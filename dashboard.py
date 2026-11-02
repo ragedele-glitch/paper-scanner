@@ -47,7 +47,8 @@ def read_log_tail(nbytes=400_000):
     try:
         with open(C.LOG_PATH, "rb") as f:
             f.seek(0, 2); size = f.tell(); f.seek(max(0, size - nbytes))
-            return f.read().decode("utf-8", "ignore").splitlines()[1:]
+            lines = f.read().decode("utf-8", "ignore").splitlines()
+            return lines[1:] if size > nbytes else lines
     except Exception:
         return []
 
