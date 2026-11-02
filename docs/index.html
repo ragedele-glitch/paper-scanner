@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#0e1116">
+<title>Memecoin paper bot</title>
+<style>
+:root{--bg:#0e1116;--card:#171b22;--line:#252b35;--tx:#e6e9ef;--mut:#8a93a3;--g:#22c55e;--r:#ef4444;--y:#eab308;--b:#3b82f6}
+*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+header{position:sticky;top:0;z-index:5;background:var(--bg);padding:10px 12px 0;border-bottom:1px solid var(--line)}
+.top{display:flex;align-items:center;gap:8px;justify-content:space-between}
+.title{font-weight:700;font-size:16px}.paper{font-size:11px;font-weight:700;color:#111;background:var(--y);border-radius:4px;padding:2px 6px;margin-left:6px}
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;padding:4px 10px;border-radius:999px;background:var(--card);border:1px solid var(--line)}
+.dot{width:9px;height:9px;border-radius:50%}.on{background:var(--g);box-shadow:0 0 8px var(--g)}.off{background:var(--r)}
+nav{display:flex;gap:2px;overflow-x:auto;margin-top:10px;scrollbar-width:none}nav::-webkit-scrollbar{display:none}
+nav button{flex:0 0 auto;background:none;border:0;color:var(--mut);font:inherit;font-weight:600;padding:8px 10px;border-bottom:2px solid transparent}
+nav button.act{color:var(--tx);border-color:var(--b)}
+main{padding:12px;max-width:760px;margin:0 auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:12px}
+.card h3{margin:0 0 8px;font-size:13px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.big{font-size:30px;font-weight:700}.g{color:var(--g)}.r{color:var(--r)}.y{color:var(--y)}.m{color:var(--mut)}.s{font-size:13px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.kv{background:#11151b;border-radius:8px;padding:8px}.kv b{display:block;font-size:17px}.kv span{font-size:12px;color:var(--mut)}
+.row{border-top:1px solid var(--line);padding:10px 0}.row:first-child{border-top:0;padding-top:0}
+.rh{display:flex;justify-content:space-between;gap:8px;font-weight:600}.rd{font-size:13px;color:var(--mut);margin-top:3px}
+.tag{display:inline-block;font-size:12px;font-weight:600;padding:2px 7px;border-radius:5px;margin-top:4px}
+.t-copied{background:#123d24;color:#4ade80}.t-killed{background:#3d1414;color:#f87171}.t-passed{background:#13284a;color:#93c5fd}.t-skip,.t-ignored{background:#262b33;color:#aab2bf}
+.bar{display:flex;gap:2px;height:22px;margin:6px 0}.bar i{flex:1;border-radius:2px}
+.filt{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}.filt button{background:var(--card);color:var(--tx);border:1px solid var(--line);border-radius:999px;padding:5px 11px;font:inherit;font-size:13px}.filt button.act{background:var(--b);border-color:var(--b)}
+.warn{background:#3a1d0d;border:1px solid #7c2d12;color:#fed7aa;border-radius:10px;padding:10px;margin-bottom:12px;font-size:14px}
+.empty{color:var(--mut);text-align:center;padding:18px 0}
+svg{display:block;width:100%}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:6px 4px;text-align:right;border-top:1px solid var(--line)}td:first-child,th:first-child{text-align:left}th{color:var(--mut);font-weight:600}
+footer{color:var(--mut);font-size:12px;text-align:center;padding:4px 12px 24px}
+</style></head><body>
+<header>
+ <div class="top"><div class="title">Memecoin bot<span class="paper">PAPER</span></div><div id="pill" class="pill"><span class="dot"></span>Loading…</div></div>
+ <nav id="nav"></nav>
+</header>
+<main id="main"><div class="empty">Loading…</div></main>
+<footer id="foot">Paper mode only: no wallet, no keys, no real money. This page can only watch.</footer>
+<script>
+const TABS=[["ov","Overview"],["pos","Positions"],["hist","History"],["sig","Signals"],["stats","Stats"],["log","Activity"],["wal","Wallets"]];
+const OWNER="ragedele-glitch",REPO="paper-scanner";
+let K=location.hash.slice(1);if(K.length>20){try{localStorage.setItem("pk",K)}catch(e){}}else{try{K=localStorage.getItem("pk")||""}catch(e){}}
+let tab=(()=>{try{return localStorage.getItem("tab")||"ov"}catch(e){return"ov"}})(),S=null,sigF="all",lastOk=0,errMsg="";
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const usd=(v,d=2)=>v==null?"–":(v<0?"-$":"$")+Math.abs(v).toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d});
+const sgn=(v,d=2)=>v==null?"–":(v>=0?"+":"-")+"$"+Math.abs(v).toFixed(d);
+const pct=(v,d=1)=>v==null?"–":(v>=0?"+":"")+v.toFixed(d)+"%";
+const cls=v=>v==null?"m":v>0?"g":v<0?"r":"m";
+function px(v){if(v==null)return"–";if(v>=1)return"$"+v.toFixed(4);const s=v.toPrecision(3);if(v>=1e-4)return"$"+Number(s);const m=v.toExponential(2).split("e");return"$"+m[0]+"e"+m[1]}
+const T=ts=>ts?new Date(ts*1000).toLocaleString("en-GB",{timeZone:"Africa/Lagos",weekday:"short",day:"numeric",month:"short",hour:"2-digit",minute:"2-digit",hour12:true}):"–";
+const TT=ts=>ts?new Date(ts*1000).toLocaleTimeString("en-GB",{timeZone:"Africa/Lagos",hour:"2-digit",minute:"2-digit",hour12:true}):"–";
+function ago(s){s=Math.max(0,s);if(s<60)return Math.round(s)+"s ago";if(s<3600)return Math.round(s/60)+" min ago";if(s<86400)return(s/3600).toFixed(1)+" h ago";return(s/86400).toFixed(1)+" days ago"}
+function dur(s){if(s<3600)return Math.round(s/60)+" min";if(s<86400)return(s/3600).toFixed(1)+" h";return(s/86400).toFixed(1)+" d"}
+function nav(){$("#nav").innerHTML=TABS.map(([k,n])=>`<button class="${k==tab?"act":""}" onclick="go('${k}')">${n}${k=="pos"&&S?` (${S.positions.length})`:""}</button>`).join("")}
+function go(k){tab=k;try{localStorage.setItem("tab",k)}catch(e){};render();scrollTo(0,0)}
+function pill(){const st=S.status,el=$("#pill");el.innerHTML=st.awake?`<span class="dot on"></span>Running`:`<span class="dot off"></span>Asleep`}
+function curve(pts){if(pts.length<2)return'<div class="empty">Curve appears after the first data points.</div>';
+ const W=600,H=170,P=6,xs=pts.map(p=>p[0]),ys=pts.map(p=>p[1]);let x0=Math.min(...xs),x1=Math.max(...xs),y0=Math.min(...ys,200),y1=Math.max(...ys,200);if(y1-y0<2){y0-=1;y1+=1}
+ const X=x=>P+(x-x0)/(x1-x0||1)*(W-2*P),Y=y=>H-P-(y-y0)/(y1-y0)*(H-2*P);
+ const d=pts.map((p,i)=>(i?"L":"M")+X(p[0]).toFixed(1)+","+Y(p[1]).toFixed(1)).join("");const last=ys[ys.length-1],col=last>=200?"#22c55e":"#ef4444";
+ return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="height:170px"><line x1="0" x2="${W}" y1="${Y(200)}" y2="${Y(200)}" stroke="#3a4250" stroke-dasharray="4 4"/><path d="${d} L${X(x1)},${H} L${X(x0)},${H}Z" fill="${col}" opacity=".12"/><path d="${d}" fill="none" stroke="${col}" stroke-width="2.2" vector-effect="non-scaling-stroke"/></svg><div class="rd" style="display:flex;justify-content:space-between"><span>${T(x0)}</span><span>dashed line = $200 start</span><span>now</span></div>`}
+function upbar(u){return `<div class="bar">${u.cells.map(c=>`<i title="${T(c.h)}: ${c.pct}%" style="background:${c.pct>=90?"#22c55e":c.pct>=30?"#eab308":c.pct>0?"#7c2d12":"#2a303a"}"></i>`).join("")}</div><div class="rd" style="display:flex;justify-content:space-between"><span>48 h ago</span><span>each block = 1 hour awake</span><span>now</span></div>`}
+function errs(st){if(!st.errors.length)return'<div class="s g">No data-source errors in the last 15 minutes.</div>';return st.errors.map(e=>`<div class="s"><span class="r">●</span> ${esc(e.what)} — ${e.count}×, last ${TT(e.last)}</div>`).join("")}
+function posCard(p){return `<div class="row"><div class="rh"><span>${esc(p.coin)} <span class="m s">${esc(p.mint)}</span></span><span class="${cls(p.pnl)}">${sgn(p.pnl)} (${pct(p.pnl_pct)})</span></div>
+<div class="rd">Bought ${usd(p.size)} at ${px(p.entry_price)} · now ${px(p.now_price)} <span class="m">(price ${ago(p.price_age)})</span></div>
+<div class="rd">Stop ${px(p.stop)} (${pct(p.stop_pct,0)} from entry, ${p.stop_kind=="trailing"?"trailing, profit locked":p.stop_kind=="breakeven"?"at breakeven":"starting stop"}) · best so far ${pct(p.peak_pct,0)}</div>
+<div class="rd">Copied ${esc(p.wallet)} · open ${dur(S.now-p.entry_ts)} (since ${T(p.entry_ts)})</div></div>`}
+function histCard(h){return `<div class="row"><div class="rh"><span>${esc(h.coin)} <span class="m s">${esc(h.mint)}</span></span><span class="${cls(h.pnl)}">${sgn(h.pnl)} (${pct(h.pnl_pct)})</span></div>
+<div class="rd">${px(h.entry_price)} → ${px(h.exit_price)} · ${usd(h.size)} in · after all costs</div>
+<div class="rd">${esc(h.reason)} · held ${dur(h.exit_ts-h.entry_ts)} · closed ${T(h.exit_ts)}</div><div class="rd">Copied ${esc(h.wallet)}</div></div>`}
+function sigCard(s){const after=(s.p1h!=null||s.p24h!=null)?` · after 1 h <b class="${cls(s.p1h)}">${pct(s.p1h,0)}</b>, after 24 h <b class="${cls(s.p24h)}">${pct(s.p24h,0)}</b>`:"";
+ return `<div class="row"><div class="rh"><span>${esc(s.coin)} <span class="m s">${esc(s.mint)}</span></span><span class="m s">${T(s.ts)}</span></div>
+<div class="rd">${esc(s.wallet)} bought${s.liq!=null?` · pool ${usd(s.liq,0)}`:""}${s.h1!=null?` · 1 h move ${pct(s.h1,0)}`:""}${s.lag!=null?` · spotted ${dur(s.lag)} after`:""}${after}</div>
+<span class="tag t-${s.verdict}">${esc(s.label)}</span></div>`}
+function cmpRow(name,g){const f=x=>x.n?`${pct(x.avg,0)} avg · ${pct(x.median,0)} median · ${x.up}/${x.n} up · ${x.dead} dead`:"no data yet";return `<div class="row"><div class="rh"><span>${name}</span></div><div class="rd">After 1 h: ${f(g.h1)}</div><div class="rd">After 24 h: ${f(g.h24)}</div></div>`}
+function render(){nav();if(!S){if(errMsg)$("#main").innerHTML=`<div class="warn">${esc(errMsg)}</div>`;return}S.now=Date.now()/1000;S.status.awake=S.status.last_beat&&S.now-S.status.last_beat<300;pill();const st=S.status,a=S.account,x=S.stats;let h="";
+ const stale=S.now-S.gen>420;const wf=`https://github.com/${OWNER}/${REPO}/actions/workflows/scan.yml`;
+ if(!st.awake)h+=`<div class="warn"><b>The bot is asleep.</b> Last check-in ${T(st.last_beat)} (${ago(S.now-st.last_beat)}). While asleep it sees no buys and doesn't move stops. It restarts by itself within about 15 minutes. To start it now, open <a style="color:#fff" href="${wf}" target="_blank" rel="noopener">GitHub Actions</a>, tap <b>Run workflow</b>, then <b>Run workflow</b> again.</div>`;
+ if(stale&&st.awake)h+=`<div class="warn">The newest data is ${ago(S.now-S.gen)}, so the numbers below may be a little old.</div>`;
+ if(tab=="ov"){
+  h+=`<div class="card"><h3>$200 paper account</h3><div class="big ${cls(a.change_usd)}">${usd(a.equity)}</div><div class="${cls(a.change_usd)}">${sgn(a.change_usd)} (${pct(a.change_pct,2)}) since start</div>${curve(a.curve)}
+  <div class="grid" style="margin-top:10px"><div class="kv"><span>Cash</span><b>${usd(a.cash)}</b></div><div class="kv"><span>In open trades</span><b>${usd(a.open_value)}</b></div><div class="kv"><span>Max drawdown</span><b class="r">${a.mdd_pct.toFixed(1)}%</b></div><div class="kv"><span>Open trades</span><b>${a.n_open} of ${a.max_open}</b></div></div></div>`;
+  h+=`<div class="card"><h3>Bot status</h3><div class="grid"><div class="kv"><span>Status</span><b class="${st.awake?"g":"r"}">${st.awake?"Running":"Asleep"}</b></div><div class="kv"><span>Last check-in</span><b>${TT(st.last_beat)}</b><span>${ago(S.now-st.last_beat)}</span></div><div class="kv"><span>Wallets followed</span><b>${st.wallets}</b></div><div class="kv"><span>Wallet reads, last 10 min</span><b>${st.polled_10m}</b></div></div>
+  <div style="margin-top:10px" class="s">Awake <b>${st.uptime.h24}%</b> of the last 24 h, <b>${st.uptime.h48}%</b> of 48 h</div>${upbar(st.uptime)}<div style="margin-top:8px">${errs(st)}</div></div>`;
+  h+=`<div class="card"><h3>Scoreboard</h3><div class="grid"><div class="kv"><span>Closed trades</span><b>${x.closed}</b></div><div class="kv"><span>Win rate</span><b>${x.win_rate==null?"–":x.win_rate.toFixed(0)+"%"}</b><span>${x.wins} won</span></div><div class="kv"><span>Best trade</span><b class="g">${x.best?pct(x.best.pnl_pct,0):"–"}</b><span>${x.best?esc(x.best.coin):""}</span></div><div class="kv"><span>Worst trade</span><b class="r">${x.worst?pct(x.worst.pnl_pct,0):"–"}</b><span>${x.worst?esc(x.worst.coin):""}</span></div></div></div>`;
+  h+=`<div class="card"><h3>Open positions</h3>${S.positions.length?S.positions.map(posCard).join(""):'<div class="empty">No open trades right now.</div>'}</div>`;
+  h+=`<div class="card"><h3>Latest signals</h3>${S.signals.filter(s=>s.verdict!="ignored").slice(0,5).map(sigCard).join("")||'<div class="empty">No buys seen yet.</div>'}<div class="s" style="margin-top:6px"><a style="color:var(--b)" href="javascript:void 0" onclick="go('sig');return false">All signals →</a></div></div>`;
+ }
+ if(tab=="pos")h+=`<div class="card"><h3>Open positions (${S.positions.length} of ${a.max_open})</h3>${S.positions.length?S.positions.map(posCard).join(""):'<div class="empty">No open trades right now.</div>'}</div><div class="card"><h3>Rules it follows</h3>${Object.values(S.rules).map(r=>`<div class="rd">• ${esc(r)}</div>`).join("")}</div>`;
+ if(tab=="hist")h+=`<div class="card"><h3>Closed trades (${x.closed}) · total ${sgn(x.total_pnl)}</h3>${S.history.length?S.history.map(histCard).join(""):'<div class="empty">No closed trades yet.</div>'}</div>`;
+ if(tab=="sig"){const F=[["all","All real buys"],["copied","Copied"],["killed","Blocked"],["passed","Passed, not copied"],["skip","Skipped"],["ignored","Not real buys"]];
+  const list=S.signals.filter(s=>sigF=="all"?s.verdict!="ignored":s.verdict==sigF);
+  h+=`<div class="filt">${F.map(([k,n])=>`<button class="${k==sigF?"act":""}" onclick="sigF='${k}';render()">${n}</button>`).join("")}</div><div class="card"><h3>${list.length} shown, newest first</h3>${list.slice(0,150).map(sigCard).join("")||'<div class="empty">Nothing here yet.</div>'}</div>`}
+ if(tab=="stats"){h+=`<div class="card"><h3>Results</h3><div class="grid"><div class="kv"><span>Closed trades</span><b>${x.closed}</b></div><div class="kv"><span>Win rate</span><b>${x.win_rate==null?"–":x.win_rate.toFixed(0)+"%"}</b></div><div class="kv"><span>Total P&amp;L</span><b class="${cls(x.total_pnl)}">${sgn(x.total_pnl)}</b></div><div class="kv"><span>Max drawdown</span><b class="r">${a.mdd_pct.toFixed(1)}%</b><span>${usd(a.mdd_usd)}</span></div><div class="kv"><span>Best</span><b class="g">${x.best?pct(x.best.pnl_pct,0):"–"}</b><span>${x.best?esc(x.best.coin)+" "+sgn(x.best.pnl):""}</span></div><div class="kv"><span>Worst</span><b class="r">${x.worst?pct(x.worst.pnl_pct,0):"–"}</b><span>${x.worst?esc(x.worst.coin)+" "+sgn(x.worst.pnl):""}</span></div></div></div>
+  <div class="card"><h3>Are the safety filters helping?</h3><div class="rd" style="margin-bottom:8px">How coins moved after the smart wallet bought: ones the filters blocked versus ones that passed. "Dead" = down 90% or more. Only counts coins the bot was awake to re-check.</div>${cmpRow(`Blocked coins (${x.killed})`,x.compare.killed)}${cmpRow(`Passed coins (${x.survivors})`,x.compare.survivor)}</div>
+  <div class="card"><h3>What blocked coins</h3>${x.filters.length?x.filters.map(([k,n])=>`<div class="rh s" style="font-weight:400;padding:4px 0"><span>${esc(k)}</span><span>${n}</span></div>`).join(""):'<div class="empty">Nothing blocked yet.</div>'}</div>
+  <div class="card"><h3>Test copy of every passed coin</h3><div class="rd">A side test that copies every coin that passes at a flat $20, with no 5-trade limit. It doesn't touch the $200 account.</div><div class="grid" style="margin-top:8px"><div class="kv"><span>Closed</span><b>${x.shadow.n}</b><span>${x.shadow.wins} won</span></div><div class="kv"><span>Total</span><b class="${cls(x.shadow.pnl)}">${sgn(x.shadow.pnl)}</b></div></div></div>`}
+ if(tab=="log")h+=`<div class="card"><h3>What the bot did, newest first</h3>${S.activity.length?S.activity.map(e=>`<div class="row"><div class="rh" style="font-weight:400"><span class="${e.kind=="bad"?"r":e.kind=="buy"?"g":e.kind=="sell"?"y":""}">${esc(e.text)}</span><span class="m s" style="white-space:nowrap">${T(e.ts)}</span></div></div>`).join(""):'<div class="empty">Nothing logged yet.</div>'}</div>`;
+ if(tab=="wal")h+=`<div class="card"><h3>Smart wallets followed (${S.wallets.length})</h3><div class="rd" style="margin-bottom:6px">Top wallets from the Kolscan leaderboard, re-read every 6 hours.</div>${S.wallets.map(w=>`<div class="row"><div class="rh"><span>#${w.rank??"–"} ${esc(w.name)} <span class="m s">${esc(w.addr)}</span></span><span class="${cls(w.pnl_usd)} s">${w.pnl_usd!=null?sgn(w.pnl_usd,0):""}</span></div><div class="rd">${w.wins??0} wins / ${w.losses??0} losses on Kolscan · checked every ${w.every_s}s · last ${w.last_check?ago(S.now-w.last_check):"never"}</div></div>`).join("")}</div>`;
+ $("#main").innerHTML=h;$("#foot").innerHTML=`Data from ${TT(S.gen)} Lagos time (${ago(S.now-S.gen)}) · the bot sends new data every 2 min, and this page checks every minute<br><a style="color:var(--mut)" href="${wf}" target="_blank" rel="noopener">The bot runs on GitHub Actions</a><br>Paper mode only: no wallet, no keys, no real money. This page can only watch.`}
+function b64(s){s=s.replace(/-/g,"+").replace(/_/g,"/");while(s.length%4)s+="=";return Uint8Array.from(atob(s),c=>c.charCodeAt(0))}
+async function fetchBlob(){const u1=`https://api.github.com/repos/${OWNER}/${REPO}/contents/state.enc?ref=data&t=${Date.now()}`;
+ try{const r=await fetch(u1,{cache:"no-store",headers:{Accept:"application/vnd.github.raw"}});if(r.ok)return(await r.text()).trim()}catch(e){}
+ const r=await fetch(`https://raw.githubusercontent.com/${OWNER}/${REPO}/data/state.enc?t=${Date.now()}`,{cache:"no-store"});if(!r.ok)throw new Error("fetch "+r.status);return(await r.text()).trim()}
+async function load(){if(!K){errMsg="This link is missing its key. Open the full link you were sent.";render();return}
+ try{const raw=b64((await fetchBlob()).replace(/\s/g,""));const key=await crypto.subtle.importKey("raw",b64(K),"AES-GCM",false,["decrypt"]);
+  const plain=await crypto.subtle.decrypt({name:"AES-GCM",iv:raw.slice(0,12)},key,raw.slice(12));
+  const txt=await new Response(new Blob([plain]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
+  S=JSON.parse(txt);S.gen=S.now;lastOk=Date.now()/1000;errMsg=""}catch(e){if(!S)errMsg=String(e.name)=="OperationError"?"The key in this link doesn't match. Open the full link you were sent.":"Couldn't load the bot's data yet. It will retry by itself."}
+ render()}
+load();setInterval(load,60000);
+</script></body></html>

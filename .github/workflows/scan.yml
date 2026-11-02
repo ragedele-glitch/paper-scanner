@@ -1,0 +1,77 @@
+name: Paper scanner
+
+# PAPER MODE ONLY. No wallet, no keys, nothing is signed or sent on-chain.
+# Each run follows the smart wallets for about 4 hours, then queues the next run itself.
+# The 15-minute schedule is a safety net that restarts it if the chain ever breaks.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: paper-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 290
+    env:
+      DASH_KEY: ${{ secrets.DASH_KEY }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install --quiet cryptography
+      - name: Restore saved bot state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: scanner-state-${{ github.run_id }}-start
+          restore-keys: scanner-state-
+      - name: Prepare
+        run: python ci_runner.py prepare
+
+      - name: Scan, hour 1
+        run: python ci_runner.py run 58
+      - name: Save state 1
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: scanner-state-${{ github.run_id }}-${{ github.run_attempt }}-1
+
+      - name: Scan, hour 2
+        run: python ci_runner.py run 58
+      - name: Save state 2
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: scanner-state-${{ github.run_id }}-${{ github.run_attempt }}-2
+
+      - name: Scan, hour 3
+        run: python ci_runner.py run 58
+      - name: Save state 3
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: scanner-state-${{ github.run_id }}-${{ github.run_attempt }}-3
+
+      - name: Scan, hour 4 (queues the next run near the end)
+        run: python ci_runner.py run 58 last
+      - name: Save state 4
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: scanner-state-${{ github.run_id }}-${{ github.run_attempt }}-4

@@ -1,0 +1,68 @@
+import os
+# Paper-mode Solana memecoin copy-trade scanner: settings.
+# PAPER MODE ONLY. No wallet, no keys, nothing is ever signed or sent on-chain.
+
+RPC_URL = "https://api.mainnet-beta.solana.com"   # free public Solana node (read-only calls)
+KOLSCAN_URL = "https://kolscan.io/leaderboard"     # public leaderboard of profitable Solana wallets
+DEX_TOKENS = "https://api.dexscreener.com/tokens/v1/solana/"
+GECKO = "https://api.geckoterminal.com/api/v2/networks/solana"
+RUGCHECK = "https://api.rugcheck.xyz/v1/tokens/{}/report"
+
+TOKEN_PROGRAMS = [
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",   # SPL Token
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",   # Token-2022 (newer pump.fun coins)
+]
+
+# --- Scout ---
+MAX_WALLETS = 50            # follow up to 50 wallets
+BOARD_KEEP_DAYS = 3         # keep following a wallet for 3 days after it last appeared on the board
+BOARD_REFRESH_S = 6 * 3600  # re-read the leaderboard every 6 hours
+LOOP_S = 20
+GAP_REBASELINE_S = 30 * 60  # if a wallet wasn't polled for 30+ min (VM asleep), re-baseline silently
+MISSED_LAG_S = 10 * 60      # buys found 10+ min late are logged as missed, not traded
+MIN_LEADER_BUY_USD = 20     # ignore dust/airdrops worth under $20
+
+# --- Filter (rules from the post) ---
+DEV_MAX_PCT = 5.0
+LIQ_MIN_USD = 25_000
+TOP10_MAX_PCT = 35.0
+BUNDLE_INSIDER_PCT = 5.0    # insider/bundle-linked holders owning 5%+ of supply = bundled
+PUMP_1H_MAX_PCT = 100.0
+
+# --- Sniper / paper account ---
+START_EQUITY = 200.0
+POS_FRACTION = 0.10         # 10% of current equity per trade ($20 to start)
+MIN_POS_USD = 5.0
+MAX_OPEN = 5
+COPY_DELAY_S = 5            # copier buys 5 seconds after the smart wallet
+SLIPPAGE = 0.03             # 3% worse price on every buy and every sell
+BOT_FEE = 0.01              # 1% copy-bot fee per side (typical Telegram copy bots)
+POOL_FEE = 0.01             # ~1% DEX / pump.fun fee per side
+NETWORK_FEE_USD = 0.10      # priority fee + tip per transaction
+
+# --- Guard ---
+INITIAL_STOP = 0.30         # stop 30% under entry, set before entry
+BE_TRIGGER = 0.40           # once up 40%, stop moves to breakeven after costs
+BE_LEVEL = 1.12             # 12% over entry price ~= breakeven after ~10% round-trip costs
+TRAIL_STEPS = [             # (peak gain reached, stop distance under the peak)
+    (0.40, 0.25),
+    (1.00, 0.20),
+    (3.00, 0.15),
+]
+MIRROR_SELL_FRAC = 0.50     # exit if the smart wallet sells 50%+ of its bag
+TIME_STOP_S = 24 * 3600     # close anything still open after 24 hours
+
+EXCLUDE_MINTS = {
+    "So11111111111111111111111111111111111111112",  # wSOL
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+    "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",  # mSOL
+    "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",  # JitoSOL
+    "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj",  # stSOL
+    "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1",  # bSOL
+    "2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo",  # PYUSD
+}
+
+DB_PATH = os.environ.get("SCANNER_DB", "/home/sprite/memecoin-scanner/scanner.db")
+LOG_PATH = os.environ.get("SCANNER_LOG", "/home/sprite/memecoin-scanner/scanner.log")

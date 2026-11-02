@@ -1,0 +1,718 @@
+#!/usr/bin/env python3
+"""Paper-mode Solana memecoin copy-trade scanner.
+
+Scout   -> follows profitable wallets from the public Kolscan leaderboard and spots their new coin buys
+           (by diffing each wallet's token holdings with read-only Solana RPC calls).
+Filter  -> kills any coin breaking a hard rule (dev >5%, liquidity <$25k, top-10 >35%, bundled, +100% in 1h,
+           smart wallet sold early) plus basic safety checks (mint/freeze authority still live).
+Sniper  -> paper-buys survivors 5 s after the smart wallet, with slippage and fees.
+Guard   -> stop set at entry, moved to breakeven, then trailed tighter as gains grow; mirror-sell; 24 h time stop.
+
+PAPER MODE ONLY: no wallet, no private keys, nothing is ever signed or sent.
+"""
+import os, base64, calendar, gzip, json, logging, logging.handlers, math, re, sqlite3, struct, sys, time, traceback
+import urllib.request, urllib.error
+from collections import deque
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import config as C
+
+log = logging.getLogger("scanner")
+
+# ----------------------------------------------------------------------------- helpers
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def b58(b):
+    n = int.from_bytes(b, "big"); s = ""
+    while n:
+        n, r = divmod(n, 58); s = B58[r] + s
+    return "1" * (len(b) - len(b.lstrip(b"\0"))) + s
+
+
+class Limiter:
+    def __init__(self, per_min):
+        self.per_min = per_min; self.t = deque()
+
+    def wait(self):
+        now = time.time()
+        while self.t and now - self.t[0] > 60:
+            self.t.popleft()
+        if len(self.t) >= self.per_min:
+            time.sleep(60 - (now - self.t[0]) + 0.2)
+        self.t.append(time.time())
+
+    def free(self):
+        now = time.time()
+        while self.t and now - self.t[0] > 60:
+            self.t.popleft()
+        return self.per_min - len(self.t)
+
+
+LIM = {"rpc": Limiter(150), "gecko": Limiter(25), "rug": Limiter(12), "dex": Limiter(200), "web": Limiter(5)}
+STATS = {"rpc_bytes": 0}
+RPC_UA = "memecoin-paper-scanner/1.0 (read-only, python-urllib)"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
+
+
+def http(url, data=None, kind="web", headers=None, timeout=30, tries=3, raw=False):
+    # The public Solana RPC now rejects requests that claim to be a browser (HTTP 403 since Nov 2),
+    # so RPC calls identify honestly as a script; web pages keep the browser UA.
+    h = {"User-Agent": RPC_UA if kind == "rpc" else UA, "Accept": "application/json", "Accept-Encoding": "gzip"}
+    if headers:
+        h.update(headers)
+    for i in range(tries):
+        LIM[kind].wait()
+        try:
+            req = urllib.request.Request(url, data=data, headers=h)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                body = r.read()
+                if r.headers.get("Content-Encoding") == "gzip":
+                    body = gzip.decompress(body)
+            if kind == "rpc":
+                STATS["rpc_bytes"] += len(body)
+            return body if raw else json.loads(body)
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and i < tries - 1:
+                time.sleep(3 * (i + 1) * (3 if e.code == 429 else 1)); continue
+            if e.code == 404:
+                return None
+            raise
+        except Exception:
+            if i < tries - 1:
+                time.sleep(2 * (i + 1)); continue
+            raise
+
+
+def rpc(method, params):
+    j = http(C.RPC_URL, json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),
+             kind="rpc", headers={"Content-Type": "application/json"}, timeout=60)
+    if j is None or "error" in j:
+        raise RuntimeError(f"rpc {method} error: {j and j.get('error')}")
+    return j["result"]
+
+
+def now():
+    return time.time()
+
+
+# ----------------------------------------------------------------------------- database
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS wallets(address TEXT PRIMARY KEY, name TEXT, first_seen REAL, last_seen REAL,
+  last_rank INT, pnl_sol REAL, pnl_usd REAL, wins INT, losses INT, n_accounts INT, poll_s INT, last_poll REAL, active INT DEFAULT 1);
+CREATE TABLE IF NOT EXISTS snapshots(address TEXT PRIMARY KEY, ts REAL, holdings TEXT);
+CREATE TABLE IF NOT EXISTS signals(id INTEGER PRIMARY KEY, detected_ts REAL, wallet TEXT, wallet_name TEXT, mint TEXT,
+  symbol TEXT, name TEXT, ata TEXT, leader_buy_ts REAL, leader_buy_sig TEXT, leader_post_amt REAL, leader_usd REAL,
+  detect_lag_s REAL, pool TEXT, dex TEXT, price_detect REAL, liq_usd REAL, h1_pct REAL, mcap REAL, pair_age_min REAL,
+  dev_pct REAL, top10_pct REAL, insider_pct REAL, graph_insiders INT, mint_auth INT, freeze_auth INT, rug_score REAL,
+  killed_by TEXT, status TEXT, notes TEXT, p1h REAL, p6h REAL, p24h REAL, max24h REAL);
+CREATE INDEX IF NOT EXISTS sig_mint ON signals(mint);
+CREATE TABLE IF NOT EXISTS positions(id INTEGER PRIMARY KEY, signal_id INT, account INT, mint TEXT, symbol TEXT, pool TEXT,
+  leader TEXT, entry_ts REAL, entry_price REAL, entry_src TEXT, size_usd REAL, qty REAL, stop REAL, peak REAL,
+  last_candle_ts REAL, last_price REAL, last_update REAL, status TEXT, exit_ts REAL, exit_price REAL, exit_reason TEXT,
+  proceeds REAL, pnl_usd REAL, pnl_pct REAL, stop_log TEXT);
+CREATE TABLE IF NOT EXISTS leader_sells(wallet TEXT, mint TEXT, ts REAL, sold_frac REAL, PRIMARY KEY(wallet, mint));
+CREATE TABLE IF NOT EXISTS equity(ts REAL PRIMARY KEY, cash REAL, open_value REAL, equity REAL, n_open INT);
+CREATE TABLE IF NOT EXISTS heartbeat(ts REAL PRIMARY KEY, polled INT, rpc_mb REAL, note TEXT);
+"""
+
+
+def db():
+    con = sqlite3.connect(C.DB_PATH, timeout=30)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    return con
+
+
+def meta_get(con, k, default=None):
+    r = con.execute("SELECT value FROM meta WHERE key=?", (k,)).fetchone()
+    return json.loads(r[0]) if r else default
+
+
+def meta_set(con, k, v):
+    con.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (k, json.dumps(v)))
+
+
+# ----------------------------------------------------------------------------- Scout: wallet list
+def refresh_board(con):
+    html = http(C.KOLSCAN_URL, kind="web", raw=True, headers={"Accept": "text/html"}).decode("utf-8", "ignore")
+    blocks = html.split("leaderboard_leaderboardUser__")[1:]
+    rows = []
+    for rank, b in enumerate(blocks, 1):
+        m = re.search(r'href="/account/([1-9A-HJ-NP-Za-km-z]{32,44})\?timeframe=', b)
+        if not m:
+            continue
+        name = re.search(r'font-weight:550">([^<]*)</h1>', b)
+        wl = re.search(r'margin-right:2px">(\d+)</p>/<p[^>]*>(\d+)</p>', b)
+        pnl = re.search(r'<h1>([+-]?[\d,.]+)<!-- --> <!-- -->Sol</h1><h1>\(<!-- -->(-?)\$?(-?)([\d,.]+)', b)
+        rows.append(dict(addr=m.group(1), name=name.group(1) if name else "", rank=rank,
+                         wins=int(wl.group(1)) if wl else None, losses=int(wl.group(2)) if wl else None,
+                         pnl_sol=float(pnl.group(1).replace(",", "")) if pnl else None,
+                         pnl_usd=(-1 if (pnl and (pnl.group(2) or pnl.group(3))) else 1) * float(pnl.group(4).replace(",", "")) if pnl else None))
+    seen = set(); t = now()
+    for r in rows:
+        if r["addr"] in seen:
+            continue
+        seen.add(r["addr"])
+        con.execute("""INSERT INTO wallets(address,name,first_seen,last_seen,last_rank,pnl_sol,pnl_usd,wins,losses,poll_s,last_poll)
+            VALUES(?,?,?,?,?,?,?,?,?,60,0) ON CONFLICT(address) DO UPDATE SET name=excluded.name,last_seen=excluded.last_seen,
+            last_rank=excluded.last_rank,pnl_sol=excluded.pnl_sol,pnl_usd=excluded.pnl_usd,wins=excluded.wins,losses=excluded.losses""",
+                    (r["addr"], r["name"], t, t, r["rank"], r["pnl_sol"], r["pnl_usd"], r["wins"], r["losses"]))
+    # follow set: on the board in the last N days with positive profit, best recent rank first
+    con.execute("UPDATE wallets SET active=0")
+    cand = con.execute("""SELECT address FROM wallets WHERE last_seen>? AND COALESCE(pnl_sol,0)>0
+                          ORDER BY last_seen DESC, last_rank ASC LIMIT ?""", (t - C.BOARD_KEEP_DAYS * 86400, C.MAX_WALLETS)).fetchall()
+    for c in cand:
+        con.execute("UPDATE wallets SET active=1 WHERE address=?", (c[0],))
+    meta_set(con, "board_ts", t)
+    con.commit()
+    log.info("board refreshed: %d rows parsed, %d wallets followed", len(rows), len(cand))
+
+
+def snapshot(addr):
+    """Current token holdings of a wallet: {mint: [amount_raw, biggest_token_account]} plus account count."""
+    hold = {}; n = 0
+    for prog in C.TOKEN_PROGRAMS:
+        res = rpc("getTokenAccountsByOwner", [addr, {"programId": prog},
+                  {"encoding": "base64", "dataSlice": {"offset": 0, "length": 72}, "commitment": "confirmed"}])
+        for a in res["value"]:
+            n += 1
+            d = base64.b64decode(a["account"]["data"][0])
+            if len(d) < 72:
+                continue
+            amt = struct.unpack("<Q", d[64:72])[0]
+            if amt == 0:
+                continue
+            mint = b58(d[:32])
+            cur = hold.get(mint)
+            if cur is None:
+                hold[mint] = [amt, a["pubkey"]]
+            else:
+                cur[0] += amt
+    return hold, n
+
+
+def token_delta(tx, owner, mint):
+    m = tx["meta"]; pre = post = 0.0; dec = None
+    for b in m.get("preTokenBalances") or []:
+        if b.get("owner") == owner and b.get("mint") == mint:
+            pre += float(b["uiTokenAmount"]["amount"]); dec = b["uiTokenAmount"]["decimals"]
+    for b in m.get("postTokenBalances") or []:
+        if b.get("owner") == owner and b.get("mint") == mint:
+            post += float(b["uiTokenAmount"]["amount"]); dec = b["uiTokenAmount"]["decimals"]
+    return pre, post, dec
+
+
+def paid_something(tx, owner):
+    """True if the owner spent SOL/wSOL/USDC/USDT in this tx (a swap), not just received tokens."""
+    m = tx["meta"]
+    keys = [k["pubkey"] if isinstance(k, dict) else k for k in tx["transaction"]["message"]["accountKeys"]]
+    if owner in keys:
+        i = keys.index(owner)
+        if (m["preBalances"][i] - m["postBalances"][i]) > 0.005e9:
+            return True
+    for mint in ("So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                 "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"):
+        pre, post, _ = token_delta(tx, owner, mint)
+        if pre - post > 0:
+            return True
+    return False
+
+
+def ata_history(ata, since_ts, limit=25):
+    sigs = rpc("getSignaturesForAddress", [ata, {"limit": limit, "commitment": "confirmed"}])
+    return sorted([s for s in sigs if not s.get("err") and (s.get("blockTime") or 0) >= since_ts - 10],
+                  key=lambda s: s["blockTime"])
+
+
+def get_tx(sig):
+    return rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1, "commitment": "confirmed"}])
+
+
+# ----------------------------------------------------------------------------- market data
+def dex_pairs(mints):
+    """{mint: [pairs]} from DexScreener, 30 per call."""
+    out = {}
+    mints = list(mints)
+    for i in range(0, len(mints), 30):
+        chunk = mints[i:i + 30]
+        try:
+            d = http(C.DEX_TOKENS + ",".join(chunk), kind="dex") or []
+        except Exception as e:
+            log.warning("dexscreener error %s", e); continue
+        for p in d:
+            if p.get("chainId") != "solana":
+                continue
+            out.setdefault(p["baseToken"]["address"], []).append(p)
+    return out
+
+
+def top_pair(pairs):
+    if not pairs:
+        return None
+    return max(pairs, key=lambda p: ((p.get("liquidity") or {}).get("usd") or 0, p.get("volume", {}).get("h24") or 0))
+
+
+def gecko_candles(pool, mint, since_ts):
+    """1-minute OHLCV (usd, for this token) with start time >= since_ts, ascending. Paginates back up to ~3 days."""
+    out = []; before = int(now()) + 60
+    for _ in range(5):
+        d = http(f"{C.GECKO}/pools/{pool}/ohlcv/minute?aggregate=1&limit=1000&currency=usd&token={mint}&before_timestamp={before}",
+                 kind="gecko")
+        lst = (((d or {}).get("data") or {}).get("attributes") or {}).get("ohlcv_list") or []
+        if not lst:
+            break
+        out.extend(lst)
+        oldest = min(c[0] for c in lst)
+        if oldest <= since_ts or len(lst) < 1000:
+            break
+        before = oldest
+    cs = sorted({int(c[0]): c for c in out if c[0] >= since_ts}.values(), key=lambda c: c[0])
+    return [(int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4])) for c in cs]
+
+
+def gecko_price_at(pool, mint, ts):
+    """Price of the first pool trade at or after ts (what a copier buying then would get, before slippage)."""
+    try:
+        d = http(f"{C.GECKO}/pools/{pool}/trades", kind="gecko")
+        trades = []
+        for t in (d or {}).get("data") or []:
+            a = t["attributes"]
+            tt = calendar.timegm(time.strptime(a["block_timestamp"], "%Y-%m-%dT%H:%M:%SZ"))
+            if a["from_token_address"] == mint:
+                px = float(a["price_from_in_usd"])
+            elif a["to_token_address"] == mint:
+                px = float(a["price_to_in_usd"])
+            else:
+                continue
+            trades.append((tt, px))
+        trades.sort()
+        if trades and trades[0][0] <= ts:
+            after = [t for t in trades if t[0] >= ts]
+            if after and after[0][0] - ts <= 120:
+                return after[0][1], "trade"
+    except Exception as e:
+        log.warning("gecko trades error %s", e)
+    cs = gecko_candles(pool, mint, int(ts // 60 * 60) - 60)
+    for c in cs:
+        if c[0] <= ts < c[0] + 60:
+            return (c[2] + c[3] + c[4]) / 3, "candle"
+    later = [c for c in cs if c[0] >= ts]
+    if later and later[0][0] - ts <= 300:
+        return later[0][1], "candle_open"
+    return None, None
+
+
+def rugcheck(mint):
+    try:
+        return http(C.RUGCHECK.format(mint), kind="rug", tries=2)
+    except Exception as e:
+        log.warning("rugcheck error %s %s", mint, e)
+        return None
+
+
+def analyse_rug(r, pool):
+    """dev %, top-10 % (excluding pools/lockers/curve), insider %, graph insiders, authorities."""
+    tok = r.get("token") or {}
+    supply = float(tok.get("supply") or 0); dec = tok.get("decimals") or 0
+    creator = r.get("creator")
+    known = r.get("knownAccounts") or {}
+    excl = set()
+    for addr, info in known.items():
+        if (info or {}).get("type") in ("AMM", "LOCKER") or "pool" in (info or {}).get("name", "").lower() \
+                or "curve" in (info or {}).get("name", "").lower():
+            excl.add(addr)
+    for m in r.get("markets") or []:
+        for k in ("pubkey", "liquidityA", "liquidityB", "liquidityAAccount", "liquidityBAccount"):
+            v = m.get(k)
+            if isinstance(v, str):
+                excl.add(v)
+            elif isinstance(v, dict) and v.get("owner"):
+                excl.add(v["owner"])
+    if pool:
+        excl.add(pool)
+    holders = [h for h in (r.get("topHolders") or []) if h.get("owner") not in excl and h.get("address") not in excl]
+    top10 = sum(float(h.get("pct") or 0) for h in holders[:10])
+    insider = sum(float(h.get("pct") or 0) for h in holders if h.get("insider"))
+    dev = 0.0
+    if supply > 0 and r.get("creatorBalance"):
+        dev = float(r["creatorBalance"]) / supply * 100
+    for h in r.get("topHolders") or []:
+        if creator and h.get("owner") == creator:
+            dev = max(dev, float(h.get("pct") or 0))
+    risks = [x.get("name", "") for x in r.get("risks") or []]
+    liq = r.get("totalMarketLiquidity")
+    return dict(dev=dev, top10=top10, insider=insider, graph=int(r.get("graphInsidersDetected") or 0),
+                mint_auth=1 if tok.get("mintAuthority") else 0, freeze_auth=1 if tok.get("freezeAuthority") else 0,
+                score=r.get("score_normalised"), risks=risks, rugged=bool(r.get("rugged")), liq=liq)
+
+
+# ----------------------------------------------------------------------------- costs
+def buy_qty(size_usd, px):
+    return size_usd * (1 - C.BOT_FEE - C.POOL_FEE) / (px * (1 + C.SLIPPAGE))
+
+
+def sell_proceeds(qty, px):
+    return max(0.0, qty * px * (1 - C.SLIPPAGE) * (1 - C.BOT_FEE - C.POOL_FEE) - C.NETWORK_FEE_USD)
+
+
+# ----------------------------------------------------------------------------- Filter + Sniper
+def process_new_buys(con, cands):
+    """cands: list of dicts(wallet, name, mint, ata, amt, prev_ts, det_ts)."""
+    if not cands:
+        return
+    pairs = dex_pairs({c["mint"] for c in cands})
+    for c in cands:
+        try:
+            handle_candidate(con, c, pairs.get(c["mint"]) or [])
+        except Exception as e:
+            log.error("candidate error %s %s\n%s", c["mint"], e, traceback.format_exc())
+        con.commit()
+
+
+def insert_signal(con, **kw):
+    cols = ",".join(kw.keys()); q = ",".join("?" * len(kw))
+    cur = con.execute(f"INSERT INTO signals({cols}) VALUES({q})", tuple(kw.values()))
+    return cur.lastrowid
+
+
+def handle_candidate(con, c, pairs):
+    mint, wallet, det = c["mint"], c["wallet"], c["det_ts"]
+    tp = top_pair(pairs)
+    base = dict(detected_ts=det, wallet=wallet, wallet_name=c["name"], mint=mint, ata=c["ata"])
+    if mint in C.EXCLUDE_MINTS:
+        return
+    if not tp:
+        insert_signal(con, **base, status="ignored", notes="no DEX market (airdrop/spam/unlisted)"); return
+    price = float(tp.get("priceUsd") or 0)
+    sym = tp["baseToken"].get("symbol"); nm = tp["baseToken"].get("name")
+    dec_guess = None
+    # leader buy tx: exact time, and confirm it was a swap (not an airdrop/transfer)
+    buy_ts = None; buy_sig = None; post_amt = None; note = []
+    try:
+        hist = ata_history(c["ata"], c["prev_ts"])
+        for s in hist[:4]:
+            tx = get_tx(s["signature"])
+            if not tx:
+                continue
+            pre, post, dec = token_delta(tx, wallet, mint)
+            if post > pre:
+                if not paid_something(tx, wallet):
+                    insert_signal(con, **base, symbol=sym, name=nm, status="ignored", notes="received by transfer, not bought")
+                    return
+                buy_ts, buy_sig, post_amt, dec_guess = s["blockTime"], s["signature"], post, dec
+                break
+    except Exception as e:
+        note.append(f"buy tx lookup failed: {e}")
+    if buy_ts is None:
+        buy_ts = (c["prev_ts"] + det) / 2; note.append("buy time estimated")
+    dec = dec_guess if dec_guess is not None else 6
+    leader_usd = c["amt"] / (10 ** dec) * price if dec_guess is not None else None
+    if leader_usd is not None and leader_usd < C.MIN_LEADER_BUY_USD:
+        insert_signal(con, **base, symbol=sym, name=nm, status="ignored", notes=f"leader bag only ${leader_usd:.2f}"); return
+    lag = det - buy_ts
+    liq_dex = sum(((p.get("liquidity") or {}).get("usd") or 0) for p in pairs)
+    h1 = (tp.get("priceChange") or {}).get("h1")
+    age_min = (det - tp["pairCreatedAt"] / 1000) / 60 if tp.get("pairCreatedAt") else None
+    sig = dict(base, symbol=sym, name=nm, leader_buy_ts=buy_ts, leader_buy_sig=buy_sig, leader_post_amt=post_amt,
+               leader_usd=leader_usd, detect_lag_s=lag, pool=tp["pairAddress"], dex=tp.get("dexId"), price_detect=price,
+               liq_usd=liq_dex or None, h1_pct=h1, mcap=tp.get("marketCap") or tp.get("fdv"), pair_age_min=age_min)
+    # repeat buys of a coin already signalled in the last 24h are confluence, not a new signal
+    prev = con.execute("SELECT id FROM signals WHERE mint=? AND status NOT IN ('ignored','repeat') AND detected_ts>?",
+                       (mint, det - 86400)).fetchone()
+    if prev:
+        insert_signal(con, **sig, status="repeat", notes=f"same coin as signal #{prev[0]}"); return
+    if lag > C.MISSED_LAG_S:
+        insert_signal(con, **sig, status="missed", notes="; ".join(note + [f"found {lag/60:.0f} min late"])); return
+
+    killed = []
+    # --- cheap filters
+    entry_ts = buy_ts + C.COPY_DELAY_S
+    # smart wallet sold before we could copy (only sells before our entry time count: no look-ahead)
+    try:
+        hist2 = ata_history(c["ata"], buy_ts)
+        for s in hist2:
+            if s["blockTime"] > entry_ts:
+                break
+            if s["signature"] == buy_sig:
+                continue
+            tx = get_tx(s["signature"])
+            pre, post, _ = token_delta(tx, wallet, mint)
+            if post < pre:
+                killed.append("smart_wallet_sold_early"); break
+    except Exception as e:
+        note.append(f"sold-early check failed: {e}")
+    if h1 is not None and h1 > C.PUMP_1H_MAX_PCT:
+        killed.append("up_100pct_1h")
+    # --- RugCheck (dev, top10, bundle, authorities). Skipped when a cheap rule already killed the coin
+    # and DexScreener liquidity is known, to stay inside RugCheck's free limit.
+    if killed and liq_dex:
+        if liq_dex < C.LIQ_MIN_USD:
+            killed.append("liquidity_under_25k")
+        sig["killed_by"] = ",".join(killed)
+        insert_signal(con, **sig, status="killed", notes="; ".join(note + ["holder checks not run"])); return
+    r = rugcheck(mint)
+    if r is None:
+        time.sleep(5); r = rugcheck(mint)
+    a = analyse_rug(r, tp["pairAddress"]) if r else None
+    liq = liq_dex if liq_dex else (a["liq"] if a else None)
+    sig["liq_usd"] = liq
+    if liq is None or liq < C.LIQ_MIN_USD:
+        killed.append("liquidity_under_25k")
+    if a:
+        sig.update(dev_pct=a["dev"], top10_pct=a["top10"], insider_pct=a["insider"], graph_insiders=a["graph"],
+                   mint_auth=a["mint_auth"], freeze_auth=a["freeze_auth"], rug_score=a["score"])
+        if a["dev"] > C.DEV_MAX_PCT:
+            killed.append("dev_over_5pct")
+        if a["top10"] > C.TOP10_MAX_PCT:
+            killed.append("top10_over_35pct")
+        if a["insider"] >= C.BUNDLE_INSIDER_PCT or any(re.search(r"bundl|insider", x, re.I) for x in a["risks"]):
+            killed.append("bundled_buys")
+        if a["mint_auth"]:
+            killed.append("analyst_mint_authority_live")
+        if a["freeze_auth"]:
+            killed.append("analyst_freeze_authority_live")
+        if a["rugged"]:
+            killed.append("analyst_flagged_rugged")
+        if a["risks"]:
+            note.append("rugcheck: " + ", ".join(a["risks"])[:200])
+    else:
+        killed.append("safety_check_unavailable")
+    sig["killed_by"] = ",".join(killed) or None
+    if killed:
+        insert_signal(con, **sig, status="killed", notes="; ".join(note) or None); return
+
+    # --- Sniper: survivor -> paper entry
+    px, src = gecko_price_at(tp["pairAddress"], mint, entry_ts)
+    if not px:
+        px, src = price, "dexscreener_live"; note.append("no trade data at entry time, used live price")
+    sid = insert_signal(con, **sig, status="survivor", notes="; ".join(note) or None)
+    # shadow position: every survivor, flat $20, no slot limit (measures the filters themselves)
+    open_position(con, sid, 0, mint, sym, tp["pairAddress"], wallet, entry_ts, px, src, 20.0)
+    # the $200 paper account: 10% of equity, max 5 open
+    st = account_state(con)
+    size = max(C.MIN_POS_USD, st["equity"] * C.POS_FRACTION)
+    if st["n_open"] >= C.MAX_OPEN:
+        con.execute("UPDATE signals SET notes=COALESCE(notes||'; ','')||'account full (5 open), not copied' WHERE id=?", (sid,))
+    elif st["cash"] < size + C.NETWORK_FEE_USD:
+        con.execute("UPDATE signals SET notes=COALESCE(notes||'; ','')||'not enough paper cash' WHERE id=?", (sid,))
+    else:
+        open_position(con, sid, 1, mint, sym, tp["pairAddress"], wallet, entry_ts, px, src, size)
+        meta_set(con, "cash", st["cash"] - size - C.NETWORK_FEE_USD)
+        log.info("PAPER BUY %s %s $%.2f @ %.10g (%s) copying %s", sym, mint, size, px, src, c["name"])
+
+
+def open_position(con, sid, account, mint, sym, pool, leader, entry_ts, px, src, size):
+    stop = px * (1 - C.INITIAL_STOP)
+    con.execute("""INSERT INTO positions(signal_id,account,mint,symbol,pool,leader,entry_ts,entry_price,entry_src,size_usd,qty,
+        stop,peak,last_candle_ts,last_price,last_update,status,stop_log) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?)""",
+                (sid, account, mint, sym, pool, leader, entry_ts, px, src, size, buy_qty(size, px), stop, px,
+                 int(entry_ts // 60 * 60), px, 0, json.dumps([[entry_ts, stop, "initial"]])))
+
+
+def account_state(con):
+    cash = meta_get(con, "cash", C.START_EQUITY)
+    opens = con.execute("SELECT qty,last_price FROM positions WHERE account=1 AND status='open'").fetchall()
+    ov = sum(sell_proceeds(o["qty"], o["last_price"] or 0) for o in opens)
+    return dict(cash=cash, open_value=ov, equity=cash + ov, n_open=len(opens))
+
+
+# ----------------------------------------------------------------------------- Guard
+def new_stop(entry, peak, old):
+    gain = peak / entry - 1 + 1e-9
+    s = entry * (1 - C.INITIAL_STOP)
+    for trig, dist in C.TRAIL_STEPS:
+        if gain >= trig:
+            s = peak * (1 - dist)
+    if gain >= C.BE_TRIGGER:
+        s = max(s, entry * C.BE_LEVEL)
+    return max(old, s)
+
+
+def close_position(con, p, ts, px, reason, stop=None, peak=None, slog=None):
+    proceeds = sell_proceeds(p["qty"], px)
+    pnl = proceeds - p["size_usd"] - C.NETWORK_FEE_USD
+    con.execute("""UPDATE positions SET status='closed',exit_ts=?,exit_price=?,exit_reason=?,proceeds=?,pnl_usd=?,pnl_pct=?,last_price=?,
+                   stop=COALESCE(?,stop),peak=COALESCE(?,peak),stop_log=COALESCE(?,stop_log),last_update=? WHERE id=?""",
+                (ts, px, reason, proceeds, pnl, pnl / p["size_usd"] * 100, px, stop, peak,
+                 json.dumps(slog[-30:]) if slog is not None else None, now(), p["id"]))
+    if p["account"] == 1:
+        meta_set(con, "cash", meta_get(con, "cash", C.START_EQUITY) + proceeds)
+        log.info("PAPER SELL %s %s pnl $%.2f (%.0f%%)", p["symbol"], reason, pnl, pnl / p["size_usd"] * 100)
+
+
+def update_position(con, p, pool_now=None):
+    pool = pool_now or p["pool"]
+    t_now = now()
+    cs = gecko_candles(pool, p["mint"], int(p["last_candle_ts"]) + 60 if p["last_update"] else int(p["entry_ts"] // 60 * 60) + 60)
+    cs = [c for c in cs if c[0] + 60 <= t_now - 20]   # completed candles only
+    stop, peak, entry = p["stop"], p["peak"], p["entry_price"]
+    slog = json.loads(p["stop_log"] or "[]")
+    ls = con.execute("SELECT ts,sold_frac FROM leader_sells WHERE wallet=? AND mint=?", (p["leader"], p["mint"])).fetchone()
+    mirror_ts = ls["ts"] + C.COPY_DELAY_S if ls and ls["sold_frac"] >= C.MIRROR_SELL_FRAC else None
+    last_ts, last_px = p["last_candle_ts"], p["last_price"]
+    for (t, o, h, l, c) in cs:
+        if t <= p["entry_ts"] - 60:
+            continue
+        kw = dict(stop=stop, peak=peak, slog=slog)
+        if mirror_ts and t >= mirror_ts:
+            close_position(con, p, t, o, "smart wallet sold", **kw); return
+        if t >= p["entry_ts"] + C.TIME_STOP_S:
+            close_position(con, p, t, o, "24h time stop", **kw); return
+        if o <= stop:
+            close_position(con, p, t, o, "stop (gapped through)" if stop < entry else "trailing stop (gapped)", **kw); return
+        if l <= stop:
+            close_position(con, p, t, stop if c >= stop else c, "stop" if stop < entry else "trailing stop", **kw); return
+        if h > peak:
+            peak = h
+            ns = new_stop(entry, peak, stop)
+            if ns > stop:
+                slog.append([t, ns, f"peak +{(peak/entry-1)*100:.0f}%"]); stop = ns
+        last_ts, last_px = t, c
+    # no candle (no trades) for a long time -> time stop at last known price
+    if t_now >= p["entry_ts"] + C.TIME_STOP_S and (not cs or cs[-1][0] < p["entry_ts"] + C.TIME_STOP_S):
+        kw = dict(stop=stop, peak=peak, slog=slog)
+        if mirror_ts and mirror_ts < p["entry_ts"] + C.TIME_STOP_S:
+            close_position(con, p, mirror_ts, last_px, "smart wallet sold", **kw); return
+        close_position(con, p, p["entry_ts"] + C.TIME_STOP_S, last_px, "24h time stop", **kw); return
+    con.execute("UPDATE positions SET stop=?,peak=?,last_candle_ts=?,last_price=?,last_update=?,stop_log=?,pool=? WHERE id=?",
+                (stop, peak, last_ts, last_px, t_now, json.dumps(slog[-30:]), pool, p["id"]))
+
+
+def guard_all(con):
+    opens = con.execute("SELECT * FROM positions WHERE status='open' ORDER BY account DESC, last_update ASC").fetchall()
+    if not opens:
+        return
+    # refresh the best pool once in a while (pump.fun coins migrate from the bonding curve to PumpSwap)
+    pools = {}
+    stale = [p["mint"] for p in opens if now() - (p["last_update"] or 0) > 300]
+    if stale:
+        for m, ps in dex_pairs(set(stale)).items():
+            tp = top_pair(ps)
+            if tp:
+                pools[m] = tp["pairAddress"]
+    every = max(60, len(opens) * 60 / 15)   # keep GeckoTerminal under its free limit
+    for p in opens:
+        if p["account"] == 0 and now() - (p["last_update"] or 0) < every:
+            continue
+        if p["account"] == 1 and now() - (p["last_update"] or 0) < 55:
+            continue
+        if LIM["gecko"].free() < 3:
+            break
+        try:
+            update_position(con, p, pools.get(p["mint"]))
+            con.commit()
+        except Exception as e:
+            log.warning("guard error %s %s", p["symbol"], e)
+
+
+# ----------------------------------------------------------------------------- outcome checkpoints for every signal
+def checkpoints(con):
+    t = now(); todo = []
+    for col, sec in (("p1h", 3600), ("p6h", 6 * 3600), ("p24h", 86400)):
+        rows = con.execute(f"""SELECT id,mint,price_detect FROM signals WHERE {col} IS NULL AND price_detect>0
+            AND status IN ('survivor','killed') AND detected_ts<=? AND detected_ts>?""", (t - sec, t - sec - 3 * 3600)).fetchall()
+        todo += [(col, r) for r in rows]
+    if not todo:
+        return
+    pairs = dex_pairs({r["mint"] for _, r in todo})
+    for col, r in todo:
+        tp = top_pair(pairs.get(r["mint"]))
+        pct = (float(tp["priceUsd"]) / r["price_detect"] - 1) * 100 if tp and tp.get("priceUsd") else -100.0
+        con.execute(f"UPDATE signals SET {col}=? WHERE id=?", (pct, r["id"]))
+    con.commit()
+
+
+# ----------------------------------------------------------------------------- main loop
+def poll_wallets(con):
+    t = now(); cands = []; polled = 0
+    ws = con.execute("SELECT * FROM wallets WHERE active=1 ORDER BY last_poll ASC").fetchall()
+    open_mints = {(r["leader"], r["mint"]) for r in con.execute("SELECT leader,mint FROM positions WHERE status='open'")}
+    for w in ws:
+        if t - (w["last_poll"] or 0) < (w["poll_s"] or 60):
+            continue
+        if now() - t > 50:
+            break
+        addr = w["address"]
+        try:
+            hold, n = snapshot(addr)
+        except Exception as e:
+            log.warning("snapshot failed %s %s", w["name"], e)
+            con.execute("UPDATE wallets SET last_poll=? WHERE address=?", (now(), addr)); continue
+        polled += 1; det = now()
+        poll_s = 60 if n < 1500 else (180 if n < 6000 else (300 if n < 20000 else 900))
+        snap = con.execute("SELECT ts,holdings FROM snapshots WHERE address=?", (addr,)).fetchone()
+        if snap and det - snap["ts"] <= max(C.GAP_REBASELINE_S, poll_s * 3):
+            prev = json.loads(snap["holdings"])
+            for mint, (amt, ata) in hold.items():
+                if mint in C.EXCLUDE_MINTS:
+                    continue
+                if not prev.get(mint) or prev[mint][0] == 0:
+                    cands.append(dict(wallet=addr, name=w["name"], mint=mint, ata=ata, amt=amt, prev_ts=snap["ts"], det_ts=det))
+            # leader sells on coins we hold (for the mirror-sell rule)
+            for mint, (pamt, pata) in prev.items():
+                if (addr, mint) not in open_mints:
+                    continue
+                cur = hold.get(mint, [0])[0]
+                if cur < pamt:
+                    sg = con.execute("SELECT leader_post_amt FROM signals WHERE wallet=? AND mint=? AND status='survivor' ORDER BY id DESC",
+                                     (addr, mint)).fetchone()
+                    ref = (sg and sg[0]) or pamt
+                    frac = 1 - cur / ref if ref else 1
+                    ts_sell = (snap["ts"] + det) / 2
+                    try:
+                        h = ata_history(pata, snap["ts"])
+                        if h:
+                            ts_sell = h[-1]["blockTime"] if cur == 0 else h[0]["blockTime"]
+                    except Exception:
+                        pass
+                    ex = con.execute("SELECT sold_frac FROM leader_sells WHERE wallet=? AND mint=?", (addr, mint)).fetchone()
+                    if not ex or (ex[0] < C.MIRROR_SELL_FRAC and frac > ex[0]):
+                        con.execute("INSERT OR REPLACE INTO leader_sells VALUES(?,?,?,?)", (addr, mint, ts_sell, frac))
+        con.execute("INSERT OR REPLACE INTO snapshots VALUES(?,?,?)", (addr, det, json.dumps(hold)))
+        con.execute("UPDATE wallets SET last_poll=?, n_accounts=?, poll_s=? WHERE address=?", (det, n, poll_s, addr))
+        con.commit()
+    return cands, polled
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                        handlers=[logging.handlers.RotatingFileHandler(C.LOG_PATH, maxBytes=5_000_000, backupCount=3),
+                                  ] + ([] if os.environ.get("QUIET") else [logging.StreamHandler(sys.stdout)]))
+    con = db(); con.executescript(SCHEMA)
+    if meta_get(con, "start_ts") is None:
+        meta_set(con, "start_ts", now()); meta_set(con, "cash", C.START_EQUITY); con.commit()
+    log.info("scanner start (PAPER MODE ONLY - no wallet, no keys, nothing signed)")
+    last_eq = 0
+    while True:
+        loop_t = now()
+        try:
+            if now() - (meta_get(con, "board_ts", 0) or 0) > C.BOARD_REFRESH_S:
+                try:
+                    refresh_board(con)
+                except Exception as e:
+                    log.warning("board refresh failed %s", e); meta_set(con, "board_ts", now() - C.BOARD_REFRESH_S + 900); con.commit()
+            b0 = STATS["rpc_bytes"]
+            cands, polled = poll_wallets(con)
+            process_new_buys(con, cands)
+            guard_all(con)
+            checkpoints(con)
+            if now() - last_eq > 300:
+                st = account_state(con)
+                con.execute("INSERT OR REPLACE INTO equity VALUES(?,?,?,?,?)", (now(), st["cash"], st["open_value"], st["equity"], st["n_open"]))
+                last_eq = now()
+            con.execute("INSERT OR REPLACE INTO heartbeat VALUES(?,?,?,?)", (now(), polled, (STATS["rpc_bytes"] - b0) / 1e6,
+                                                                          f"{len(cands)} new buys" if cands else None))
+            con.commit()
+        except Exception as e:
+            log.error("loop error %s\n%s", e, traceback.format_exc())
+            try:
+                con.rollback()
+            except Exception:
+                pass
+        time.sleep(max(1, C.LOOP_S - (now() - loop_t)))
+
+
+if __name__ == "__main__":
+    main()
