@@ -8,7 +8,8 @@ Filter  -> kills any coin breaking a hard rule (dev >5%, liquidity <$25k, top-10
 Sniper  -> paper-buys survivors 5 s after the smart wallet, with slippage and fees.
 Guard   -> stop set at entry, moved to breakeven, then trailed tighter as gains grow; mirror-sell; 24 h time stop.
 
-PAPER MODE ONLY: no wallet, no private keys, nothing is ever signed or sent.
+PAPER MODE by default: no wallet, no private keys, nothing is ever signed or sent.
+Live mode (live.py) is a separate, switched-off add-on; see live.py and LIVE.md.
 """
 import os, base64, calendar, gzip, json, logging, logging.handlers, math, re, sqlite3, struct, sys, time, traceback
 import urllib.request, urllib.error
@@ -16,6 +17,15 @@ from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config as C
+import live   # live mode: switched off unless LIVE_MODE is set; with it off every hook returns at once
+
+
+def live_hook(fn, *a):
+    """Live mode can never break paper mode: any error in a live hook is logged and ignored."""
+    try:
+        fn(*a)
+    except Exception as e:
+        logging.getLogger("scanner").error("live hook error %s", e)
 
 log = logging.getLogger("scanner")
 
@@ -501,6 +511,7 @@ def handle_candidate(con, c, pairs):
         open_position(con, sid, 1, mint, sym, tp["pairAddress"], wallet, entry_ts, px, src, size)
         meta_set(con, "cash", st["cash"] - size - C.NETWORK_FEE_USD)
         log.info("PAPER BUY %s %s $%.2f @ %.10g (%s) copying %s", sym, mint, size, px, src, c["name"])
+        live_hook(live.on_paper_buy, con, sid, mint, sym, buy_ts)
 
 
 def open_position(con, sid, account, mint, sym, pool, leader, entry_ts, px, src, size):
@@ -540,6 +551,7 @@ def close_position(con, p, ts, px, reason, stop=None, peak=None, slog=None):
     if p["account"] == 1:
         meta_set(con, "cash", meta_get(con, "cash", C.START_EQUITY) + proceeds)
         log.info("PAPER SELL %s %s pnl $%.2f (%.0f%%)", p["symbol"], reason, pnl, pnl / p["size_usd"] * 100)
+        live_hook(live.on_paper_close, con, p["signal_id"], p["mint"], reason)
 
 
 def update_position(con, p, pool_now=None):
@@ -697,6 +709,7 @@ def main():
             cands, polled = poll_wallets(con)
             process_new_buys(con, cands)
             guard_all(con)
+            live_hook(live.tick, con)
             checkpoints(con)
             if now() - last_eq > 300:
                 st = account_state(con)

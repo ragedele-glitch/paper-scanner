@@ -131,6 +131,15 @@ def uptime(con, now):
     return {"h24": share(86400), "h48": share(48 * 3600), "cells": cells}
 
 
+def live_status(con):
+    """Live mode summary for the status tab. Never lets a live-mode problem break the paper dashboard."""
+    try:
+        import live
+        return live.dashboard_status(con)
+    except Exception:
+        return {"mode": "unknown"}
+
+
 def build_state():
     now = time.time()
     con = sqlite3.connect(f"file:{C.DB_PATH}?mode=ro", uri=True, timeout=10)
@@ -236,9 +245,10 @@ def build_state():
 
     errs, activity = parse_log(now)
     awake = last_beat is not None and now - last_beat < 120
+    live_st = live_status(con)
     con.close()
     return {
-        "now": now, "paper_only": True,
+        "now": now, "paper_only": live_st.get("mode") == "off", "live": live_st,
         "status": {"awake": awake, "last_beat": last_beat, "since_start_h": (now - start_ts) / 3600,
                    "wallets": len(wallets), "polled_10m": polled_10m, "errors": errs, "uptime": uptime(con2(), now)},
         "account": {"start": C.START_EQUITY, "equity": equity, "cash": cash, "open_value": open_val,

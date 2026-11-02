@@ -1,6 +1,8 @@
 name: Paper scanner
 
-# PAPER MODE ONLY. No wallet, no keys, nothing is signed or sent on-chain.
+# PAPER MODE. No wallet, no keys, nothing is signed or sent on-chain.
+# Live mode (live.py) is switched OFF: it only wakes up if the repository variable LIVE_MODE is set to
+# dry-run or live, and live also needs the LIVE_WALLET_KEY secret, which does not exist. See LIVE.md.
 # Each run follows the smart wallets for about 4 hours, then queues the next run itself.
 # The 15-minute schedule is a safety net that restarts it if the chain ever breaks.
 
@@ -24,13 +26,28 @@ jobs:
     env:
       DASH_KEY: ${{ secrets.DASH_KEY }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Live mode settings (repository variables, Settings > Secrets and variables > Actions > Variables).
+      # None are set, so LIVE_MODE is empty and live mode stays off.
+      LIVE_MODE: ${{ vars.LIVE_MODE }}
+      LIVE_WALLET_ADDRESS: ${{ vars.LIVE_WALLET_ADDRESS }}
+      LIVE_TRADE_USD: ${{ vars.LIVE_TRADE_USD }}
+      LIVE_TOTAL_BUDGET_USD: ${{ vars.LIVE_TOTAL_BUDGET_USD }}
+      LIVE_MAX_OPEN: ${{ vars.LIVE_MAX_OPEN }}
+      LIVE_DAILY_LOSS_USD: ${{ vars.LIVE_DAILY_LOSS_USD }}
+      LIVE_SLIPPAGE_BPS: ${{ vars.LIVE_SLIPPAGE_BPS }}
+      LIVE_MAX_PRICE_IMPACT_PCT: ${{ vars.LIVE_MAX_PRICE_IMPACT_PCT }}
+      LIVE_MAX_SIGNAL_AGE_S: ${{ vars.LIVE_MAX_SIGNAL_AGE_S }}
+      LIVE_MAX_WALLET_USD: ${{ vars.LIVE_MAX_WALLET_USD }}
+      LIVE_KILL: ${{ vars.LIVE_KILL }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: Install
-        run: pip install --quiet cryptography
+        run: |
+          pip install --quiet cryptography
+          if [ "$LIVE_MODE" = "live" ]; then pip install --quiet "solders==0.29.0"; fi
       - name: Restore saved bot state
         uses: actions/cache/restore@v4
         with:
@@ -42,6 +59,10 @@ jobs:
 
       - name: Scan, hour 1
         run: python ci_runner.py run 58
+        env:
+          LIVE_WALLET_KEY: ${{ secrets.LIVE_WALLET_KEY }}
+          LIVE_RPC_URL: ${{ secrets.LIVE_RPC_URL }}
+          JUP_API_KEY: ${{ secrets.JUP_API_KEY }}
       - name: Save state 1
         if: always()
         uses: actions/cache/save@v4
@@ -51,6 +72,10 @@ jobs:
 
       - name: Scan, hour 2
         run: python ci_runner.py run 58
+        env:
+          LIVE_WALLET_KEY: ${{ secrets.LIVE_WALLET_KEY }}
+          LIVE_RPC_URL: ${{ secrets.LIVE_RPC_URL }}
+          JUP_API_KEY: ${{ secrets.JUP_API_KEY }}
       - name: Save state 2
         if: always()
         uses: actions/cache/save@v4
@@ -60,6 +85,10 @@ jobs:
 
       - name: Scan, hour 3
         run: python ci_runner.py run 58
+        env:
+          LIVE_WALLET_KEY: ${{ secrets.LIVE_WALLET_KEY }}
+          LIVE_RPC_URL: ${{ secrets.LIVE_RPC_URL }}
+          JUP_API_KEY: ${{ secrets.JUP_API_KEY }}
       - name: Save state 3
         if: always()
         uses: actions/cache/save@v4
@@ -69,6 +98,10 @@ jobs:
 
       - name: Scan, hour 4 (queues the next run near the end)
         run: python ci_runner.py run 58 last
+        env:
+          LIVE_WALLET_KEY: ${{ secrets.LIVE_WALLET_KEY }}
+          LIVE_RPC_URL: ${{ secrets.LIVE_RPC_URL }}
+          JUP_API_KEY: ${{ secrets.JUP_API_KEY }}
       - name: Save state 4
         if: always()
         uses: actions/cache/save@v4
