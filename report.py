@@ -14,9 +14,12 @@ def _q(con, sql, args=()):
 
 def _awake(con, t0, t1):
     """Share of minutes between t0 and t1 with at least one bot check-in."""
-    mins = {int(r[0] // 60) for r in _q(con, "SELECT ts FROM heartbeat WHERE ts>=? AND ts<=?", (t0, t1))}
-    total = max(1, int((t1 - t0) // 60))
-    return min(100.0, 100 * len(mins) / total), len(mins) / 60
+    # same rule as the dashboard: a minute counts as awake if the bot checked in during it or the minute before
+    # (one loop can take a little over a minute)
+    beats = {int(r[0] // 60) for r in _q(con, "SELECT ts FROM heartbeat WHERE ts>=? AND ts<=?", (t0 - 60, t1))}
+    ms = range(int(t0 // 60), int(t1 // 60) + 1)
+    up = sum(1 for m in ms if m in beats or (m - 1) in beats)
+    return min(100.0, 100 * up / max(1, len(ms))), up / 60
 
 
 def _lag(con, where, args):
