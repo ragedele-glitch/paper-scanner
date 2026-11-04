@@ -74,6 +74,19 @@ TRAIL_STEPS = [             # (peak gain reached, stop distance under the peak)
     (1.00, 0.20),
     (3.00, 0.15),
 ]
+# Exit rules v3 (from Nov 4, 2026 afternoon; positions opened earlier keep the rules above)
+MAX_LOSS_PCT = 0.25         # $5 max-loss stop: 25% under entry = $5 on a $20 trade (real fill can be worse)
+BE2_TRIGGER = 0.50          # once up 50%, stop moves to the real breakeven price after all costs
+HALF_AT = 2.0               # runner plan: at 2x the entry price sell half (takes back about the stake)
+HALF_FRAC = 0.5
+TRAIL_V3 = [                # runner trail: widens as the trade grows, so the second half can run
+    (0.40, 0.25),           # from +40%: 25% under the peak (same as the old trail)
+    (1.00, 0.30),           # from 2x: 30%
+    (2.00, 0.40),           # past 3x: 40%
+]
+# exit comparison: flag the new exits once this many finished trades are compared, with at least this many differing
+CMP_MIN_TRADES = 20
+CMP_MIN_DIFFER = 5
 MIRROR_SELL_FRAC = 0.50     # exit if the smart wallet sells 50%+ of its bag
 TIME_STOP_S = 24 * 3600     # close anything still open after 24 hours
 

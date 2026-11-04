@@ -33,7 +33,50 @@ EXITS = {
     "stop (gapped through)": "Stop loss hit (price jumped past it)",
     "trailing stop (gapped)": "Trailing stop hit (price jumped past it)",
     "smart wallet sold": "Copied wallet sold, so we sold", "24h time stop": "24-hour time limit",
+    "max-loss stop": "$5 max-loss stop hit", "max-loss stop (gapped)": "$5 max-loss stop hit (price jumped past it)",
+    "breakeven stop": "Breakeven stop hit (winner closed at no loss)",
+    "breakeven stop (gapped)": "Breakeven stop hit (price jumped past it)",
 }
+ALT_NAMES = {"old_exits": "Old exits (no half sell, old tightening trail)",
+             "no_stop_be": "New exits without the $5 stop and breakeven"}
+
+
+def exit_compare(con, acct):
+    """New exits vs the comparison copies on the same finished trades (v3 trades where every copy has finished)."""
+    rows = con.execute("SELECT pnl_usd, alts, alts_open, part_ts FROM positions WHERE account=? AND status='closed' AND rules='v3'",
+                       (acct,)).fetchall()
+    done = [r for r in rows if not r[2] and r[1]]
+    out = {"n": len(done), "waiting": len(rows) - len(done), "new": {"pnl": sum(r[0] for r in done),
+           "wins": sum(1 for r in done if r[0] > 0), "losses": sum(1 for r in done if r[0] <= 0)},
+           "half_sold": sum(1 for r in done if r[3]), "alts": {}}
+    for k in ALT_NAMES:
+        pairs = [(r[0], json.loads(r[1]).get(k, {}).get("pnl")) for r in done]
+        pairs = [(a, b) for a, b in pairs if b is not None]
+        differ = [(a, b) for a, b in pairs if abs(a - b) > 0.005]
+        new_pnl, alt_pnl = sum(a for a, _ in pairs), sum(b for _, b in pairs)
+        new_l, alt_l = sum(1 for a, _ in pairs if a <= 0), sum(1 for _, b in pairs if b <= 0)
+        meaningful = len(pairs) >= C.CMP_MIN_TRADES and len(differ) >= C.CMP_MIN_DIFFER
+        worse = meaningful and (new_pnl < alt_pnl or new_l > alt_l)
+        out["alts"][k] = {"label": ALT_NAMES[k], "n": len(pairs), "differ": len(differ), "new_pnl": new_pnl, "alt_pnl": alt_pnl,
+                          "new_wins": len(pairs) - new_l, "alt_wins": len(pairs) - alt_l, "new_losses": new_l,
+                          "alt_losses": alt_l, "meaningful": meaningful, "worse": worse}
+    return out
+
+
+def compare_lines(cmp, label):
+    """Plain-text lines for the report and the scanner updates."""
+    L = []
+    m = lambda v: ("-" if v < 0 else "+") + f"${abs(v):.2f}"
+    for k, a in cmp["alts"].items():
+        if not a["n"]:
+            L.append(f"  {label}: new exits vs {a['label'].lower()}: no finished trades yet ({cmp['waiting']} still being followed).")
+            continue
+        verdict = ("WARNING: NEW EXITS DOING WORSE" if a["worse"] else "new exits ahead or level" if a["meaningful"]
+                   else f"too early to judge (needs {C.CMP_MIN_TRADES} trades with {C.CMP_MIN_DIFFER} that differ)")
+        L.append(f"  {label}: new exits {m(a['new_pnl'])} ({a['new_wins']} won, {a['new_losses']} lost) vs "
+                 f"{a['label'].lower()} {m(a['alt_pnl'])} ({a['alt_wins']} won, {a['alt_losses']} lost) on the same "
+                 f"{a['n']} trades, {a['differ']} differed. {verdict}.")
+    return L
 
 
 def sell_proceeds(qty, px):
@@ -200,12 +243,15 @@ def build_state():
         open_rows = []; open_val = 0.0
         for p in opens:
             val = fills.position_value(p, p["last_price"] or 0); open_val += val
-            pnl = val - p["size_usd"] - (p["fee_in"] if p["fill_model"] == "live" else C.NETWORK_FEE_USD)
+            pnl = val + (p["part_proceeds"] or 0) - p["size_usd"] - (p["fee_in"] if p["fill_model"] == "live" else C.NETWORK_FEE_USD)
             open_rows.append({
                 "coin": p["symbol"] or short(p["mint"]), "mint": short(p["mint"]), "entry_price": p["entry_price"],
                 "now_price": p["last_price"], "size": p["size_usd"], "pnl": pnl, "pnl_pct": pnl / p["size_usd"] * 100,
                 "stop": p["stop"], "stop_pct": (p["stop"] / p["entry_price"] - 1) * 100 if p["entry_price"] else None,
-                "stop_kind": "trailing" if p["stop"] > p["entry_price"] else ("breakeven" if abs(p["stop"] / p["entry_price"] - 1) < .2 and p["stop"] >= p["entry_price"] else "initial"),
+                "stop_kind": ("breakeven" if p["be_px"] and abs(p["stop"] - p["be_px"]) <= 1e-9 * p["stop"] else
+                              "trailing" if p["stop"] > p["entry_price"] else
+                              ("breakeven" if abs(p["stop"] / p["entry_price"] - 1) < .2 and p["stop"] >= p["entry_price"] else "initial")),
+                "half": ({"px": p["part_px"], "x": p["part_px"] / p["entry_price"], "got": p["part_proceeds"]} if p["part_ts"] else None),
                 "peak_pct": (p["peak"] / p["entry_price"] - 1) * 100 if p["entry_price"] else None,
                 "wallet": names.get(p["leader"]) or short(p["leader"]), "entry_ts": p["entry_ts"],
                 "price_age": now - (p["last_update"] or p["entry_ts"]),
@@ -224,6 +270,12 @@ def build_state():
                          "entry_ts": c["entry_ts"], "exit_ts": c["exit_ts"], "entry_price": c["entry_price"], "exit_price": c["exit_price"],
                          "size": c["size_usd"], "pnl": c["pnl_usd"], "pnl_pct": c["pnl_pct"],
                          "reason": EXITS.get(c["exit_reason"], c["exit_reason"]),
+                         "half": ({"x": c["part_px"] / c["entry_price"], "got": c["part_proceeds"]} if c["part_ts"] else None),
+                         "stop_fill": ({"stop": c["exit_trigger_px"], "fill": c["exit_price"], "src": c["exit_fill_src"]}
+                                       if c["exit_trigger_px"] else None),
+                         "alts": ({k: {"label": ALT_NAMES[k], "pnl": a.get("pnl"), "reason": EXITS.get(a.get("reason"), a.get("reason")),
+                                       "open": a.get("st") == "open"} for k, a in json.loads(c["alts"]).items() if k in ALT_NAMES}
+                                  if c["alts"] else None),
                          "fill": ({"ideal": c["ideal_pnl"], "delay": c["gap_delay"], "impact": c["gap_impact"],
                                    "botfee": c["gap_botfee"], "netfee": c["gap_netfee"], "rt_pct": c["rt_pct"],
                                    "liq_in": c["liq_in"], "liq_out": c["liq_out"], "src_in": c["q_src_in"],
@@ -327,6 +379,11 @@ def build_state():
     errs, activity = parse_log(now)
     awake = last_beat is not None and now - last_beat < 120
     live_st = live_status(con)
+    exits = {"min_trades": C.CMP_MIN_TRADES, "min_differ": C.CMP_MIN_DIFFER, "groups": [
+        {"label": "Realistic $200 account", **exit_compare(con, C.ACCT_REAL)},
+        {"label": "Realistic, every survivor ($20 each)", **exit_compare(con, C.ACCT_REAL_SHADOW)},
+        {"label": "Old 5 s test, $200 account", **exit_compare(con, C.ACCT_5S)},
+        {"label": "Old 5 s test, every survivor", **exit_compare(con, C.ACCT_5S_SHADOW)}]}
     con.close()
     try:
         import report
@@ -352,6 +409,7 @@ def build_state():
                             "noisy": len(feed.get("noisy") or []), "side": feed.get("side")},
                    "lag": lag},
         "account": account, "account_5s": account_5s,
+        "exits": exits,
         "entry_compare": {"n": len(entry_gap), "median_gap_pct": entry_gap[len(entry_gap) // 2] if entry_gap else None,
                           "real_shadow": {"n": len(sh_real), "pnl": sum(r[0] for r in sh_real)}},
         "positions": open_rows, "history": hist[:200],
@@ -368,7 +426,13 @@ def build_state():
         "realism": realism,
         "activity": activity,
         "rules": {"size": f"{int(C.POS_FRACTION*100)}% of the account per trade, max {C.MAX_OPEN} open",
-                  "stop": f"Stop {int(C.INITIAL_STOP*100)}% under entry; moves to breakeven at +{int(C.BE_TRIGGER*100)}%, then trails",
+                  "stop": (f"$5 max-loss stop: {int(C.MAX_LOSS_PCT*100)}% under entry (a dump can fill worse; the real fill is recorded). "
+                           f"From +{int(C.BE2_TRIGGER*100)}% the stop never sits below breakeven after all costs"),
+                  "runner": (f"Runner plan: at {C.HALF_AT:g}x sell half to take back the stake; the rest rides under a trail that widens: "
+                             + ", ".join(f"{int(d*100)}% under the peak from {'+' + str(int(g*100)) + '%' if g < 1 else str(g + 1).rstrip('0').rstrip('.') + 'x'}"
+                                         for g, d in C.TRAIL_V3)),
+                  "compare": ("Every trade is also followed under the old exits and under the new exits without the $5 stop and "
+                              "breakeven, so both P&Ls can be compared on the same trades"),
                   "costs": f"{int(C.SLIPPAGE*100)}% slippage + {int((C.BOT_FEE+C.POOL_FEE)*100)}% fees each way + ${C.NETWORK_FEE_USD:.2f} network fee",
                   "costs_live": (f"lands {C.EXEC_DELAY_S} s after seen; real Jupiter quotes for the trade size (price impact + DEX fees, "
                                  f"sell re-quoted at exit); {int(C.BOT_FEE*100)}% bot fee each way; base + live priority fee + "

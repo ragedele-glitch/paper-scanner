@@ -157,7 +157,12 @@ MIGRATIONS = [
     "q_src_in TEXT", "q_src_out TEXT", "route TEXT",
     "fee_in REAL", "fee_out REAL",                    # network: base + priority + Jito tip, in dollars
     "liq_in REAL", "liq_out REAL", "sellable INT",
-    "ideal_pnl REAL", "gap_delay REAL", "gap_impact REAL", "gap_botfee REAL", "gap_netfee REAL")
+    "ideal_pnl REAL", "gap_delay REAL", "gap_impact REAL", "gap_botfee REAL", "gap_netfee REAL",
+    "rules TEXT",          # 'v3' = $5 max-loss stop + breakeven at +50% + half at 2x + widening trail; NULL = original
+    "be_px REAL",          # price where the trade breaks even after all costs
+    "exit_trigger_px REAL", "exit_fill_src TEXT",   # stop level vs the price a live sell would really have got
+    "part_ts REAL", "part_px REAL", "part_qty REAL", "part_proceeds REAL", "part_r REAL", "part_fee REAL",
+    "alts TEXT", "alts_open INT")   # the same trade under the other exit rules, for comparison
 ] + [f"ALTER TABLE signals ADD COLUMN {c}" for c in (
     "holders INT", "transfer_fee_pct REAL", "lp_locked_pct REAL", "token_program TEXT",
     "rt_pct REAL", "fill_note TEXT")]
@@ -662,12 +667,19 @@ def open_main(con, sid, account, mint, sym, pool, wallet, entry_ts, px, src, nam
 
 
 def open_position(con, sid, account, mint, sym, pool, leader, entry_ts, px, src, size, fill=None):
-    stop = px * (1 - C.INITIAL_STOP)
+    stop = px * (1 - C.MAX_LOSS_PCT)
     qty = fills.buy_qty(size, px, fill["r_buy"]) if fill else buy_qty(size, px)
+    if fill:
+        fee = fill["fee_in"]; sf = (fill["r_sell_est"] or 0) * (1 - C.BOT_FEE)
+    else:
+        fee = C.NETWORK_FEE_USD; sf = (1 - C.SLIPPAGE) * (1 - C.BOT_FEE - C.POOL_FEE)
+    be_px = (size + 2 * fee) / (qty * sf) if qty and sf > 0 else px * C.BE_LEVEL
+    alts = {k: alt_init(spec, px, qty, entry_ts, be_px) for k, spec in ALTS.items()}
+    fill = dict(fill or {}, rules="v3", be_px=be_px, alts=json.dumps(alts), alts_open=len(alts))
     cur = con.execute("""INSERT INTO positions(signal_id,account,mint,symbol,pool,leader,entry_ts,entry_price,entry_src,size_usd,qty,
         stop,peak,last_candle_ts,last_price,last_update,status,stop_log) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?)""",
                 (sid, account, mint, sym, pool, leader, entry_ts, px, src, size, qty, stop, px,
-                 int(entry_ts // 60 * 60), px, 0, json.dumps([[entry_ts, stop, "initial"]])))
+                 int(entry_ts // 60 * 60), px, 0, json.dumps([[entry_ts, stop, "$5 max-loss (-25%)"]])))
     if fill:
         cols = list(fill.keys())
         con.execute(f"UPDATE positions SET {','.join(c + '=?' for c in cols)} WHERE id=?",
@@ -693,12 +705,212 @@ def new_stop(entry, peak, old):
     return max(old, s)
 
 
+REAL_SPEC = dict(max_loss=C.MAX_LOSS_PCT, be=C.BE2_TRIGGER, half_at=C.HALF_AT, trail=C.TRAIL_V3)
+ALTS = {
+    # the old exits on the same trade: $5 stop + breakeven, the old tightening trail, no half sell
+    "old_exits": dict(max_loss=C.MAX_LOSS_PCT, be=C.BE2_TRIGGER, half_at=None, trail=C.TRAIL_STEPS),
+    # the new exits without the $5 stop and the breakeven rule
+    "no_stop_be": dict(max_loss=None, be=None, half_at=C.HALF_AT, trail=C.TRAIL_V3),
+}
+
+
+def stop_for(spec, entry, peak, old, be_px):
+    gain = peak / entry - 1 + 1e-9
+    s = entry * (1 - spec["max_loss"]) if spec.get("max_loss") else 0.0
+    for trig, dist in spec["trail"]:
+        if gain >= trig:
+            s = peak * (1 - dist)
+    if spec.get("be") and gain >= spec["be"]:
+        s = max(s, be_px or entry * C.BE_LEVEL)
+    return max(old, s)
+
+
+def alt_init(spec, px, qty, entry_ts, be_px):
+    return {"st": "open", "stop": stop_for(spec, px, px, 0.0, be_px), "peak": px, "last": int(entry_ts // 60 * 60),
+            "px": px, "frac": 1.0, "q0": qty, "legs": []}
+
+
+def is_v3(p):
+    return "rules" in p.keys() and p["rules"] == "v3"
+
+
+def stop_reason(p, stop, gapped):
+    entry = p["entry_price"]
+    if is_v3(p):
+        if stop < entry:
+            r = "max-loss stop"
+        elif p["be_px"] and abs(stop - p["be_px"]) <= 1e-9 * stop:
+            r = "breakeven stop"
+        else:
+            r = "trailing stop"
+        return r + (" (gapped)" if gapped else "")
+    if stop < entry:
+        return "stop (gapped through)" if gapped else "stop"
+    return "trailing stop (gapped)" if gapped else "trailing stop"
+
+
+TRADES = {}
+
+
+def stop_fill(p, t, stop):
+    """Realistic sell after a stop triggers: find the first real pool trade at or under the stop in this minute,
+    then sell at the first trade EXEC_DELAY_S after it. Dumps and rugs fill worse than the stop, as live."""
+    key = p["pool"]
+    e = TRADES.get(key)
+    if not (e and now() - e[0] < 30):
+        try:
+            d = http(f"{C.GECKO}/pools/{p['pool']}/trades", kind="gecko")
+            tr = []
+            for x in (d or {}).get("data") or []:
+                a = x["attributes"]
+                tt = calendar.timegm(time.strptime(a["block_timestamp"], "%Y-%m-%dT%H:%M:%SZ"))
+                if a["from_token_address"] == p["mint"]:
+                    tr.append((tt, float(a["price_from_in_usd"])))
+                elif a["to_token_address"] == p["mint"]:
+                    tr.append((tt, float(a["price_to_in_usd"])))
+            tr.sort(); TRADES[key] = (now(), tr); e = TRADES[key]
+        except Exception as ex:
+            log.warning("stop fill trades error %s %s", p["symbol"], ex)
+            return None
+    tr = e[1]
+    if not tr or tr[0][0] >= t + 60:
+        return None
+    hit = next((x for x in tr if t <= x[0] < t + 60 and x[1] <= stop), None)
+    if not hit:
+        return None
+    after = [x for x in tr if x[0] >= hit[0] + C.EXEC_DELAY_S]
+    if after and after[0][0] - hit[0] <= 120:
+        return after[0][1]
+    return hit[1]
+
+
+def is_live(p):
+    return "fill_model" in p.keys() and p["fill_model"] == "live"
+
+
+def sell_leg(p, qty, px, ts, t_now):
+    """Proceeds of selling qty at px. Live-like: re-quote now if the sell is recent, else the entry-time estimate."""
+    if not is_live(p):
+        return sell_proceeds(qty, px), None, C.NETWORK_FEE_USD
+    r = p["r_sell_est"] or 0
+    if t_now - ts < 600:
+        try:
+            pr = dex_pairs([p["mint"]]).get(p["mint"]) or []
+            liq = sum(((x.get("liquidity") or {}).get("usd") or 0) for x in pr) or None
+            r = fills.exit_quote(p["mint"], qty, liq if liq is not None else (p["liq_in"] or 0), bool(p["sellable"]))["r_sell"]
+        except Exception as ex:
+            log.warning("leg quote error %s %s", p["symbol"], ex)
+    fee = fills.tx_fee_usd(p["pool"]) if r > 0 else 0.0
+    return fills.sell_value(qty, px, r, fee), r, fee
+
+
+def stop_px(p, t, stop, o, c, live_fill):
+    if o <= stop:
+        px, src = o, "candle"
+    else:
+        px, src = (stop if c >= stop else c), "candle"
+    if live_fill:
+        f = stop_fill(p, t, stop)
+        if f:
+            px, src = f, "trade after trigger"
+    return px, src
+
+
+def alt_step(con, p, cs, mirror_ts, t_now, live_fill):
+    """Advance the comparison copies of this trade (other exit rules) over the same candles."""
+    if not ("alts" in p.keys() and p["alts"]):
+        return
+    alts = json.loads(p["alts"]); entry = p["entry_price"]; be = p["be_px"]
+    entry_fee = (p["fee_in"] or 0) if is_live(p) else C.NETWORK_FEE_USD
+    for name, a in alts.items():
+        if a["st"] != "open" or name not in ALTS:
+            continue
+        spec = ALTS[name]
+
+        def leg(ts, px, frac):
+            v, r, fee = sell_leg(p, a["q0"] * frac, px, ts, t_now)
+            a["legs"].append([ts, px, frac, v])
+
+        def done(ts, px, why):
+            leg(ts, px, a["frac"]); a["frac"] = 0.0
+            a.update(st="closed", exit_ts=ts, exit_px=px, reason=why,
+                     pnl=sum(x[3] for x in a["legs"]) - p["size_usd"] - entry_fee)
+
+        for (t, o, h, l, c) in cs:
+            if t <= p["entry_ts"] - 60 or t <= a["last"]:
+                continue
+            if mirror_ts and t >= mirror_ts:
+                done(t, o, "smart wallet sold"); break
+            if t >= p["entry_ts"] + C.TIME_STOP_S:
+                done(t, o, "24h time stop"); break
+            if a["stop"] and (o <= a["stop"] or l <= a["stop"]):
+                px, _ = stop_px(p, t, a["stop"], o, c, live_fill)
+                done(t, px, stop_reason(p, a["stop"], o <= a["stop"])); break
+            if spec.get("half_at") and a["frac"] == 1.0 and h >= entry * spec["half_at"]:
+                leg(t, max(o, entry * spec["half_at"]), C.HALF_FRAC); a["frac"] = 1.0 - C.HALF_FRAC
+            if h > a["peak"]:
+                a["peak"] = h; a["stop"] = stop_for(spec, entry, a["peak"], a["stop"], be)
+            a["last"], a["px"] = t, c
+        if a["st"] == "open" and t_now >= p["entry_ts"] + C.TIME_STOP_S and a["last"] < p["entry_ts"] + C.TIME_STOP_S - 60:
+            if mirror_ts and mirror_ts < p["entry_ts"] + C.TIME_STOP_S:
+                done(mirror_ts, a["px"], "smart wallet sold")
+            else:
+                done(p["entry_ts"] + C.TIME_STOP_S, a["px"], "24h time stop")
+        a["upd"] = t_now
+    n_open = sum(1 for a in alts.values() if a["st"] == "open")
+    con.execute("UPDATE positions SET alts=?, alts_open=? WHERE id=?", (json.dumps(alts), n_open, p["id"]))
+
+
+def mirror_time(con, p):
+    ls = con.execute("SELECT ts,sold_frac,det_ts FROM leader_sells WHERE wallet=? AND mint=?", (p["leader"], p["mint"])).fetchone()
+    if ls and ls["sold_frac"] >= C.MIRROR_SELL_FRAC:
+        if p["account"] in (C.ACCT_REAL, C.ACCT_REAL_SHADOW) and ls["det_ts"]:
+            return max(ls["det_ts"], ls["ts"])
+        return ls["ts"] + C.COPY_DELAY_S
+    return None
+
+
+def alt_all(con):
+    """Keep following trades the real rules already closed but a comparison copy still holds."""
+    rows = con.execute("""SELECT * FROM positions WHERE status='closed' AND alts_open>0
+                          AND COALESCE(last_update,0) < ? ORDER BY last_update LIMIT 6""", (now() - 120,)).fetchall()
+    for p in rows:
+        if LIM["gecko"].free() < 4:
+            break
+        try:
+            t_now = now()
+            alts = json.loads(p["alts"])
+            since = min(a["last"] for a in alts.values() if a["st"] == "open") + 60
+            cs = candles_cached(p["pool"], p["mint"], int(since))
+            cs = [c for c in cs if c[0] + 60 <= t_now - 20]
+            alt_step(con, p, cs, mirror_time(con, p), t_now, p["account"] in (C.ACCT_REAL, C.ACCT_REAL_SHADOW))
+            con.execute("UPDATE positions SET last_update=? WHERE id=?", (t_now, p["id"]))
+            con.commit()
+        except Exception as ex:
+            log.warning("alt exits error %s %s", p["symbol"], ex)
+
+
+def take_half(con, p, t, px, stop, slog, t_now):
+    """Runner plan: at 2x sell half the bag, so the stake comes back and the rest rides under the trail."""
+    half = p["qty"] * C.HALF_FRAC
+    proceeds, r, fee = sell_leg(p, half, px, t, t_now)
+    p["qty"] = p["qty"] - half
+    p["part_proceeds"] = proceeds; p["part_r"] = r; p["part_fee"] = fee; p["part_px"] = px
+    con.execute("""UPDATE positions SET qty=?, part_ts=?, part_px=?, part_qty=?, part_proceeds=?, part_r=?, part_fee=? WHERE id=?""",
+                (p["qty"], t, px, half, proceeds, r, fee, p["id"]))
+    slog.append([t, stop, f"sold half at {px / p['entry_price']:.1f}x for ${proceeds:.2f}"])
+    if p["account"] in (C.ACCT_5S, C.ACCT_REAL):
+        k = cash_key(p["account"])
+        meta_set(con, k, meta_get(con, k, C.START_EQUITY) + proceeds)
+        log.info("PAPER SELL HALF [acct %d] %s at %.1fx $%.2f", p["account"], p["symbol"], px / p["entry_price"], proceeds)
+
+
 def close_position(con, p, ts, px, reason, stop=None, peak=None, slog=None):
     if "fill_model" in p.keys() and p["fill_model"] == "live":
         proceeds, pnl = close_live(con, p, px)
     else:
         proceeds = sell_proceeds(p["qty"], px)
-        pnl = proceeds - p["size_usd"] - C.NETWORK_FEE_USD
+        pnl = proceeds + ((p["part_proceeds"] if "part_proceeds" in p.keys() else 0) or 0) - p["size_usd"] - C.NETWORK_FEE_USD
     con.execute("""UPDATE positions SET status='closed',exit_ts=?,exit_price=?,exit_reason=?,proceeds=?,pnl_usd=?,pnl_pct=?,last_price=?,
                    stop=COALESCE(?,stop),peak=COALESCE(?,peak),stop_log=COALESCE(?,stop_log),last_update=? WHERE id=?""",
                 (ts, px, reason, proceeds, pnl, pnl / p["size_usd"] * 100, px, stop, peak,
@@ -725,15 +937,21 @@ def close_live(con, p, px):
     fee_out = fills.tx_fee_usd(p["pool"]) if r_sell > 0 else 0.0
     size, mid, rb = p["size_usd"], p["entry_price"], p["r_buy"] or 1.0
     proceeds = fills.sell_value(p["qty"], px, r_sell, fee_out)
-    pnl = proceeds - size - (p["fee_in"] or 0)
+    part = (p["part_proceeds"] if "part_proceeds" in p.keys() else 0) or 0
+    pnl = proceeds + part - size - (p["fee_in"] or 0)
     lead = p["leader_px"] or mid
-    ideal = size * (px / lead - 1)
-    a = size * (px / mid - 1)                                   # after the copy delay, no costs
-    b = size * (px * r_sell) / (mid * rb) - size                # after price impact and DEX fees
-    c = size * (1 - C.BOT_FEE) ** 2 * (px * r_sell) / (mid * rb) - size   # after the copy-bot fee
+    # each sell leg as a share of the bag: the half sold at 2x (if any) and the rest sold now
+    legs = [(px, r_sell, 1.0)]
+    if part:
+        legs = [(p["part_px"], p["part_r"] if p["part_r"] is not None else r_sell, C.HALF_FRAC), (px, r_sell, 1 - C.HALF_FRAC)]
+    ideal = sum(f * size * (x / lead - 1) for x, r, f in legs)
+    a = sum(f * size * (x / mid - 1) for x, r, f in legs)                          # after the copy delay, no costs
+    b = sum(f * (size * (x * r) / (mid * rb) - size) for x, r, f in legs)          # after price impact and DEX fees
+    c = sum(f * (size * (1 - C.BOT_FEE) ** 2 * (x * r) / (mid * rb) - size) for x, r, f in legs)   # after the bot fee
+    netfee = (p["fee_in"] or 0) + fee_out + (((p["part_fee"] if "part_fee" in p.keys() else 0) or 0) if part else 0)
     con.execute("""UPDATE positions SET r_sell=?, q_src_out=?, fee_out=?, liq_out=?, ideal_pnl=?, gap_delay=?,
                    gap_impact=?, gap_botfee=?, gap_netfee=? WHERE id=?""",
-                (r_sell, q["src"], fee_out, liq_out, ideal, ideal - a, a - b, b - c, (p["fee_in"] or 0) + fee_out, p["id"]))
+                (r_sell, q["src"], fee_out, liq_out, ideal, ideal - a, a - b, b - c, netfee, p["id"]))
     return proceeds, pnl
 
 
@@ -752,6 +970,7 @@ def candles_cached(pool, mint, since):
 
 
 def update_position(con, p, pool_now=None):
+    p = dict(p)
     pool = pool_now or p["pool"]
     t_now = now()
     cs = candles_cached(pool, p["mint"], candle_since(p))
@@ -767,6 +986,10 @@ def update_position(con, p, pool_now=None):
         else:
             mirror_ts = ls["ts"] + C.COPY_DELAY_S
     last_ts, last_px = p["last_candle_ts"], p["last_price"]
+    v3 = is_v3(p)
+    live_fill = v3 and p["account"] in (C.ACCT_REAL, C.ACCT_REAL_SHADOW)
+    if v3:
+        alt_step(con, p, cs, mirror_ts, t_now, live_fill)
     for (t, o, h, l, c) in cs:
         if t <= p["entry_ts"] - 60:
             continue
@@ -775,15 +998,21 @@ def update_position(con, p, pool_now=None):
             close_position(con, p, t, o, "smart wallet sold", **kw); return
         if t >= p["entry_ts"] + C.TIME_STOP_S:
             close_position(con, p, t, o, "24h time stop", **kw); return
-        if o <= stop:
-            close_position(con, p, t, o, "stop (gapped through)" if stop < entry else "trailing stop (gapped)", **kw); return
-        if l <= stop:
-            close_position(con, p, t, stop if c >= stop else c, "stop" if stop < entry else "trailing stop", **kw); return
+        if o <= stop or l <= stop:
+            if v3:
+                px, src = stop_px(p, t, stop, o, c, live_fill)
+                con.execute("UPDATE positions SET exit_trigger_px=?, exit_fill_src=? WHERE id=?", (stop, src, p["id"]))
+            else:
+                px = o if o <= stop else (stop if c >= stop else c)
+            close_position(con, p, t, px, stop_reason(p, stop, o <= stop), **kw); return
+        if v3 and not p.get("part_ts") and h >= entry * C.HALF_AT:
+            take_half(con, p, t, max(o, entry * C.HALF_AT), stop, slog, t_now); p["part_ts"] = t
         if h > peak:
             peak = h
-            ns = new_stop(entry, peak, stop)
+            ns = stop_for(REAL_SPEC, entry, peak, stop, p["be_px"]) if v3 else new_stop(entry, peak, stop)
             if ns > stop:
-                slog.append([t, ns, f"peak +{(peak/entry-1)*100:.0f}%"]); stop = ns
+                lab = "breakeven" if v3 and p["be_px"] and abs(ns - p["be_px"]) < 1e-9 * ns else f"peak +{(peak/entry-1)*100:.0f}%"
+                slog.append([t, ns, lab]); stop = ns
         last_ts, last_px = t, c
     # no candle (no trades) for a long time -> time stop at last known price
     if t_now >= p["entry_ts"] + C.TIME_STOP_S and (not cs or cs[-1][0] < p["entry_ts"] + C.TIME_STOP_S):
@@ -1078,6 +1307,7 @@ def main():
             _t("filters", process_new_buys, con, cands)
             _t("feed2", drain_stream, con)
             _t("guard", guard_all, con)
+            _t("alt exits", alt_all, con)
             live_hook(live.tick, con)
             _t("checkpoints", checkpoints, con)
             if sum(tm.values()) > 60:

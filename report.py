@@ -91,6 +91,15 @@ def make_report(con, host="GitHub Actions (public repo ragedele-glitch/paper-sca
     gaps = sorted((r[0] / r[1] - 1) * 100 for r in pair if r[0] and r[1])
     if gaps:
         L.append(f"  Same coins, realistic entry price vs 5 s entry: median {gaps[len(gaps) // 2]:+.1f}% ({len(gaps)} coins).")
+    try:
+        import dashboard
+        L.append(f"EXIT RULES (from Nov 4 afternoon): $5 max-loss stop (-{int(C.MAX_LOSS_PCT*100)}%), breakeven from +{int(C.BE2_TRIGGER*100)}%, "
+                 f"half sold at {C.HALF_AT:g}x, trail widening 25% -> 40% past 3x. Same trades, both P&Ls:")
+        for acct, lab in ((C.ACCT_REAL, "realistic $200"), (C.ACCT_REAL_SHADOW, "realistic every survivor"),
+                          (C.ACCT_5S, "5 s $200"), (C.ACCT_5S_SHADOW, "5 s every survivor")):
+            L.extend(dashboard.compare_lines(dashboard.exit_compare(con, acct), lab))
+    except Exception as e:
+        L.append(f"Exit comparison failed: {type(e).__name__}")
     s24 = _q(con, "SELECT status, COUNT(*) FROM signals WHERE detected_ts>? GROUP BY status", (now - 86400,))
     L.append("Signals, last 24 h: " + (", ".join(f"{k} {n}" for k, n in s24) or "none"))
     for p in _q(con, f"SELECT account,symbol,entry_price,last_price,size_usd FROM positions WHERE status='open' AND account IN ({C.ACCT_REAL},{C.ACCT_5S})"):
