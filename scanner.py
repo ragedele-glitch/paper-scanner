@@ -21,6 +21,7 @@ from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config as C
+import fills
 import live   # live mode: switched off unless LIVE_MODE is set; with it off every hook returns at once
 import stream as streammod
 
@@ -147,7 +148,19 @@ MIGRATIONS = [
     "ALTER TABLE leader_sells ADD COLUMN det_ts REAL",     # when the scanner saw the smart wallet's sell
     "ALTER TABLE heartbeat ADD COLUMN ws INT",             # 1 = live feed connected at this check-in
     "ALTER TABLE heartbeat ADD COLUMN stream_n INT",       # wallet transactions read from the feed since last check-in
-]
+] + [f"ALTER TABLE positions ADD COLUMN {c}" for c in (
+    "fill_model TEXT",     # 'live' = live-like fills (fills.py); NULL = flat 3% slippage model
+    "leader_px REAL",      # price the copied wallet got (first trade at its buy time): the 'ideal' entry
+    "seen_px REAL",        # price when the scanner saw the buy
+    "r_buy REAL", "r_sell_est REAL", "r_sell REAL",   # fill price / mid, from real Jupiter quotes for this size
+    "rt_pct REAL",         # round-trip loss % (buy then sell back) at entry, for this size
+    "q_src_in TEXT", "q_src_out TEXT", "route TEXT",
+    "fee_in REAL", "fee_out REAL",                    # network: base + priority + Jito tip, in dollars
+    "liq_in REAL", "liq_out REAL", "sellable INT",
+    "ideal_pnl REAL", "gap_delay REAL", "gap_impact REAL", "gap_botfee REAL", "gap_netfee REAL")
+] + [f"ALTER TABLE signals ADD COLUMN {c}" for c in (
+    "holders INT", "transfer_fee_pct REAL", "lp_locked_pct REAL", "token_program TEXT",
+    "rt_pct REAL", "fill_note TEXT")]
 
 
 def migrate(con):
@@ -404,7 +417,14 @@ def analyse_rug(r, pool):
             dev = max(dev, float(h.get("pct") or 0))
     risks = [x.get("name", "") for x in r.get("risks") or []]
     liq = r.get("totalMarketLiquidity")
-    return dict(dev=dev, top10=top10, insider=insider, graph=int(r.get("graphInsidersDetected") or 0),
+    tf = (r.get("transferFee") or {}).get("pct")
+    lp = None
+    for m in r.get("markets") or []:
+        if m.get("pubkey") == pool:
+            lp = (m.get("lp") or {}).get("lpLockedPct")
+    return dict(holders=r.get("totalHolders"), transfer_fee=float(tf) if tf is not None else None, lp_locked=lp,
+                token_program=r.get("tokenProgram") or r.get("tokenType"),
+                dev=dev, top10=top10, insider=insider, graph=int(r.get("graphInsidersDetected") or 0),
                 mint_auth=1 if tok.get("mintAuthority") else 0, freeze_auth=1 if tok.get("freezeAuthority") else 0,
                 score=r.get("score_normalised"), risks=risks, rugged=bool(r.get("rugged")), liq=liq)
 
@@ -546,7 +566,9 @@ def handle_candidate(con, c, pairs):
         rest.append("liquidity_under_25k")
     if a:
         sig.update(dev_pct=a["dev"], top10_pct=a["top10"], insider_pct=a["insider"], graph_insiders=a["graph"],
-                   mint_auth=a["mint_auth"], freeze_auth=a["freeze_auth"], rug_score=a["score"])
+                   mint_auth=a["mint_auth"], freeze_auth=a["freeze_auth"], rug_score=a["score"],
+                   holders=a["holders"], transfer_fee_pct=a["transfer_fee"], lp_locked_pct=a["lp_locked"],
+                   token_program=a["token_program"])
         if a["dev"] > C.DEV_MAX_PCT:
             rest.append("dev_over_5pct")
         if a["top10"] > C.TOP10_MAX_PCT:
@@ -570,19 +592,48 @@ def handle_candidate(con, c, pairs):
 
     # --- Sniper: survivor -> paper entries (realistic headline, plus the old 5 s test)
     pool = tp["pairAddress"]
-    (px_r, src_r), (px_5, src_5) = gecko_prices_at(pool, mint, [entry_real, entry_5s])
-    if not px_r:
-        px_r, src_r = price, "dexscreener_live"; note.append("no trade data at detection time, used DexScreener price")
+    fill_ts = entry_real + C.EXEC_DELAY_S
+    (px_seen, src_r), (px_5, src_5), (px_lead, _), (px_fill, src_f) = gecko_prices_at(
+        pool, mint, [entry_real, entry_5s, buy_ts, fill_ts])
+    if not px_seen:
+        px_seen, src_r = price, "dexscreener_live"; note.append("no trade data at detection time, used DexScreener price")
     if not px_5:
         px_5, src_5 = price, "dexscreener_live"
+    fill = None
+    if not killed:
+        # live-like fill for the realistic accounts: lands EXEC_DELAY_S later, priced with real quotes and fees
+        px_r = px_fill or px_seen
+        q = fills.entry_quote(mint, pool, 20.0, liq)
+        fee_in = fills.tx_fee_usd(pool)
+        fill = dict(fill_model="live", leader_px=px_lead, seen_px=px_seen, r_buy=q["r_buy"], r_sell_est=q["r_sell"],
+                    rt_pct=q["rt_pct"], q_src_in=q["src"], route=q.get("route"), fee_in=fee_in, liq_in=liq,
+                    sellable=1 if q["sellable"] else 0)
+        sig["rt_pct"] = q["rt_pct"]
+        fn = [f"live-like fill: lands {C.EXEC_DELAY_S}s after seen at {px_r:.6g} (seen {px_seen:.6g})",
+              f"round trip {q['rt_pct']:.1f}% via {q['src']}", f"network ${fee_in:.3f}/tx"]
+        if not q["sellable"]:
+            fn.append("Jupiter could buy but not sell it back (honeypot or sell tax)")
+        jump = px_r / px_seen - 1 if px_seen else 0
+        if jump > C.COPY_SLIPPAGE_TOL:
+            # a live bot's buy fails on its slippage limit; the failed transaction's fee is still paid
+            fail_fee = fills.tx_fee_usd(pool, landed=False)
+            fn.append(f"buy failed: price jumped {jump*100:.0f}% before landing (limit {C.COPY_SLIPPAGE_TOL*100:.0f}%), "
+                      f"${fail_fee:.3f} fee lost")
+            meta_set(con, cash_key(C.ACCT_REAL), meta_get(con, cash_key(C.ACCT_REAL), C.START_EQUITY) - fail_fee)
+            fill = "failed"
+        sig["fill_note"] = "; ".join(fn)
     if killed:   # only the realistic sold-early check blocked it: the wallet sold after 5 s but before we saw the buy
         sid = insert_signal(con, **sig, status="killed",
                             notes="; ".join(note + ["5 s test still copied it (wallet sold before the scanner saw the buy)"]))
     else:
-        sid = insert_signal(con, **sig, status="survivor", notes="; ".join(note) or None)
-        # shadow position: every survivor, flat $20, no slot limit (measures the filters themselves)
-        open_position(con, sid, C.ACCT_REAL_SHADOW, mint, sym, pool, wallet, entry_real, px_r, src_r, 20.0)
-        open_main(con, sid, C.ACCT_REAL, mint, sym, pool, wallet, entry_real, px_r, src_r, c["name"], "")
+        if fill == "failed":
+            sid = insert_signal(con, **sig, status="survivor",
+                                notes="; ".join(note + ["realistic buy failed (price ran past the slippage limit), not copied"]))
+        else:
+            sid = insert_signal(con, **sig, status="survivor", notes="; ".join(note) or None)
+            # shadow position: every survivor, flat $20, no slot limit (measures the filters themselves)
+            open_position(con, sid, C.ACCT_REAL_SHADOW, mint, sym, pool, wallet, fill_ts, px_r, src_f or src_r, 20.0, fill)
+            open_main(con, sid, C.ACCT_REAL, mint, sym, pool, wallet, fill_ts, px_r, src_f or src_r, c["name"], "", fill)
     if not killed5:
         open_position(con, sid, C.ACCT_5S_SHADOW, mint, sym, pool, wallet, entry_5s, px_5, src_5, 20.0)
         if open_main(con, sid, C.ACCT_5S, mint, sym, pool, wallet, entry_5s, px_5, src_5, c["name"], "5 s test: "):
@@ -593,34 +644,40 @@ def cash_key(account):
     return "cash_real" if account == C.ACCT_REAL else "cash"
 
 
-def open_main(con, sid, account, mint, sym, pool, wallet, entry_ts, px, src, name, tag):
+def open_main(con, sid, account, mint, sym, pool, wallet, entry_ts, px, src, name, tag, fill=None):
     """A $200 paper account: 10% of equity per trade, max 5 open."""
     st = account_state(con, account)
     size = max(C.MIN_POS_USD, st["equity"] * C.POS_FRACTION)
+    fee = fill["fee_in"] if fill else C.NETWORK_FEE_USD
     if st["n_open"] >= C.MAX_OPEN:
         con.execute("UPDATE signals SET notes=COALESCE(notes||'; ','')||? WHERE id=?", (f"{tag}account full (5 open), not copied", sid))
         return False
-    if st["cash"] < size + C.NETWORK_FEE_USD:
+    if st["cash"] < size + fee:
         con.execute("UPDATE signals SET notes=COALESCE(notes||'; ','')||? WHERE id=?", (f"{tag}not enough paper cash", sid))
         return False
-    open_position(con, sid, account, mint, sym, pool, wallet, entry_ts, px, src, size)
-    meta_set(con, cash_key(account), st["cash"] - size - C.NETWORK_FEE_USD)
+    open_position(con, sid, account, mint, sym, pool, wallet, entry_ts, px, src, size, fill)
+    meta_set(con, cash_key(account), st["cash"] - size - fee)
     log.info("PAPER BUY [acct %d] %s %s $%.2f @ %.10g (%s) copying %s", account, sym, mint, size, px, src, name)
     return True
 
 
-def open_position(con, sid, account, mint, sym, pool, leader, entry_ts, px, src, size):
+def open_position(con, sid, account, mint, sym, pool, leader, entry_ts, px, src, size, fill=None):
     stop = px * (1 - C.INITIAL_STOP)
-    con.execute("""INSERT INTO positions(signal_id,account,mint,symbol,pool,leader,entry_ts,entry_price,entry_src,size_usd,qty,
+    qty = fills.buy_qty(size, px, fill["r_buy"]) if fill else buy_qty(size, px)
+    cur = con.execute("""INSERT INTO positions(signal_id,account,mint,symbol,pool,leader,entry_ts,entry_price,entry_src,size_usd,qty,
         stop,peak,last_candle_ts,last_price,last_update,status,stop_log) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?)""",
-                (sid, account, mint, sym, pool, leader, entry_ts, px, src, size, buy_qty(size, px), stop, px,
+                (sid, account, mint, sym, pool, leader, entry_ts, px, src, size, qty, stop, px,
                  int(entry_ts // 60 * 60), px, 0, json.dumps([[entry_ts, stop, "initial"]])))
+    if fill:
+        cols = list(fill.keys())
+        con.execute(f"UPDATE positions SET {','.join(c + '=?' for c in cols)} WHERE id=?",
+                    tuple(fill[c] for c in cols) + (cur.lastrowid,))
 
 
 def account_state(con, account=C.ACCT_5S):
     cash = meta_get(con, cash_key(account), C.START_EQUITY)
-    opens = con.execute("SELECT qty,last_price FROM positions WHERE account=? AND status='open'", (account,)).fetchall()
-    ov = sum(sell_proceeds(o["qty"], o["last_price"] or 0) for o in opens)
+    opens = con.execute("SELECT * FROM positions WHERE account=? AND status='open'", (account,)).fetchall()
+    ov = sum(fills.position_value(o, o["last_price"] or 0) for o in opens)
     return dict(cash=cash, open_value=ov, equity=cash + ov, n_open=len(opens))
 
 
@@ -637,8 +694,11 @@ def new_stop(entry, peak, old):
 
 
 def close_position(con, p, ts, px, reason, stop=None, peak=None, slog=None):
-    proceeds = sell_proceeds(p["qty"], px)
-    pnl = proceeds - p["size_usd"] - C.NETWORK_FEE_USD
+    if "fill_model" in p.keys() and p["fill_model"] == "live":
+        proceeds, pnl = close_live(con, p, px)
+    else:
+        proceeds = sell_proceeds(p["qty"], px)
+        pnl = proceeds - p["size_usd"] - C.NETWORK_FEE_USD
     con.execute("""UPDATE positions SET status='closed',exit_ts=?,exit_price=?,exit_reason=?,proceeds=?,pnl_usd=?,pnl_pct=?,last_price=?,
                    stop=COALESCE(?,stop),peak=COALESCE(?,peak),stop_log=COALESCE(?,stop_log),last_update=? WHERE id=?""",
                 (ts, px, reason, proceeds, pnl, pnl / p["size_usd"] * 100, px, stop, peak,
@@ -649,6 +709,32 @@ def close_position(con, p, ts, px, reason, stop=None, peak=None, slog=None):
         log.info("PAPER SELL [acct %d] %s %s pnl $%.2f (%.0f%%)", p["account"], p["symbol"], reason, pnl, pnl / p["size_usd"] * 100)
     if p["account"] == C.ACCT_5S:
         live_hook(live.on_paper_close, con, p["signal_id"], p["mint"], reason)
+
+
+def close_live(con, p, px):
+    """Exit of a live-like position: re-quote the sell for exactly this token amount now, pay this moment's network
+    fee, and split the gap from the 'ideal' trade (wallet's own entry, no costs) into its causes."""
+    try:
+        pr = dex_pairs([p["mint"]]).get(p["mint"]) or []
+        # pump.fun bonding-curve pairs carry no liquidity figure: 0 there means unknown, not empty
+        liq_out = sum(((x.get("liquidity") or {}).get("usd") or 0) for x in pr) or None
+    except Exception:
+        liq_out = None
+    q = fills.exit_quote(p["mint"], p["qty"], liq_out if liq_out is not None else (p["liq_in"] or 0), bool(p["sellable"]))
+    r_sell = q["r_sell"]
+    fee_out = fills.tx_fee_usd(p["pool"]) if r_sell > 0 else 0.0
+    size, mid, rb = p["size_usd"], p["entry_price"], p["r_buy"] or 1.0
+    proceeds = fills.sell_value(p["qty"], px, r_sell, fee_out)
+    pnl = proceeds - size - (p["fee_in"] or 0)
+    lead = p["leader_px"] or mid
+    ideal = size * (px / lead - 1)
+    a = size * (px / mid - 1)                                   # after the copy delay, no costs
+    b = size * (px * r_sell) / (mid * rb) - size                # after price impact and DEX fees
+    c = size * (1 - C.BOT_FEE) ** 2 * (px * r_sell) / (mid * rb) - size   # after the copy-bot fee
+    con.execute("""UPDATE positions SET r_sell=?, q_src_out=?, fee_out=?, liq_out=?, ideal_pnl=?, gap_delay=?,
+                   gap_impact=?, gap_botfee=?, gap_netfee=? WHERE id=?""",
+                (r_sell, q["src"], fee_out, liq_out, ideal, ideal - a, a - b, b - c, (p["fee_in"] or 0) + fee_out, p["id"]))
+    return proceeds, pnl
 
 
 def candle_since(p):

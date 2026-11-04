@@ -35,8 +35,9 @@ def _lag(con, where, args):
 def _acct(con, acct, cash_key, t0):
     meta = {r[0]: json.loads(r[1]) for r in _q(con, "SELECT key,value FROM meta")}
     cash = meta.get(cash_key, C.START_EQUITY)
-    opens = _q(con, "SELECT qty,last_price,size_usd FROM positions WHERE account=? AND status='open'", (acct,))
-    ov = sum(max(0.0, (o[0] or 0) * (o[1] or 0) * (1 - C.SLIPPAGE) * (1 - C.BOT_FEE - C.POOL_FEE) - C.NETWORK_FEE_USD) for o in opens)
+    opens = _q(con, "SELECT qty,last_price,size_usd,fill_model,r_sell_est,fee_in FROM positions WHERE account=? AND status='open'", (acct,))
+    import fills
+    ov = sum(fills.position_value(dict(qty=o[0], fill_model=o[3], r_sell_est=o[4], fee_in=o[5]), o[1] or 0) for o in opens)
     closed = _q(con, "SELECT pnl_usd FROM positions WHERE account=? AND status='closed'", (acct,))
     wins = sum(1 for c in closed if c[0] > 0)
     eq = cash + ov
@@ -79,7 +80,7 @@ def make_report(con, host="GitHub Actions (public repo ragedele-glitch/paper-sca
     L.append("  backup re-read, last 24 h: " + _lag(con, "COALESCE(detect_src,'poll')='poll' AND detected_ts>?", (now - 86400,)))
     L.append("  before the live feed: " + _lag(con, "detected_ts<?", (real_start or now,)))
     if real_start:
-        L.append("HEADLINE, realistic entry (buys at the moment the scanner saw the wallet's buy, plus slippage and fees):")
+        L.append("HEADLINE, realistic entry (copy lands 2 s after the scanner saw the buy; from Nov 4 afternoon priced with live-like fills: real Jupiter quotes for the trade size, 1% bot fee each way, live priority fee + Jito tip; earlier trades used flat 3% slippage + fees):")
         L.append("  $200 account: " + _acct(con, C.ACCT_REAL, "cash_real", real_start))
         L.append("  Every survivor: " + _shadow(con, C.ACCT_REAL_SHADOW))
     L.append("Old test, entry 5 s after the smart wallet (optimistic, kept for comparison):")
@@ -96,6 +97,26 @@ def make_report(con, host="GitHub Actions (public repo ragedele-glitch/paper-sca
         tag = "realistic" if p[0] == C.ACCT_REAL else "5 s test"
         ch = (p[3] / p[2] - 1) * 100 if p[2] and p[3] else 0
         L.append(f"  open [{tag}] {p[1]} ${p[4]:.2f}, price {ch:+.0f}% since entry")
+    try:
+        import dashboard
+        rv = dashboard.realism_view(con, real_start)
+        sh = rv.get("shadow") or {}
+        if sh.get("n"):
+            L.append(f"IDEAL vs LIVE-LIKE (flat-$20 test, {sh['n']} closed trade(s) priced like live fills): ideal ${sh['ideal']:+.2f}, "
+                     f"live-like ${sh['actual']:+.2f}, gap ${sh['gap']:.2f} = copy delay ${sh['delay']:.2f} + price impact/DEX fees "
+                     f"${sh['impact']:.2f} + bot fee ${sh['botfee']:.2f} + network/priority/tip ${sh['netfee']:.2f}. "
+                     f"Avg round trip {rv.get('avg_rt_pct') or 0:.1f}%, failed buys {rv['failed_buys']}, unsellable at entry "
+                     f"{rv.get('unsellable_at_entry', 0)}, sells with no liquidity {sh.get('no_sell', 0)}.")
+        else:
+            L.append(f"IDEAL vs LIVE-LIKE: no closed trades with live-like fills yet ({sh.get('open', 0)} open, "
+                     f"{rv['failed_buys']} failed buys).")
+    except Exception as e:
+        L.append(f"Ideal vs live-like failed: {type(e).__name__}")
+    try:
+        import wallet_stats
+        L.extend(wallet_stats.report_lines(con, real_start, start))
+    except Exception as e:
+        L.append(f"Wallet leaderboard failed: {type(e).__name__}")
     return "\n".join(L)
 
 

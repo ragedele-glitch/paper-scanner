@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import config as C
+import fills
 
 PORT = int(os.environ.get("DASH_PORT", "8790"))
 LAGOS = timezone(timedelta(hours=1))
@@ -140,6 +141,44 @@ def live_status(con):
         return {"mode": "unknown"}
 
 
+def realism_view(con, real_start):
+    """Ideal vs live-like P&L for the realistic accounts' trades priced with live-like fills (fills.py).
+    Ideal = bought at the copied wallet's own price and sold at the exit price, with no costs at all."""
+    con.row_factory = sqlite3.Row
+    q = lambda s, a=(): con.execute(s, a).fetchall()
+    out = {"exec_delay_s": C.EXEC_DELAY_S, "slippage_tol_pct": C.COPY_SLIPPAGE_TOL * 100, "jito_tip_sol": C.JITO_TIP_SOL,
+           "bot_fee_pct": C.BOT_FEE * 100}
+    r = q("SELECT MIN(entry_ts) FROM positions WHERE fill_model='live'")
+    since = r[0][0] if r else None
+    out["since"] = since
+    for key, acct in (("shadow", C.ACCT_REAL_SHADOW), ("main", C.ACCT_REAL)):
+        rows = q("SELECT * FROM positions WHERE account=? AND fill_model='live' AND status='closed'", (acct,))
+        n = len(rows)
+        tot = lambda k: sum((x[k] or 0) for x in rows)
+        d = {"n": n, "open": q("SELECT COUNT(*) FROM positions WHERE account=? AND fill_model='live' AND status='open'", (acct,))[0][0]}
+        if n:
+            d.update(ideal=tot("ideal_pnl"), actual=tot("pnl_usd"), delay=tot("gap_delay"), impact=tot("gap_impact"),
+                     botfee=tot("gap_botfee"), netfee=tot("gap_netfee"), size=tot("size_usd"),
+                     no_sell=sum(1 for x in rows if x["r_sell"] == 0))
+            d["gap"] = d["ideal"] - d["actual"]
+        out[key] = d
+    allp = q("SELECT * FROM positions WHERE account=? AND fill_model='live'", (C.ACCT_REAL_SHADOW,))
+    if allp:
+        avg = lambda v: (sum(v) / len(v)) if v else None
+        out["avg_rt_pct"] = avg([x["rt_pct"] for x in allp if x["rt_pct"] is not None and x["sellable"]])
+        out["avg_fee_tx"] = avg([x["fee_in"] for x in allp if x["fee_in"] is not None])
+        out["avg_delay_move_pct"] = avg([(x["entry_price"] / x["leader_px"] - 1) * 100 for x in allp if x["leader_px"]])
+        out["avg_landing_move_pct"] = avg([(x["entry_price"] / x["seen_px"] - 1) * 100 for x in allp if x["seen_px"]])
+        out["avg_liq_in"] = avg([x["liq_in"] for x in allp if x["liq_in"]])
+        out["avg_liq_out"] = avg([x["liq_out"] for x in allp if x["liq_out"] is not None and x["status"] == "closed"])
+        out["unsellable_at_entry"] = sum(1 for x in allp if x["sellable"] == 0)
+        out["jupiter_share"] = round(100 * sum(1 for x in allp if (x["q_src_in"] or "").startswith("jupiter")) / len(allp))
+    out["failed_buys"] = q("SELECT COUNT(*) FROM signals WHERE fill_note LIKE '%buy failed%'")[0][0]
+    out["failed_examples"] = [dict(coin=r[0], note=r[1]) for r in
+                              q("SELECT symbol, fill_note FROM signals WHERE fill_note LIKE '%buy failed%' ORDER BY detected_ts DESC LIMIT 5")]
+    return out
+
+
 def build_state():
     now = time.time()
     con = sqlite3.connect(f"file:{C.DB_PATH}?mode=ro", uri=True, timeout=10)
@@ -160,8 +199,8 @@ def build_state():
         opens = q("SELECT * FROM positions WHERE account=? AND status='open' ORDER BY entry_ts DESC", (acct,))
         open_rows = []; open_val = 0.0
         for p in opens:
-            val = sell_proceeds(p["qty"], p["last_price"] or 0); open_val += val
-            pnl = val - p["size_usd"] - C.NETWORK_FEE_USD
+            val = fills.position_value(p, p["last_price"] or 0); open_val += val
+            pnl = val - p["size_usd"] - (p["fee_in"] if p["fill_model"] == "live" else C.NETWORK_FEE_USD)
             open_rows.append({
                 "coin": p["symbol"] or short(p["mint"]), "mint": short(p["mint"]), "entry_price": p["entry_price"],
                 "now_price": p["last_price"], "size": p["size_usd"], "pnl": pnl, "pnl_pct": pnl / p["size_usd"] * 100,
@@ -184,7 +223,12 @@ def build_state():
             hist.append({"coin": c["symbol"] or short(c["mint"]), "mint": short(c["mint"]), "wallet": names.get(c["leader"]) or short(c["leader"]),
                          "entry_ts": c["entry_ts"], "exit_ts": c["exit_ts"], "entry_price": c["entry_price"], "exit_price": c["exit_price"],
                          "size": c["size_usd"], "pnl": c["pnl_usd"], "pnl_pct": c["pnl_pct"],
-                         "reason": EXITS.get(c["exit_reason"], c["exit_reason"])})
+                         "reason": EXITS.get(c["exit_reason"], c["exit_reason"]),
+                         "fill": ({"ideal": c["ideal_pnl"], "delay": c["gap_delay"], "impact": c["gap_impact"],
+                                   "botfee": c["gap_botfee"], "netfee": c["gap_netfee"], "rt_pct": c["rt_pct"],
+                                   "liq_in": c["liq_in"], "liq_out": c["liq_out"], "src_in": c["q_src_in"],
+                                   "src_out": c["q_src_out"], "sellable": c["sellable"]}
+                                  if c["fill_model"] == "live" else None)})
         wins = [h for h in hist if h["pnl"] > 0]
         acc = {"start": C.START_EQUITY, "equity": equity, "cash": cash, "open_value": open_val, "since": t0,
                "change_pct": (equity / C.START_EQUITY - 1) * 100, "change_usd": equity - C.START_EQUITY,
@@ -232,6 +276,10 @@ def build_state():
         if st == "survivor":
             if "account full" in own:
                 verdict, label = "passed", "Passed checks, not copied: 5 trades already open"
+            elif "realistic buy failed" in own:
+                m = re.search(r"price jumped (\d+)%", s["fill_note"] or "")
+                verdict, label = "passed", ("Passed checks, but the copy would have failed: price jumped "
+                                            + (m.group(1) + "%" if m else "too far") + " before it landed")
             elif "not enough paper cash" in own:
                 verdict, label = "passed", "Passed checks, not copied: not enough paper cash"
             else:
@@ -253,7 +301,8 @@ def build_state():
         blind = "403" in notes
         sigs.append({"ts": s["detected_ts"], "wallet": s["wallet_name"] or short(s["wallet"]), "coin": s["symbol"] or short(s["mint"]),
                      "mint": short(s["mint"]), "verdict": verdict, "label": label, "liq": s["liq_usd"], "h1": s["h1_pct"],
-                     "mcap": s["mcap"], "lag": s["detect_lag_s"], "p1h": s["p1h"], "p24h": s["p24h"], "partial": blind})
+                     "mcap": s["mcap"], "lag": s["detect_lag_s"], "p1h": s["p1h"], "p24h": s["p24h"], "partial": blind,
+                     "holders": s["holders"], "rt": s["rt_pct"], "fill_note": s["fill_note"]})
 
     # ---- did the filters help? killed vs survivors after 1h / 24h
     def grp(status, col):
@@ -284,6 +333,15 @@ def build_state():
         report_text = report.make_report(con2())
     except Exception as e:
         report_text = f"report failed: {e}"
+    try:
+        realism = realism_view(con2(), real_start)
+    except Exception as e:
+        realism = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        import wallet_stats
+        wallet_board = wallet_stats.boards(con2(), real_start, start_ts)
+    except Exception as e:
+        wallet_board = {"error": f"{type(e).__name__}: {e}"}
     return {
         "report": report_text,
         "now": now, "paper_only": live_st.get("mode") == "off", "live": live_st,
@@ -306,10 +364,15 @@ def build_state():
         "wallets": [{"name": w["name"] or short(w["address"]), "addr": short(w["address"]), "rank": w["last_rank"],
                      "pnl_usd": w["pnl_usd"], "wins": w["wins"], "losses": w["losses"], "every_s": w["poll_s"],
                      "last_check": w["last_poll"]} for w in wallets],
+        "wallet_board": wallet_board,
+        "realism": realism,
         "activity": activity,
         "rules": {"size": f"{int(C.POS_FRACTION*100)}% of the account per trade, max {C.MAX_OPEN} open",
                   "stop": f"Stop {int(C.INITIAL_STOP*100)}% under entry; moves to breakeven at +{int(C.BE_TRIGGER*100)}%, then trails",
                   "costs": f"{int(C.SLIPPAGE*100)}% slippage + {int((C.BOT_FEE+C.POOL_FEE)*100)}% fees each way + ${C.NETWORK_FEE_USD:.2f} network fee",
+                  "costs_live": (f"lands {C.EXEC_DELAY_S} s after seen; real Jupiter quotes for the trade size (price impact + DEX fees, "
+                                 f"sell re-quoted at exit); {int(C.BOT_FEE*100)}% bot fee each way; base + live priority fee + "
+                                 f"{C.JITO_TIP_SOL} SOL Jito tip per transaction; buys fail if price runs over {int(C.COPY_SLIPPAGE_TOL*100)}% before landing"),
                   "time": "Anything still open after 24 hours is closed"},
     }
 

@@ -54,6 +54,16 @@ SLIPPAGE = 0.03             # 3% worse price on every buy and every sell
 BOT_FEE = 0.01              # 1% copy-bot fee per side (typical Telegram copy bots)
 POOL_FEE = 0.01             # ~1% DEX / pump.fun fee per side
 NETWORK_FEE_USD = 0.10      # priority fee + tip per transaction
+# Live-like fills (fills.py), used by the realistic accounts from the switch-over onward. Read-only quotes, paper only.
+EXEC_DELAY_S = 2            # seconds from the scanner seeing the buy to the copy landing on chain
+COPY_SLIPPAGE_TOL = 0.15    # copy bot's slippage limit: a buy whose price ran up more than 15% before landing fails
+BASE_FEE_LAMPORTS = 5000    # Solana base fee per signature
+SWAP_COMPUTE_UNITS = 250_000  # compute units a typical swap transaction pays priority on
+PRIORITY_MICROLAMPORTS_FALLBACK = 1_000_000   # if the RPC can't be read
+PRIORITY_MAX_SOL = 0.01     # cap on the priority fee per transaction
+JITO_TIP_SOL = 0.001        # tip per landed transaction, as copy bots commonly set it
+SOL_USD_FALLBACK = 150.0    # only if no SOL price could ever be read
+MIN_SELLABLE_LIQ_USD = 500  # below this pool liquidity, with no Jupiter sell route, a sell gets nothing
 
 # --- Guard ---
 INITIAL_STOP = 0.30         # stop 30% under entry, set before entry
