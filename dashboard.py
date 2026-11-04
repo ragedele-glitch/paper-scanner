@@ -152,63 +152,95 @@ def build_state():
     wallets = q("SELECT name,address,last_rank,pnl_usd,wins,losses,n_accounts,poll_s,last_poll FROM wallets WHERE active=1 ORDER BY last_rank")
     names = {r["address"]: r["name"] for r in q("SELECT address,name FROM wallets")}
 
-    # ---- $200 paper account
-    cash = meta.get("cash", C.START_EQUITY)
-    opens = q("SELECT * FROM positions WHERE account=1 AND status='open' ORDER BY entry_ts DESC")
-    open_rows = []; open_val = 0.0
-    for p in opens:
-        val = sell_proceeds(p["qty"], p["last_price"] or 0); open_val += val
-        pnl = val - p["size_usd"] - C.NETWORK_FEE_USD
-        open_rows.append({
-            "coin": p["symbol"] or short(p["mint"]), "mint": short(p["mint"]), "entry_price": p["entry_price"],
-            "now_price": p["last_price"], "size": p["size_usd"], "pnl": pnl, "pnl_pct": pnl / p["size_usd"] * 100,
-            "stop": p["stop"], "stop_pct": (p["stop"] / p["entry_price"] - 1) * 100 if p["entry_price"] else None,
-            "stop_kind": "trailing" if p["stop"] > p["entry_price"] else ("breakeven" if abs(p["stop"] / p["entry_price"] - 1) < .2 and p["stop"] >= p["entry_price"] else "initial"),
-            "peak_pct": (p["peak"] / p["entry_price"] - 1) * 100 if p["entry_price"] else None,
-            "wallet": names.get(p["leader"]) or short(p["leader"]), "entry_ts": p["entry_ts"],
-            "price_age": now - (p["last_update"] or p["entry_ts"]),
-        })
-    equity = cash + open_val
-    eq = [(r["ts"], r["equity"]) for r in q("SELECT ts,equity FROM equity ORDER BY ts")]
-    start_ts = meta.get("start_ts", eq[0][0] if eq else now)
-    curve = [(start_ts, C.START_EQUITY)] + eq
-    closed_all = q("SELECT * FROM positions WHERE account=1 AND status='closed' ORDER BY exit_ts")
-    # equity curve also steps at every closed trade, so it is exact even with gaps in the 5-minute samples
-    run = C.START_EQUITY
-    for c in closed_all:
-        run += c["pnl_usd"]
-    curve.append((now, equity))
-    curve.sort()
-    peak = -1e18; mdd = 0.0; mdd_usd = 0.0
-    for _, v in curve:
-        peak = max(peak, v)
-        if peak > 0 and (peak - v) / peak > mdd:
-            mdd = (peak - v) / peak; mdd_usd = peak - v
+    # ---- $200 paper accounts: realistic entry (headline) and the old 5-seconds-after-the-wallet test
+    real_start = meta.get("real_start_ts")
+    start_ts = meta.get("start_ts", now)
 
-    hist = []
-    for c in closed_all[::-1]:
-        hist.append({"coin": c["symbol"] or short(c["mint"]), "mint": short(c["mint"]), "wallet": names.get(c["leader"]) or short(c["leader"]),
-                     "entry_ts": c["entry_ts"], "exit_ts": c["exit_ts"], "entry_price": c["entry_price"], "exit_price": c["exit_price"],
-                     "size": c["size_usd"], "pnl": c["pnl_usd"], "pnl_pct": c["pnl_pct"],
-                     "reason": EXITS.get(c["exit_reason"], c["exit_reason"])})
+    def account_view(acct, cash, eq_table, t0):
+        opens = q("SELECT * FROM positions WHERE account=? AND status='open' ORDER BY entry_ts DESC", (acct,))
+        open_rows = []; open_val = 0.0
+        for p in opens:
+            val = sell_proceeds(p["qty"], p["last_price"] or 0); open_val += val
+            pnl = val - p["size_usd"] - C.NETWORK_FEE_USD
+            open_rows.append({
+                "coin": p["symbol"] or short(p["mint"]), "mint": short(p["mint"]), "entry_price": p["entry_price"],
+                "now_price": p["last_price"], "size": p["size_usd"], "pnl": pnl, "pnl_pct": pnl / p["size_usd"] * 100,
+                "stop": p["stop"], "stop_pct": (p["stop"] / p["entry_price"] - 1) * 100 if p["entry_price"] else None,
+                "stop_kind": "trailing" if p["stop"] > p["entry_price"] else ("breakeven" if abs(p["stop"] / p["entry_price"] - 1) < .2 and p["stop"] >= p["entry_price"] else "initial"),
+                "peak_pct": (p["peak"] / p["entry_price"] - 1) * 100 if p["entry_price"] else None,
+                "wallet": names.get(p["leader"]) or short(p["leader"]), "entry_ts": p["entry_ts"],
+                "price_age": now - (p["last_update"] or p["entry_ts"]),
+            })
+        equity = cash + open_val
+        curve = [(t0, C.START_EQUITY)] + [(r["ts"], r["equity"]) for r in q(f"SELECT ts,equity FROM {eq_table} ORDER BY ts")]
+        curve.append((now, equity)); curve.sort()
+        peak = -1e18; mdd = 0.0; mdd_usd = 0.0
+        for _, v in curve:
+            peak = max(peak, v)
+            if peak > 0 and (peak - v) / peak > mdd:
+                mdd = (peak - v) / peak; mdd_usd = peak - v
+        hist = []
+        for c in q("SELECT * FROM positions WHERE account=? AND status='closed' ORDER BY exit_ts DESC", (acct,)):
+            hist.append({"coin": c["symbol"] or short(c["mint"]), "mint": short(c["mint"]), "wallet": names.get(c["leader"]) or short(c["leader"]),
+                         "entry_ts": c["entry_ts"], "exit_ts": c["exit_ts"], "entry_price": c["entry_price"], "exit_price": c["exit_price"],
+                         "size": c["size_usd"], "pnl": c["pnl_usd"], "pnl_pct": c["pnl_pct"],
+                         "reason": EXITS.get(c["exit_reason"], c["exit_reason"])})
+        wins = [h for h in hist if h["pnl"] > 0]
+        acc = {"start": C.START_EQUITY, "equity": equity, "cash": cash, "open_value": open_val, "since": t0,
+               "change_pct": (equity / C.START_EQUITY - 1) * 100, "change_usd": equity - C.START_EQUITY,
+               "mdd_pct": mdd * 100, "mdd_usd": mdd_usd, "curve": curve[-600:], "n_open": len(open_rows),
+               "max_open": C.MAX_OPEN, "closed": len(hist), "wins": len(wins),
+               "win_rate": (len(wins) / len(hist) * 100) if hist else None, "total_pnl": sum(h["pnl"] for h in hist)}
+        return acc, open_rows, hist
+
+    if real_start:
+        account, open_rows, hist = account_view(C.ACCT_REAL, meta.get("cash_real", C.START_EQUITY), "equity_real", real_start)
+        account["kind"] = "realistic"
+    account_5s, _, hist_5s = account_view(C.ACCT_5S, meta.get("cash", C.START_EQUITY), "equity", start_ts)
+    account_5s["kind"] = "5s"
+    if not real_start:
+        account, open_rows, hist = account_5s, _, hist_5s
     wins = [h for h in hist if h["pnl"] > 0]
     best = max(hist, key=lambda h: h["pnl_pct"]) if hist else None
     worst = min(hist, key=lambda h: h["pnl_pct"]) if hist else None
+
+    # ---- detection lag: live feed vs holdings re-read, last 24 h and since the realistic accounts started
+    def lag_stats(where, args):
+        v = sorted(r[0] for r in q(f"SELECT detect_lag_s FROM signals WHERE detect_lag_s IS NOT NULL AND status!='ignored' AND {where}", args))
+        if not v:
+            return {"n": 0}
+        return {"n": len(v), "median": v[len(v) // 2], "p90": v[min(len(v) - 1, int(len(v) * 0.9))],
+                "under10": round(100 * sum(1 for x in v if x <= 10) / len(v))}
+    lag = {"feed_24h": lag_stats("detect_src='stream' AND detected_ts>?", (now - 86400,)),
+           "reread_24h": lag_stats("COALESCE(detect_src,'poll')='poll' AND detected_ts>?", (now - 86400,)),
+           "all_24h": lag_stats("detected_ts>?", (now - 86400,)),
+           "before_feed": lag_stats("detected_ts<?", (real_start or now,))}
+    feed = meta.get("feed") or {}
+    ws_beats = q("SELECT ws FROM heartbeat WHERE ts>? AND ws IS NOT NULL", (now - 86400,))
+    feed_share = round(100 * sum(1 for r in ws_beats if r[0]) / len(ws_beats), 1) if ws_beats else None
+    # realistic vs 5 s entry on the same coins (both versions bought it)
+    pair = q(f"""SELECT r.entry_price re, f.entry_price fe, r.pnl_pct rp, f.pnl_pct fp FROM positions r JOIN positions f
+                 ON f.signal_id=r.signal_id AND f.account={C.ACCT_5S_SHADOW} WHERE r.account={C.ACCT_REAL_SHADOW}""")
+    entry_gap = sorted((x["re"] / x["fe"] - 1) * 100 for x in pair if x["re"] and x["fe"])
+    sh_real = q("SELECT pnl_usd FROM positions WHERE account=? AND status='closed'", (C.ACCT_REAL_SHADOW,))
 
     # ---- signals feed
     sigs = []
     for s in q("SELECT * FROM signals ORDER BY detected_ts DESC LIMIT 400"):
         st = s["status"]; notes = s["notes"] or ""
+        own = "; ".join(x for x in notes.split("; ") if not x.startswith("5 s test"))
         if st == "survivor":
-            if "account full" in notes:
+            if "account full" in own:
                 verdict, label = "passed", "Passed checks, not copied: 5 trades already open"
-            elif "not enough paper cash" in notes:
+            elif "not enough paper cash" in own:
                 verdict, label = "passed", "Passed checks, not copied: not enough paper cash"
             else:
                 verdict, label = "copied", "Copied (paper buy)"
         elif st == "killed":
             verdict = "killed"
             label = "Blocked: " + "; ".join(FILTERS.get(k, k) for k in (s["killed_by"] or "").split(",") if k)
+            if "5 s test still copied it" in notes:
+                label += " (it sold before the scanner saw its buy)"
         elif st == "repeat":
             verdict, label = "skip", "Skipped: same coin already seen today"
         elif st == "missed":
@@ -241,20 +273,29 @@ def build_state():
                 filt[FILTERS.get(k, k)] = filt.get(FILTERS.get(k, k), 0) + 1
 
     # shadow test account: every survivor at a flat $20, no slot limit
-    sh = q("SELECT pnl_usd FROM positions WHERE account=0 AND status='closed'")
+    sh = q("SELECT pnl_usd FROM positions WHERE account=? AND status='closed'", (C.ACCT_REAL_SHADOW if real_start else C.ACCT_5S_SHADOW,))
 
     errs, activity = parse_log(now)
     awake = last_beat is not None and now - last_beat < 120
     live_st = live_status(con)
     con.close()
+    try:
+        import report
+        report_text = report.make_report(con2())
+    except Exception as e:
+        report_text = f"report failed: {e}"
     return {
+        "report": report_text,
         "now": now, "paper_only": live_st.get("mode") == "off", "live": live_st,
         "status": {"awake": awake, "last_beat": last_beat, "since_start_h": (now - start_ts) / 3600,
-                   "wallets": len(wallets), "polled_10m": polled_10m, "errors": errs, "uptime": uptime(con2(), now)},
-        "account": {"start": C.START_EQUITY, "equity": equity, "cash": cash, "open_value": open_val,
-                    "change_pct": (equity / C.START_EQUITY - 1) * 100, "change_usd": equity - C.START_EQUITY,
-                    "mdd_pct": mdd * 100, "mdd_usd": mdd_usd, "curve": curve[-600:], "n_open": len(open_rows),
-                    "max_open": C.MAX_OPEN},
+                   "wallets": len(wallets), "polled_10m": polled_10m, "errors": errs, "uptime": uptime(con2(), now),
+                   "feed": {"connected": bool(feed.get("connected")) and now - (feed.get("ts") or 0) < 120,
+                            "share_24h": feed_share, "reconnects": feed.get("reconnects"), "url": feed.get("url"),
+                            "noisy": len(feed.get("noisy") or []), "side": feed.get("side")},
+                   "lag": lag},
+        "account": account, "account_5s": account_5s,
+        "entry_compare": {"n": len(entry_gap), "median_gap_pct": entry_gap[len(entry_gap) // 2] if entry_gap else None,
+                          "real_shadow": {"n": len(sh_real), "pnl": sum(r[0] for r in sh_real)}},
         "positions": open_rows, "history": hist[:200],
         "stats": {"closed": len(hist), "wins": len(wins), "win_rate": (len(wins) / len(hist) * 100) if hist else None,
                   "best": best, "worst": worst, "total_pnl": sum(h["pnl"] for h in hist),

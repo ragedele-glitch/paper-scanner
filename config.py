@@ -3,6 +3,18 @@ import os
 # PAPER MODE ONLY. No wallet, no keys, nothing is ever signed or sent on-chain.
 
 RPC_URL = "https://api.mainnet-beta.solana.com"   # free public Solana node (read-only calls)
+# Live feed of the followed wallets' transactions (read-only websocket, logsSubscribe). Tried in order; on a drop
+# it reconnects, moving to the next one if a connection fails quickly. A free Helius key, if ever added as the
+# HELIUS_API_KEY secret, is used first, for both the feed and the RPC reads.
+HELIUS_API_KEY = os.environ.get("HELIUS_API_KEY") or ""
+WS_URLS = ([f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"] if HELIUS_API_KEY else []) + [
+    "wss://api.mainnet-beta.solana.com",
+    "wss://solana-rpc.publicnode.com",
+]
+if HELIUS_API_KEY:
+    RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+POLL_BACKUP_S = 600         # while the live feed is up, holdings are still re-read every 10 min as a safety net
+DEX_RETRY_S = 120           # a brand-new coin may take a minute to appear on DexScreener: keep retrying for 2 min
 KOLSCAN_URL = "https://kolscan.io/leaderboard"     # public leaderboard of profitable Solana wallets
 DEX_TOKENS = "https://api.dexscreener.com/tokens/v1/solana/"
 GECKO = "https://api.geckoterminal.com/api/v2/networks/solana"
@@ -34,7 +46,10 @@ START_EQUITY = 200.0
 POS_FRACTION = 0.10         # 10% of current equity per trade ($20 to start)
 MIN_POS_USD = 5.0
 MAX_OPEN = 5
-COPY_DELAY_S = 5            # copier buys 5 seconds after the smart wallet
+COPY_DELAY_S = 5            # old, optimistic test: copier buys 5 seconds after the smart wallet
+# Headline (realistic) accounts buy at the moment the scanner actually saw the smart wallet's buy.
+ACCT_REAL, ACCT_REAL_SHADOW = 11, 10   # $200 account and flat-$20 test, realistic entry
+ACCT_5S, ACCT_5S_SHADOW = 1, 0         # the same two, entering 5 s after the smart wallet (kept for comparison)
 SLIPPAGE = 0.03             # 3% worse price on every buy and every sell
 BOT_FEE = 0.01              # 1% copy-bot fee per side (typical Telegram copy bots)
 POOL_FEE = 0.01             # ~1% DEX / pump.fun fee per side
