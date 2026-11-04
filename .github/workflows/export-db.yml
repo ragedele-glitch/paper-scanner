@@ -1,0 +1,39 @@
+name: Export encrypted state (read-only)
+
+# Manual, read-only: copies the latest saved scanner database, encrypts it with DASH_KEY and keeps it as a
+# short-lived run artifact for analysis. Does not touch the running scanner, its rules or its state.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DASH_KEY: ${{ secrets.DASH_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet cryptography
+      - name: Restore latest saved state (read-only)
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: scanner-state-export-${{ github.run_id }}
+          restore-keys: scanner-state-
+      - name: Encrypt
+        run: |
+          python ci_runner.py seal state/scanner.db > db.enc
+          ls -la state db.enc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: db-enc
+          path: db.enc
+          retention-days: 1
