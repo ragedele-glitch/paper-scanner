@@ -1,0 +1,20 @@
+name: GMGN reachability check (temporary, read-only)
+
+# Temporary one-off check: can a GitHub runner read GMGN's public wallet-activity page? Touches nothing else.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: |
+          for i in 1 2 3; do
+            curl -s -m 25 -o out.json -w "%{http_code} %{size_download}\n" -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36" -H "Referer: https://gmgn.ai/" -H "Accept: application/json" "https://gmgn.ai/vas/api/v1/wallet_activity/sol?type=buy&type=sell&wallet=Anaxgq3zXhSjhPWsSuTGTMBAqc7GzpchnDAhs7VBvAWN&limit=100"
+            head -c 300 out.json; echo; sleep 2
+          done
