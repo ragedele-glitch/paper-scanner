@@ -8,6 +8,7 @@ launched, how many of them graduated off the curve, how many look rugged, and a 
   clean          earlier coins found, at least one graduated, none look rugged
   no_grads       earlier coins found, none graduated (a launcher whose coins never left the curve)
   first_coin     no earlier pump.fun launch by this wallet
+  launcher       the wallet launched 100+ coins (a launch service), so it says nothing about one dev
   unknown        not a pump.fun coin, or the lookup failed
 
 Sources, all free and read-only: the public Solana node api.mainnet-beta.solana.com (the curve account, and a
@@ -201,7 +202,7 @@ def judge(hist, as_of, sol=None):
 _MEM = {}
 
 
-RANK = {"rugged_before": 4, "clean": 3, "no_grads": 2, "first_coin": 1, "unknown": 0}
+RANK = {"launcher": 0, "rugged_before": 4, "clean": 3, "no_grads": 2, "first_coin": 1, "unknown": 0}
 
 
 def _hist(creator, curve):
@@ -235,6 +236,8 @@ def creator_info(mint, det_ts=None, deployer=None):
             except Exception as e:
                 out["deployer"] = {"creator": deployer, "error": str(e)[:120]}
         out["launcher"] = out["n_all_coins"] >= 100        # launch-service wallet, not one dev's track record
+        if out["launcher"]:
+            out["flag_raw"] = out["flag"]; out["flag"] = "launcher"
         out.update(src="pump.fun curve", cached=cached, secs=round(time.time() - t0, 1))
         return out
     except Exception as e:
@@ -244,7 +247,7 @@ def creator_info(mint, det_ts=None, deployer=None):
 # ---------------------------------------------------------------- dashboard / report (read-only)
 FLAGS = [("rugged_before", "Creator rugged before"), ("clean", "Clean creator (graduated coins, no rugs)"),
          ("no_grads", "Creator's earlier coins never graduated"), ("first_coin", "Creator's first coin"),
-         ("unknown", "Unknown / not pump.fun")]
+         ("launcher", "Launch-service wallet (100+ coins, not one dev)"), ("unknown", "Unknown / not pump.fun")]
 
 
 def view(con):
