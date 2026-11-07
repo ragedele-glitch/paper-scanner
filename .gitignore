@@ -2,3 +2,4 @@ state/
 _publish/
 __pycache__/
 *.pyc
+radium_state/

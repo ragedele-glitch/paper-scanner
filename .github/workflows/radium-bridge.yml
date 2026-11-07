@@ -1,0 +1,51 @@
+# Rage Radium Bot bridge: watches Radium's open trades while the paper scanner hands over from one run to the next.
+# Started by the scan run about 7 minutes before it ends. It waits, takes the trading lock (and Radium's state)
+# when the scan run lets go, guards open trades on live prices, then hands back to the next scan run.
+# It never buys. Nothing is signed unless RADIUM_MODE=live.
+name: Rage Radium Bot bridge
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+# No concurrency group on purpose: a long-running bridge starts its own replacement and hands over to it. The
+# trading lock makes sure only one of them ever trades; a spare one gives up after 45 minutes.
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      DASH_KEY: ${{ secrets.DASH_KEY }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+      LIVE_MODE: ${{ vars.LIVE_MODE }}
+      RADIUM_MODE: ${{ vars.RADIUM_MODE }}
+      RADIUM_WALLET_ADDRESS: ${{ secrets.RADIUM_WALLET_ADDRESS }}
+      RADIUM_MAX_LOSS_USD: ${{ vars.RADIUM_MAX_LOSS_USD }}
+      RADIUM_MAX_STAKE_USD: ${{ vars.RADIUM_MAX_STAKE_USD }}
+      RADIUM_MIN_STAKE_USD: ${{ vars.RADIUM_MIN_STAKE_USD }}
+      RADIUM_MAX_OPEN: ${{ vars.RADIUM_MAX_OPEN }}
+      RADIUM_DAILY_LOSS_USD: ${{ vars.RADIUM_DAILY_LOSS_USD }}
+      RADIUM_TOTAL_LOSS_USD: ${{ vars.RADIUM_TOTAL_LOSS_USD }}
+      RADIUM_BUY_SLIPPAGE_BPS: ${{ vars.RADIUM_BUY_SLIPPAGE_BPS }}
+      RADIUM_SELL_SLIPPAGE_BPS: ${{ vars.RADIUM_SELL_SLIPPAGE_BPS }}
+      RADIUM_MAX_IMPACT_PCT: ${{ vars.RADIUM_MAX_IMPACT_PCT }}
+      RADIUM_MAX_LAG_S: ${{ vars.RADIUM_MAX_LAG_S }}
+      RADIUM_PRIORITY_MAX_LAMPORTS: ${{ vars.RADIUM_PRIORITY_MAX_LAMPORTS }}
+      RADIUM_FEE_RESERVE_SOL: ${{ vars.RADIUM_FEE_RESERVE_SOL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install --quiet "cryptography==50.0.1" "solders==0.29.0"
+      - name: Bridge
+        if: vars.RADIUM_MODE != 'off'
+        run: python radium.py --role bridge
+        env:
+          RADIUM_WALLET_KEY: ${{ secrets.RADIUM_WALLET_KEY }}
+          RADIUM_RPC_URL: ${{ secrets.RADIUM_RPC_URL }}
+          JUP_API_KEY: ${{ secrets.JUP_API_KEY }}

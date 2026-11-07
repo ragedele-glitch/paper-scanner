@@ -34,15 +34,16 @@ svg{display:block;width:100%}
 table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:6px 4px;text-align:right;border-top:1px solid var(--line)}td:first-child,th:first-child{text-align:left}th{color:var(--mut);font-weight:600}
 footer{color:var(--mut);font-size:12px;text-align:center;padding:4px 12px 24px}
 .lv .dot{display:inline-block;width:7px;height:7px;margin-right:5px;background:var(--g);vertical-align:middle}.fu{animation:fu 1.2s}.fd{animation:fd 1.2s}@keyframes fu{from{background:rgba(34,197,94,.35)}to{background:transparent}}@keyframes fd{from{background:rgba(239,68,68,.35)}to{background:transparent}}
+.rbadge{display:inline-block;font-size:12px;font-weight:800;padding:3px 9px;border-radius:6px;letter-spacing:.05em}.rb-dry{background:#13284a;color:#93c5fd}.rb-live{background:#7f1d1d;color:#fff}.rb-off{background:#262b33;color:#aab2bf}.rbig{display:block;text-align:center;font-weight:700;font-size:16px;padding:12px;border-radius:10px;margin-top:8px;text-decoration:none}.rb-stop{background:#b91c1c;color:#fff}.rb-pause{background:#a16207;color:#fff}.rb-go{background:#15803d;color:#fff}
 </style></head><body>
 <header>
  <div class="top"><div class="title">Rage Meme Bot<span class="paper">PAPER</span></div><div id="pill" class="pill"><span class="dot"></span>Loading…</div></div>
  <nav id="nav"></nav>
 </header>
 <main id="main"><div class="empty">Loading…</div></main>
-<footer id="foot">Paper mode only: no wallet, no keys, no real money. This page can only watch.</footer>
+<footer id="foot">The paper accounts use no wallet, no keys and no real money. Rage Radium Bot (Radium tab) is the real-money copy. This page can only watch.</footer>
 <script>
-const TABS=[["ov","Overview"],["pos","Positions"],["hist","History"],["sig","Signals"],["stats","Stats"],["log","Activity"],["wal","Wallets"]];
+const TABS=[["ov","Overview"],["pos","Positions"],["hist","History"],["sig","Signals"],["stats","Stats"],["log","Activity"],["wal","Wallets"],["rad","Radium"]];
 const OWNER="ragedele-glitch",REPO="paper-scanner";
 let K=location.hash.slice(1);if(K.length>20){try{localStorage.setItem("pk",K)}catch(e){}}else{try{K=localStorage.getItem("pk")||""}catch(e){}}
 let tab=(()=>{try{return localStorage.getItem("tab")||"ov"}catch(e){return"ov"}})(),S=null,sigF="all",lastOk=0,errMsg="";
@@ -155,11 +156,38 @@ function realCard(){const R=S.realism;if(!R)return"";if(R.error)return`<div clas
  ${m.n?`<div class="rd" style="margin-top:8px">$200 account, same pricing: ideal ${sgn(m.ideal)}, live-like ${sgn(m.actual)} over ${m.n} trade${m.n==1?"":"s"}.</div>`:""}
  <div class="rd m" style="margin-top:6px">${esc(S.rules.costs_live||"")}. Quotes are read-only: nothing is signed or sent.</div></div>`}
 function cmpRow(name,g){const f=x=>x.n?`${pct(x.avg,0)} avg · ${pct(x.median,0)} median · ${x.up}/${x.n} up · ${x.dead} dead`:"no data yet";return `<div class="row"><div class="rh"><span>${name}</span></div><div class="rd">After 1 h: ${f(g.h1)}</div><div class="rd">After 24 h: ${f(g.h24)}</div></div>`}
+function radBadge(R){const m=(R&&R.mode)||"off";return `<span class="rbadge ${m=="live"?"rb-live":m=="dry-run"?"rb-dry":"rb-off"}">${m=="live"?"LIVE · REAL MONEY":m=="dry-run"?"DRY-RUN · NOTHING SENT":"OFF"}</span>`}
+function radMini(){const R=S.radium;if(!R)return"";const o=R.open||[],x=R.stats||{};return `<div class="card"><h3>Rage Radium Bot · real-money copy</h3>${radBadge(R)} <span class="rd">${o.length} open · ${x.closed||0} closed · ${R.mode=="live"?"real":"would-be"} P&L <b class="${cls(x.pnl)}">${sgn(x.pnl)}</b>${R.blocked?" · <span class=y>"+esc(R.blocked)+"</span>":""}</span><div class="rd">Details in the Radium tab.</div></div>`}
+function radTr(t){const live=t.mode=="live";const st=t.status;const p=t.pnl;let h=`<div class="row"><div class="rh"><span>${esc(t.coin)} <span class="m s">${st}</span></span><span class="${cls(p)}">${p!=null?sgn(p):t.value?usd(t.value):"–"}</span></div><div class="rd">`;
+ if(st=="skipped")return h+`${T(t.t)} · skipped: ${esc(t.note||"")}</div></div>`;
+ h+=`${T(t.t)} · ${live?"bought":"would buy"} ${usd(t.stake)}${t.lag!=null?" · "+t.lag.toFixed(1)+" s after the paper buy":""}${t.impact!=null?" · impact "+t.impact.toFixed(1)+"%":""}`;
+ if(t.entry&&t.paper_entry)h+=` · price ${((t.entry/t.paper_entry-1)*100).toFixed(1)}% vs paper`;
+ if(t.half_usd)h+=` · half sold ${usd(t.half_usd)}`;
+ if(st=="closed")h+=`<br>${live?"sold":"would sell"} ${usd(t.exit_usd)} ${T(t.exit_ts)} · ${esc(t.reason||"")}${t.paper_pnl!=null?` · paper main account: <span class="${cls(t.paper_pnl)}">${sgn(t.paper_pnl)}</span> on ${usd(t.paper_size)}`:""}`;
+ else if(t.stop&&t.now_px)h+=`<br>now ${usd(t.value)} · stop ${((t.stop/t.now_px-1)*100).toFixed(0)}% below the price`;
+ if(t.err)h+=`<br><span class="y">${st=="closing"?"sell retrying (try "+t.tries+"): ":""}${esc(t.err)}</span>`;
+ return h+`</div></div>`}
+function radTab(){const R=S.radium;const ctl=`https://github.com/${OWNER}/${REPO}/actions/workflows/radium-control.yml`;
+ if(!R)return `<div class="card"><h3>Rage Radium Bot</h3><div class="empty">Starts with the next bot run.</div></div>`;
+ const L=R.limits||{},x=R.stats||{},age=S.now-R.ts;let h="";
+ if(age>300)h+=`<div class="warn">Radium's newest report is ${ago(age)}. It may be between runs; the bridge job keeps watching open trades then.</div>`;
+ h+=`<div class="card"><h3>Rage Radium Bot · real-money copy of the main account</h3>${radBadge(R)}<div class="rd" style="margin-top:6px">${R.mode=="live"?"Trading with real money.":"Dry run: real quotes and real transactions built, but nothing is signed or sent. No money moves."} Right now: ${esc(R.state||"")}${R.role=="bridge"?" (bridge job, between runs)":""}.${R.blocked?`<br><span class="y">New buys blocked: ${esc(R.blocked)}</span>`:""}</div>
+ <div class="grid" style="margin-top:10px"><div class="kv"><span>${R.mode=="live"?"P&L":"Would-be P&L"}</span><b class="${cls(x.pnl)}">${sgn(x.pnl)}</b><span>${x.closed||0} closed, ${x.wins||0} won</span></div><div class="kv"><span>Paper main, same trades</span><b class="${cls(x.paper_pnl)}">${sgn(x.paper_pnl)}</b><span>paper's own $20-ish sizes</span></div><div class="kv"><span>Today (Lagos)</span><b class="${cls(R.today)}">${sgn(R.today)}</b><span>stops new buys at -${usd(L.daily_loss,0)}</span></div><div class="kv"><span>Wallet</span><b>${R.balance_sol!=null?R.balance_sol.toFixed(4)+" SOL":"–"}</b><span>${R.balance_usd!=null?"about "+usd(R.balance_usd):(R.wallet_set?"":"not set")}</span></div></div>
+ <div class="rd" style="margin-top:8px">Key secret: ${R.key_set?(R.key_matches?"added, matches the wallet":"<span class=r>added but does NOT match the wallet: live is refused</span>"):"not added yet (fine for the dry run)"}</div>
+ <a class="rbig rb-stop" href="${ctl}" target="_blank" rel="noopener">STOP: sell everything + stop</a><a class="rbig rb-pause" href="${ctl}" target="_blank" rel="noopener">Pause new buys / resume</a><div class="rd" style="margin-top:6px">Opens GitHub: tap <b>Run workflow</b>, pick <b>sell everything + stop</b>, <b>pause</b> or <b>resume</b>, then <b>Run workflow</b>. The bot reads it within about 15 seconds. Switch now: <b>${R.control&&R.control.sell_all_and_stop?"STOPPED":R.control&&R.control.pause?"PAUSED":"on"}</b>.</div></div>`;
+ const o=R.open||[];h+=`<div class="card"><h3>Open (${o.length} of ${L.max_open})</h3>${o.length?o.map(radTr).join(""):'<div class="empty">None</div>'}</div>`;
+ h+=`<div class="card"><h3>Closed, next to the paper main account</h3>${(R.closed||[]).length?R.closed.map(radTr).join(""):'<div class="empty">None yet</div>'}</div>`;
+ if((R.skipped||[]).length)h+=`<div class="card"><h3>Main-account buys Radium skipped</h3>${R.skipped.map(radTr).join("")}</div>`;
+ h+=`<div class="card"><h3>Settings (change in GitHub repository variables)</h3><table><tr><td>Most lost per trade at the −${L.stop_pct}% stop, costs included</td><td>${usd(L.max_loss)}</td></tr><tr><td>Largest stake per trade</td><td>${usd(L.max_stake)}</td></tr><tr><td>Smallest stake (skips the trade if costs push it lower)</td><td>${usd(L.min_stake)}</td></tr><tr><td>Max open trades</td><td>${L.max_open}</td></tr><tr><td>Daily loss cap (stops new buys until midnight Lagos)</td><td>${usd(L.daily_loss)}</td></tr><tr><td>Total loss cap (stops new buys)</td><td>${usd(L.total_loss)}</td></tr><tr><td>Buy slippage cap</td><td>${(L.buy_slip_bps/100).toFixed(0)}%</td></tr><tr><td>Sell slippage (widens on retries, hard cap 30%)</td><td>${(L.sell_slip_bps/100).toFixed(0)}%</td></tr><tr><td>Max price impact</td><td>${L.max_impact}%</td></tr><tr><td>Skip if seen later than</td><td>${L.max_lag} s</td></tr><tr><td>Priority fee cap</td><td>${(L.priority_lamports/1e9).toFixed(4)} SOL</td></tr><tr><td>SOL kept for fees</td><td>${L.reserve_sol} SOL</td></tr></table><div class="rd" style="margin-top:6px">The wallet address isn't shown here on purpose.</div></div>`;
+ h+=`<div class="card"><h3>Radium activity</h3>${(R.events||[]).map(e=>`<div class="row"><div class="rd">${T(e.ts)} · <span class="${e.kind=="bad"?"r":e.kind=="buy"||e.kind=="sell"?"":"m"}">${esc(e.msg)}</span></div></div>`).join("")||'<div class="empty">Nothing yet</div>'}</div>`;
+ return h}
 function render(){nav();if(!S){if(errMsg)$("#main").innerHTML=`<div class="warn">${esc(errMsg)}</div>`;return}S.now=Date.now()/1000;S.status.awake=S.status.last_beat&&S.now-S.status.last_beat<300;pill();const st=S.status,a=S.account,x=S.stats;let h="";
  const stale=S.now-S.gen>420;const wf=`https://github.com/${OWNER}/${REPO}/actions/workflows/scan.yml`;
  if(!st.awake)h+=`<div class="warn"><b>The bot is asleep.</b> Last check-in ${T(st.last_beat)} (${ago(S.now-st.last_beat)}). While asleep it sees no buys and doesn't move stops. It restarts by itself within about 15 minutes. To start it now, open <a style="color:#fff" href="${wf}" target="_blank" rel="noopener">GitHub Actions</a>, tap <b>Run workflow</b>, then <b>Run workflow</b> again.</div>`;
  if(stale&&st.awake)h+=`<div class="warn">The newest data is ${ago(S.now-S.gen)}, so the numbers below may be a little old.</div>`;
+ if(tab=="rad")h+=radTab();
  if(tab=="ov"){
+  h+=radMini();
   h+=`<div class="card"><h3>$200 paper account${a.kind=="realistic"?" · realistic entry":""}</h3>${b15Acct()}<div class="big ${cls(a.change_usd)}">${usd(a.equity)}</div><div id="lveq" class="rd"></div><div class="${cls(a.change_usd)}">${sgn(a.change_usd)} (${pct(a.change_pct,2)}) since ${a.since?D(a.since):"start"}</div>${curve(a.curve)}
   <div class="grid" style="margin-top:10px"><div class="kv"><span>Cash</span><b>${usd(a.cash)}</b></div><div class="kv"><span>In open trades</span><b>${usd(a.open_value)}</b></div><div class="kv"><span>Max drawdown</span><b class="r">${a.mdd_pct.toFixed(1)}%</b></div><div class="kv"><span>Open trades</span><b>${a.n_open} of ${a.max_open}</b></div></div></div>`;
   if(S.account_5s&&a.kind=="realistic"){const b=S.account_5s;h+=`<div class="card"><h3>Old test: buying 5 s after the wallet</h3>${b15Acct()}<div class="rd">The first version assumed a copy 5 seconds after the smart wallet bought, which was faster than the scanner could ever see the buy. The account above buys at the moment the scanner actually saw it. This one is kept for comparison.</div><div class="grid" style="margin-top:8px"><div class="kv"><span>Equity</span><b class="${cls(b.change_usd)}">${usd(b.equity)}</b><span>${sgn(b.change_usd)} since ${D(b.since)}</span></div><div class="kv"><span>Closed trades</span><b>${b.closed}</b><span>${b.wins} won</span></div></div></div>`}

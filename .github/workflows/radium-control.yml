@@ -1,0 +1,47 @@
+# Rage Radium Bot phone switch. On your phone: GitHub > paper-scanner > Actions > "Rage Radium Bot switch" >
+# Run workflow > pick one > Run workflow. The bot reads the switch every 15 seconds.
+#   pause                  no new buys; open trades are still managed and sold normally
+#   sell everything + stop sells every open trade now and buys nothing until you pick "resume"
+#   resume                 back to normal
+name: Rage Radium Bot switch
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "What should Rage Radium Bot do?"
+        required: true
+        type: choice
+        options:
+          - pause
+          - sell everything + stop
+          - resume
+permissions:
+  contents: write
+concurrency:
+  group: radium-control
+  cancel-in-progress: false
+jobs:
+  switch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Set the switch
+        env:
+          ACTION: ${{ inputs.action }}
+          WHO: ${{ github.actor }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, time
+          a = os.environ["ACTION"]
+          v = {"pause": a == "pause", "sell_all_and_stop": a.startswith("sell"),
+               "set": a, "by": os.environ["WHO"], "at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())}
+          open("radium_control.json", "w").write(json.dumps(v, indent=1) + "\n")
+          print("Rage Radium Bot switch:", a)
+          EOF
+          git config user.name "rage-radium-switch"
+          git config user.email "rage-radium-switch@users.noreply.github.com"
+          git add radium_control.json
+          git commit -m "Rage Radium Bot switch: $ACTION" || echo "no change"
+          for i in 1 2 3 4 5; do git pull -q --rebase origin main && git push -q origin HEAD:main && break; sleep 3; done

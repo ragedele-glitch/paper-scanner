@@ -21,6 +21,12 @@ os.environ["SCANNER_DB"] = DB
 os.environ["SCANNER_LOG"] = LOG
 os.environ["QUIET"] = "1"
 PUB = os.path.join(HERE, "_publish")
+RSTATE = os.path.join(HERE, "radium_state")
+RADIUM_PID = os.path.join(RSTATE, "daemon.pid")
+# Rage Radium Bot's wallet key: taken out of this process's environment at once, so the paper scanner (started
+# from here) never has it. It is handed only to the Radium process, and only its environment.
+_RADIUM_KEY = os.environ.pop("RADIUM_WALLET_KEY", "")
+RADIUM_ON = (os.environ.get("RADIUM_MODE", "").strip().lower() or "dry-run") != "off"
 REPO = os.environ.get("GITHUB_REPOSITORY", "")
 TOKEN = os.environ.get("GITHUB_TOKEN", "")
 PUBLISH_EVERY = 120
@@ -63,11 +69,74 @@ def git(*a):
     return subprocess.run(["git", *a], cwd=PUB, capture_output=True, text=True)
 
 
+def radium_status():
+    try:
+        with open(os.path.join(RSTATE, "status.json")) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def radium_alive():
+    try:
+        with open(RADIUM_PID) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return b"radium.py" in f.read()
+    except Exception:
+        return False
+
+
+def radium_start():
+    """Starts Rage Radium Bot in the background. It keeps running across the hourly steps of this job (the
+    paper scanner restarts each hour, Radium doesn't), and hands its lock to the bridge job when the run ends."""
+    if not RADIUM_ON or radium_alive() or os.path.exists(os.path.join(RSTATE, "release")):
+        return
+    os.makedirs(RSTATE, exist_ok=True)
+    env = dict(os.environ)
+    if _RADIUM_KEY:
+        env["RADIUM_WALLET_KEY"] = _RADIUM_KEY
+    subprocess.Popen([sys.executable, os.path.join(HERE, "radium.py"), "--role", "primary"], cwd=HERE, env=env,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    print("Rage Radium Bot started")
+
+
+def radium_release(wait_s=150):
+    """End of the run: tell Radium to hand its lock (and state) to the bridge, and wait until it has."""
+    os.makedirs(RSTATE, exist_ok=True)
+    if radium_alive() and not os.path.exists(os.path.join(RSTATE, "bridge_sent")):
+        dispatch_bridge()     # run cut short (cancelled or failed): still get a bridge to take over open trades
+        time.sleep(45)
+    open(os.path.join(RSTATE, "release"), "w").close()
+    t0 = time.time()
+    while radium_alive() and time.time() - t0 < wait_s:
+        time.sleep(1)
+    print("Rage Radium Bot handed over" if not radium_alive() else "Rage Radium Bot did not exit in time")
+
+
+def dispatch_bridge():
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{REPO}/actions/workflows/radium-bridge.yml/dispatches",
+        data=json.dumps({"ref": "main"}).encode(), method="POST",
+        headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json",
+                 "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "paper-scanner"})
+    try:
+        urllib.request.urlopen(req, timeout=20)
+        open(os.path.join(RSTATE, "bridge_sent"), "w").close()
+        print("Radium bridge queued")
+    except Exception as e:
+        print("could not queue the Radium bridge:", type(e).__name__)
+
+
 def publish(extra):
     sys.path.insert(0, HERE)
     import dashboard
     st = dashboard.build_state()
     st.update(extra)
+    rs = radium_status()
+    if rs is not None:
+        st["radium"] = rs
     blob = encrypt(gzip.compress(json.dumps(st, default=str, separators=(",", ":")).encode()))
     if not os.path.isdir(os.path.join(PUB, ".git")):
         os.makedirs(PUB, exist_ok=True)
@@ -106,12 +175,17 @@ def run(minutes, last):
     proc = subprocess.Popen([sys.executable, os.path.join(HERE, "scanner.py")], cwd=HERE,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     queued = False
+    bridged = False
     next_pub = time.time() + 45
+    radium_start()
     while time.time() < end:
         if proc.poll() is not None:  # crashed: start it again
             time.sleep(5)
             proc = subprocess.Popen([sys.executable, os.path.join(HERE, "scanner.py")], cwd=HERE,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        radium_start()   # no-op while it runs; restarts it if it stopped
+        if last and RADIUM_ON and not bridged and end - time.time() < 420:
+            dispatch_bridge(); bridged = True
         if last and not queued and end - time.time() < 240:
             dispatch_next(); queued = True
         if time.time() >= next_pub:
@@ -126,6 +200,8 @@ def run(minutes, last):
         proc.wait(30)
     except subprocess.TimeoutExpired:
         proc.kill()
+    if last and RADIUM_ON:
+        radium_release()
     pack()
     try:
         publish(extra)
@@ -159,6 +235,8 @@ if __name__ == "__main__":
         run(float(sys.argv[2]), len(sys.argv) > 3 and sys.argv[3] == "last")
     elif cmd == "pack":
         pack()
+    elif cmd == "radium-release":
+        radium_release()
     elif cmd == "seal":  # used once, on setup: encrypt a database file as the seed
         with open(sys.argv[2], "rb") as f:
             sys.stdout.buffer.write(encrypt(gzip.compress(f.read(), 6)))
