@@ -294,6 +294,40 @@ def build_state():
         account["kind"] = "realistic"
     account_5s, _, hist_5s = account_view(C.ACCT_5S, meta.get("cash", C.START_EQUITY), "equity", start_ts)
     account_5s["kind"] = "5s"
+    # ---- rug filter shadow test: the realistic account's trades minus the ones the rug filter would skip
+    rug = None
+    try:
+        hf_start = meta.get("hf_start_ts")
+        if hf_start:
+            rug, rug_open, _ = account_view(C.ACCT_HF, meta.get("cash_hf", C.START_EQUITY), "equity_hf", hf_start)
+            rug.pop("curve", None)
+            real_same = q("SELECT COUNT(*) n, COALESCE(SUM(pnl_usd),0) p, COALESCE(SUM(pnl_usd>0),0) w FROM positions "
+                          "WHERE account=? AND status='closed' AND entry_ts>=?", (C.ACCT_REAL, hf_start))[0]
+            skipped = []
+            for r in q("SELECT s.id, s.symbol, s.mint, s.wallet, s.notes, s.detected_ts, p.status, p.pnl_usd FROM signals s "
+                       "LEFT JOIN positions p ON p.signal_id=s.id AND p.account=? WHERE s.hf_block=1 AND s.detected_ts>=? "
+                       "ORDER BY s.detected_ts DESC LIMIT 50", (C.ACCT_REAL, hf_start)):
+                why = (r["notes"] or "").split("rug-filter test: skipped, ")[-1].split(";")[0] if "rug-filter" in (r["notes"] or "") else ""
+                skipped.append({"coin": r["symbol"] or short(r["mint"]), "wallet": names.get(r["wallet"]) or short(r["wallet"]),
+                                "ts": r["detected_ts"], "why": why, "real_status": r["status"], "real_pnl": r["pnl_usd"]})
+            checked = q("SELECT COUNT(*) n, COALESCE(SUM(hf_top10 IS NOT NULL),0) ok FROM signals WHERE hf_block IS NOT NULL AND detected_ts>=?",
+                        (hf_start,))[0]
+            rug.update(kind="rug", since=hf_start, top10_max=C.HF_TOP10_MAX, rt_max=C.HF_RT_MAX, skipped=skipped,
+                       checked=checked["n"], checked_ok=checked["ok"],
+                       real_same={"closed": real_same["n"], "wins": real_same["w"], "pnl": real_same["p"]})
+    except Exception as e:
+        rug = {"error": f"rug filter test could not be read: {e}"}
+    # ---- wallet scorecard (Rage's checklist)
+    card = None
+    try:
+        rows = q("SELECT name,address,active,card_status,card_total,card_json FROM wallets WHERE card_status IS NOT NULL")
+        order = {"pinned": 0, "keep": 1, "new": 2, "bench": 3, "removed": 4}
+        card = sorted(({"name": r["name"] or short(r["address"]), "addr": short(r["address"]), "status": r["card_status"],
+                        "followed": bool(r["active"]), "total": r["card_total"], **json.loads(r["card_json"] or "{}")}
+                       for r in rows), key=lambda x: (order.get(x["status"], 9), -(x["total"] or 0)))
+        card = [c for c in card if c["status"] != "bench" or c.get("facts", {}).get("copies") or c.get("items", 0) >= 4][:150]
+    except Exception as e:
+        card = {"error": f"wallet scorecard could not be read: {e}"}
     if not real_start:
         account, open_rows, hist = account_5s, _, hist_5s
     wins = [h for h in hist if h["pnl"] > 0]
@@ -408,7 +442,7 @@ def build_state():
                             "share_24h": feed_share, "reconnects": feed.get("reconnects"), "url": feed.get("url"),
                             "noisy": len(feed.get("noisy") or []), "side": feed.get("side")},
                    "lag": lag},
-        "account": account, "account_5s": account_5s,
+        "account": account, "account_5s": account_5s, "rug_filter": rug, "wallet_card": card,
         "exits": exits,
         "entry_compare": {"n": len(entry_gap), "median_gap_pct": entry_gap[len(entry_gap) // 2] if entry_gap else None,
                           "real_shadow": {"n": len(sh_real), "pnl": sum(r[0] for r in sh_real)}},

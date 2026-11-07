@@ -1,0 +1,66 @@
+{
+ "about": "Wallets taken off the copy list because they kept losing on the bot's paper copies. The scanner never follows these again, even when they are back on the Kolscan leaderboard. To add one back, delete its entry. Their copy results show on the (encrypted) dashboard scorecard; this public file holds only the addresses.",
+ "rule": "Removed when a wallet has 2 or more closed copies in at least one of the flat $20 paper tests (realistic, 5-second), is net negative in every test it traded in, and lost at least twice as many copies as it won in each. Stigman and Fox are never removed. Data up to Nov 7, 2026.",
+ "removed": [
+  {
+   "address": "ardinRsN1mNYVeoJWTBsWeYeXvuR9UUDGMsCDKpb6AT",
+   "name": "trunoest",
+   "removed": "2026-11-07"
+  },
+  {
+   "address": "4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9",
+   "name": "decu",
+   "removed": "2026-11-07"
+  },
+  {
+   "address": "CgaA9a1JwAXJyfHuvZ7VW8YfTVRkdiT5mjBBSKcg7Rz5",
+   "name": "Art",
+   "removed": "2026-11-07"
+  },
+  {
+   "address": "BnfiHRDpHQ5yQevvwnzTmxtaB1Ek276fV5oTY9bi71EA",
+   "name": "M A M B A 🧲",
+   "removed": "2026-11-07"
+  },
+  {
+   "address": "EDXHdSFdadFbYFFjxPXBqMe1kCEDFqpPu552uvp48HR8",
+   "name": "Clown",
+   "removed": "2026-11-07"
+  },
+  {
+   "address": "EqiFgyNw6kgrmYstWyrP8VjKhka7XEmKTZzHSmwpr1Zb",
+   "name": "ban",
+   "removed": "2026-11-07"
+  },
+  {
+   "address": "387FRwow6MKDhSwuMULhKjqeXuxoBY4BbbaSntdk9LaH",
+   "name": "Shawty",
+   "removed": "2026-11-07"
+  },
+  {
+   "address": "5YRgrP3mjGzrzirYYN5HAQH19cTYREYwGxW6XRJQUzij",
+   "name": "slingoor",
+   "removed": "2026-11-07"
+  },
+  {
+   "address": "G2mgnzpr59vYjKpwU9q5zVfS9yQ9HezMwjuqF7LACvR4",
+   "name": "fz7",
+   "removed": "2026-11-07"
+  },
+  {
+   "address": "F5TjPySiUJMdvqMZHnPP85Rc1vErDGV5FR5P2vdVm429",
+   "name": "Zyaf",
+   "removed": "2026-11-07"
+  },
+  {
+   "address": "E7gozEiAPNhpJsdS52amhhN2XCAqLZa7WPrhyR6C8o4S",
+   "name": "evening",
+   "removed": "2026-11-07"
+  },
+  {
+   "address": "CAPn1yH4oSywsxGU456jfgTrSSUidf9jgeAnHceNUJdw",
+   "name": "cap",
+   "removed": "2026-11-07"
+  }
+ ]
+}

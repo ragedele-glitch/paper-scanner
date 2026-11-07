@@ -27,6 +27,18 @@ TOKEN_PROGRAMS = [
 
 # --- Scout ---
 MAX_WALLETS = 50            # follow up to 50 wallets
+# Rage's proven wallets (big wins: Stigman HeeHaw, Fox Lealana): always followed, even after they drop off the board.
+PINNED_WALLETS = {"8fsKLLtvKNanL4ginCaiRS6UfeemY11rSf8U8fN1dJw4": "Stigman",
+                  "DAEdBmTPEKM6xkwfzC3d411QUe6coKpkND6UURa4CvHC": "Fox"}
+# Wallets taken off the copy list because they kept losing (removed_wallets.json, with their stats at removal).
+# They are never followed again, even when they are back on the leaderboard. To add one back, delete its entry.
+try:
+    import json as _json
+    REMOVED_WALLETS = {w["address"] for w in _json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                         "removed_wallets.json")))["removed"]}
+    REMOVED_ERROR = None
+except Exception as _e:   # a broken file must not stop the scanner; the error is logged at start
+    REMOVED_WALLETS = set(); REMOVED_ERROR = f"{type(_e).__name__}: {_e}"
 BOARD_KEEP_DAYS = 3         # keep following a wallet for 3 days after it last appeared on the board
 BOARD_REFRESH_S = 6 * 3600  # re-read the leaderboard every 6 hours
 LOOP_S = 20
@@ -50,6 +62,15 @@ COPY_DELAY_S = 5            # old, optimistic test: copier buys 5 seconds after 
 # Headline (realistic) accounts buy at the moment the scanner actually saw the smart wallet's buy.
 ACCT_REAL, ACCT_REAL_SHADOW = 11, 10   # $200 account and flat-$20 test, realistic entry
 ACCT_5S, ACCT_5S_SHADOW = 1, 0         # the same two, entering 5 s after the smart wallet (kept for comparison)
+# Rug filter shadow test (from Nov 7, 2026). A second realistic $200 account that takes the same trades as ACCT_REAL,
+# except the ones the rug filter would skip. The current rules are unchanged; this only shows what the filter would do.
+#  1. pump.fun curve coin where the top 10 holders (leaving out the bonding curve and the copied wallet) own
+#     HF_TOP10_MAX % or more of the supply when the scanner sees the buy (rug backtest Nov 4: caught BASS and it)
+#  2. round trip at entry (buy then sell back, real quote at the trade's size) of HF_RT_MAX % or more
+#     (backtest Nov 7: only PVE 30.2% and PAMPIT 20.4% were that high, both losers; no winner above 15.7%)
+ACCT_HF = 21
+HF_TOP10_MAX = 22.0
+HF_RT_MAX = 20.0
 SLIPPAGE = 0.03             # 3% worse price on every buy and every sell
 BOT_FEE = 0.01              # 1% copy-bot fee per side (typical Telegram copy bots)
 POOL_FEE = 0.01             # ~1% DEX / pump.fun fee per side

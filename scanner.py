@@ -22,6 +22,8 @@ from collections import deque
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config as C
 import fills
+import holders
+import walletcard
 import live   # live mode: switched off unless LIVE_MODE is set; with it off every hook returns at once
 import stream as streammod
 
@@ -142,12 +144,17 @@ CREATE TABLE IF NOT EXISTS leader_sells(wallet TEXT, mint TEXT, ts REAL, sold_fr
 CREATE TABLE IF NOT EXISTS equity(ts REAL PRIMARY KEY, cash REAL, open_value REAL, equity REAL, n_open INT);
 CREATE TABLE IF NOT EXISTS heartbeat(ts REAL PRIMARY KEY, polled INT, rpc_mb REAL, note TEXT);
 CREATE TABLE IF NOT EXISTS equity_real(ts REAL PRIMARY KEY, cash REAL, open_value REAL, equity REAL, n_open INT);
+CREATE TABLE IF NOT EXISTS equity_hf(ts REAL PRIMARY KEY, cash REAL, open_value REAL, equity REAL, n_open INT);
 """
 MIGRATIONS = [
     "ALTER TABLE signals ADD COLUMN detect_src TEXT",      # 'stream' (live feed) or 'poll' (holdings re-read)
     "ALTER TABLE leader_sells ADD COLUMN det_ts REAL",     # when the scanner saw the smart wallet's sell
     "ALTER TABLE heartbeat ADD COLUMN ws INT",             # 1 = live feed connected at this check-in
     "ALTER TABLE heartbeat ADD COLUMN stream_n INT",       # wallet transactions read from the feed since last check-in
+    "ALTER TABLE wallets ADD COLUMN card_status TEXT",     # wallet scorecard: pinned / keep / new / bench / removed
+    "ALTER TABLE wallets ADD COLUMN card_total REAL",      # checklist score (out of 7)
+    "ALTER TABLE wallets ADD COLUMN card_json TEXT",       # scores per item and the facts behind them
+    "CREATE TABLE IF NOT EXISTS wallet_scores(ts REAL, address TEXT, status TEXT, total REAL, items INT, PRIMARY KEY(ts, address))",
 ] + [f"ALTER TABLE positions ADD COLUMN {c}" for c in (
     "fill_model TEXT",     # 'live' = live-like fills (fills.py); NULL = flat 3% slippage model
     "leader_px REAL",      # price the copied wallet got (first trade at its buy time): the 'ideal' entry
@@ -165,7 +172,11 @@ MIGRATIONS = [
     "alts TEXT", "alts_open INT")   # the same trade under the other exit rules, for comparison
 ] + [f"ALTER TABLE signals ADD COLUMN {c}" for c in (
     "holders INT", "transfer_fee_pct REAL", "lp_locked_pct REAL", "token_program TEXT",
-    "rt_pct REAL", "fill_note TEXT")]
+    "rt_pct REAL", "fill_note TEXT",
+    "hf_top10 REAL", "hf_top1 REAL",   # top-10 / top-1 holders' % of supply, leaving out the curve and the copied wallet
+    "hf_block INT",                    # 1 = the holder-filter test account skipped it; 0 = took it; NULL = not checked
+    "hf_info TEXT",                    # holder check details (JSON) or why it failed
+    "chain_info TEXT")]                # creator and early-buyer numbers (JSON), filled in a few seconds later
 
 
 def migrate(con):
@@ -219,15 +230,52 @@ def refresh_board(con):
             VALUES(?,?,?,?,?,?,?,?,?,60,0) ON CONFLICT(address) DO UPDATE SET name=excluded.name,last_seen=excluded.last_seen,
             last_rank=excluded.last_rank,pnl_sol=excluded.pnl_sol,pnl_usd=excluded.pnl_usd,wins=excluded.wins,losses=excluded.losses""",
                     (r["addr"], r["name"], t, t, r["rank"], r["pnl_sol"], r["pnl_usd"], r["wins"], r["losses"]))
-    # follow set: on the board in the last N days with positive profit, best recent rank first
+    cand = follow_set(con, t)
     con.execute("UPDATE wallets SET active=0")
-    cand = con.execute("""SELECT address FROM wallets WHERE last_seen>? AND COALESCE(pnl_sol,0)>0
-                          ORDER BY last_seen DESC, last_rank ASC LIMIT ?""", (t - C.BOARD_KEEP_DAYS * 86400, C.MAX_WALLETS)).fetchall()
-    for c in cand:
-        con.execute("UPDATE wallets SET active=1 WHERE address=?", (c[0],))
+    for a in cand:
+        con.execute("UPDATE wallets SET active=1 WHERE address=?", (a,))
     meta_set(con, "board_ts", t)
     con.commit()
     log.info("board refreshed: %d rows parsed, %d wallets followed", len(rows), len(cand))
+
+
+def follow_set(con, t):
+    """Wallets to follow, from Rage's checklist scorecard (walletcard.py).
+    Pinned (Stigman, Fox) always; then wallets that made the bot money (seen on the board in the last 14 days);
+    then wallets on the board in the last BOARD_KEEP_DAYS with positive profit that score 'keep' or are too new to
+    score, best score first. Removed and benched wallets are never followed. If scoring fails, the old rule is used
+    (still without removed wallets)."""
+    old = [r[0] for r in con.execute("""SELECT address FROM wallets WHERE last_seen>? AND COALESCE(pnl_sol,0)>0
+                          ORDER BY last_seen DESC, last_rank ASC""", (t - C.BOARD_KEEP_DAYS * 86400,))
+           if r[0] not in C.REMOVED_WALLETS]
+    try:
+        board = walletcard.kolscan_boards()
+        # new candidates from the 7- and 30-day boards: profitable on both
+        for a, b in board.items():
+            if b.get(7, {}).get("sol", 0) > 0 and b.get(30, {}).get("sol", 0) > 0:
+                con.execute("""INSERT INTO wallets(address,name,first_seen,last_seen,last_rank,pnl_sol,poll_s,last_poll)
+                    VALUES(?,?,?,?,99,?,60,0) ON CONFLICT(address) DO UPDATE SET last_seen=MAX(last_seen, excluded.last_seen),
+                    pnl_sol=COALESCE(pnl_sol, excluded.pnl_sol)""", (a, b.get("name", ""), t, t, b[7]["sol"]))
+        cards = walletcard.score_all(con, board, t)
+        seen = {r[0]: r[1] for r in con.execute("SELECT address,last_seen FROM wallets")}
+        pos = {r[0]: r[1] for r in con.execute("SELECT address,COALESCE(pnl_sol,0) FROM wallets")}
+        for a, c in cards.items():
+            c["status"] = walletcard.status(a, c)
+            if a in seen:
+                con.execute("UPDATE wallets SET card_status=?, card_total=?, card_json=? WHERE address=?",
+                            (c["status"], c["total"], json.dumps({"score": c["score"], "items": c["items"], "facts": c["facts"]}), a))
+                con.execute("INSERT OR REPLACE INTO wallet_scores VALUES(?,?,?,?,?)", (round(t), a, c["status"], c["total"], c["items"]))
+        pinned = [a for a in C.PINNED_WALLETS]
+        proven = sorted((a for a, c in cards.items() if c["status"] == "keep" and walletcard.proven(c)
+                         and seen.get(a, 0) > t - 14 * 86400 and a not in pinned), key=lambda a: -cards[a]["total"])
+        rest = sorted((a for a, c in cards.items() if c["status"] in ("keep", "new") and a not in pinned and a not in proven
+                       and seen.get(a, 0) > t - C.BOARD_KEEP_DAYS * 86400 and pos.get(a, 0) > 0),
+                      key=lambda a: (cards[a]["status"] != "keep", -cards[a]["total"]))
+        out = [a for a in pinned if a in seen] + proven + rest
+        return out[:C.MAX_WALLETS + len(pinned)]
+    except Exception as e:
+        log.warning("wallet scorecard failed (%s), following the board as before", e)
+        return old[:C.MAX_WALLETS]
 
 
 def snapshot(addr):
@@ -597,6 +645,10 @@ def handle_candidate(con, c, pairs):
 
     # --- Sniper: survivor -> paper entries (realistic headline, plus the old 5 s test)
     pool = tp["pairAddress"]
+    sig.update(holder_check(mint, pool, wallet, tp.get("dexId") == "pumpfun"))
+    rug_why = [f"top 10 holders own {sig['hf_top10']:.1f}% (limit {C.HF_TOP10_MAX:.0f}%)"] if sig.get("hf_block") else []
+    hf_takes = not rug_why
+    sid = None
     fill_ts = entry_real + C.EXEC_DELAY_S
     (px_seen, src_r), (px_5, src_5), (px_lead, _), (px_fill, src_f) = gecko_prices_at(
         pool, mint, [entry_real, entry_5s, buy_ts, fill_ts])
@@ -614,6 +666,10 @@ def handle_candidate(con, c, pairs):
                     rt_pct=q["rt_pct"], q_src_in=q["src"], route=q.get("route"), fee_in=fee_in, liq_in=liq,
                     sellable=1 if q["sellable"] else 0)
         sig["rt_pct"] = q["rt_pct"]
+        if q["rt_pct"] is not None and q["rt_pct"] >= C.HF_RT_MAX:
+            rug_why.append(f"round trip {q['rt_pct']:.1f}% (limit {C.HF_RT_MAX:.0f}%)")
+        hf_takes = not rug_why
+        sig["hf_block"] = 1 if rug_why else 0
         fn = [f"live-like fill: lands {C.EXEC_DELAY_S}s after seen at {px_r:.6g} (seen {px_seen:.6g})",
               f"round trip {q['rt_pct']:.1f}% via {q['src']}", f"network ${fee_in:.3f}/tx"]
         if not q["sellable"]:
@@ -625,6 +681,8 @@ def handle_candidate(con, c, pairs):
             fn.append(f"buy failed: price jumped {jump*100:.0f}% before landing (limit {C.COPY_SLIPPAGE_TOL*100:.0f}%), "
                       f"${fail_fee:.3f} fee lost")
             meta_set(con, cash_key(C.ACCT_REAL), meta_get(con, cash_key(C.ACCT_REAL), C.START_EQUITY) - fail_fee)
+            if hf_takes and hf_started(con):   # the rug-filter test would have tried the same buy
+                meta_set(con, cash_key(C.ACCT_HF), meta_get(con, cash_key(C.ACCT_HF), C.START_EQUITY) - fail_fee)
             fill = "failed"
         sig["fill_note"] = "; ".join(fn)
     if killed:   # only the realistic sold-early check blocked it: the wallet sold after 5 s but before we saw the buy
@@ -639,14 +697,73 @@ def handle_candidate(con, c, pairs):
             # shadow position: every survivor, flat $20, no slot limit (measures the filters themselves)
             open_position(con, sid, C.ACCT_REAL_SHADOW, mint, sym, pool, wallet, fill_ts, px_r, src_f or src_r, 20.0, fill)
             open_main(con, sid, C.ACCT_REAL, mint, sym, pool, wallet, fill_ts, px_r, src_f or src_r, c["name"], "", fill)
+            # shadow test: the same trade with the rug filter (the current rules above are unchanged)
+            if not hf_started(con):
+                pass
+            elif hf_takes:
+                open_main(con, sid, C.ACCT_HF, mint, sym, pool, wallet, fill_ts, px_r, src_f or src_r, c["name"],
+                          "rug-filter test: ", fill)
+            else:
+                con.execute("UPDATE signals SET notes=COALESCE(notes||'; ','')||? WHERE id=?",
+                            ("rug-filter test: skipped, " + ", ".join(rug_why), sid))
+                log.info("RUG FILTER would skip %s %s: %s", sym, mint, ", ".join(rug_why))
+    if sid:
+        queue_chain_info(sid, mint, pool, wallet, det, tp.get("dexId") == "pumpfun")
     if not killed5:
         open_position(con, sid, C.ACCT_5S_SHADOW, mint, sym, pool, wallet, entry_5s, px_5, src_5, 20.0)
         if open_main(con, sid, C.ACCT_5S, mint, sym, pool, wallet, entry_5s, px_5, src_5, c["name"], "5 s test: "):
             live_hook(live.on_paper_buy, con, sid, mint, sym, buy_ts)
 
 
+def holder_check(mint, pool, wallet, is_curve):
+    """Top-10 holder numbers for the holder-filter shadow test. Never blocks the current rules."""
+    try:
+        h = holders.top10(mint, pool if is_curve else None, wallet)
+    except Exception as e:
+        log.warning("holder check failed for %s: %s", mint, e)
+        return dict(hf_block=0, hf_info=json.dumps({"error": str(e)[:200]}))
+    block = 1 if (is_curve and h["top10"] >= C.HF_TOP10_MAX) else 0
+    info = {k: h[k] for k in ("top10", "top1", "curve_pct", "leader_pct", "counted", "secs")}
+    info["applies"] = bool(is_curve)
+    info["top_owners"] = h["top_owners"]
+    return dict(hf_top10=h["top10"], hf_top1=h["top1"], hf_block=block, hf_info=json.dumps(info))
+
+
+def hf_started(con):
+    return meta_get(con, "hf_start_ts") is not None
+
+
+CHAIN_POOL = None
+CHAIN_JOBS = []
+
+
+def queue_chain_info(sid, mint, pool, wallet, det, is_curve):
+    """Creator and early-buyer numbers, read in the background so they never delay a paper buy."""
+    global CHAIN_POOL
+    try:
+        if CHAIN_POOL is None:
+            CHAIN_POOL = ThreadPoolExecutor(max_workers=1)
+        CHAIN_JOBS.append((sid, CHAIN_POOL.submit(holders.chain_info, mint, pool, wallet, det, is_curve)))
+    except Exception as e:
+        log.warning("chain info not queued for %s: %s", mint, e)
+
+
+def drain_chain_info(con):
+    for job in list(CHAIN_JOBS):
+        sid, fut = job
+        if not fut.done():
+            continue
+        CHAIN_JOBS.remove(job)
+        try:
+            ci = fut.result()
+        except Exception as e:
+            ci = {"error": str(e)[:200]}
+        con.execute("UPDATE signals SET chain_info=? WHERE id=?", (json.dumps(ci), sid))
+        con.commit()
+
+
 def cash_key(account):
-    return "cash_real" if account == C.ACCT_REAL else "cash"
+    return {C.ACCT_REAL: "cash_real", C.ACCT_HF: "cash_hf"}.get(account, "cash")
 
 
 def open_main(con, sid, account, mint, sym, pool, wallet, entry_ts, px, src, name, tag, fill=None):
@@ -864,7 +981,7 @@ def alt_step(con, p, cs, mirror_ts, t_now, live_fill):
 def mirror_time(con, p):
     ls = con.execute("SELECT ts,sold_frac,det_ts FROM leader_sells WHERE wallet=? AND mint=?", (p["leader"], p["mint"])).fetchone()
     if ls and ls["sold_frac"] >= C.MIRROR_SELL_FRAC:
-        if p["account"] in (C.ACCT_REAL, C.ACCT_REAL_SHADOW) and ls["det_ts"]:
+        if p["account"] in (C.ACCT_REAL, C.ACCT_REAL_SHADOW, C.ACCT_HF) and ls["det_ts"]:
             return max(ls["det_ts"], ls["ts"])
         return ls["ts"] + C.COPY_DELAY_S
     return None
@@ -883,7 +1000,7 @@ def alt_all(con):
             since = min(a["last"] for a in alts.values() if a["st"] == "open") + 60
             cs = candles_cached(p["pool"], p["mint"], int(since))
             cs = [c for c in cs if c[0] + 60 <= t_now - 20]
-            alt_step(con, p, cs, mirror_time(con, p), t_now, p["account"] in (C.ACCT_REAL, C.ACCT_REAL_SHADOW))
+            alt_step(con, p, cs, mirror_time(con, p), t_now, p["account"] in (C.ACCT_REAL, C.ACCT_REAL_SHADOW, C.ACCT_HF))
             con.execute("UPDATE positions SET last_update=? WHERE id=?", (t_now, p["id"]))
             con.commit()
         except Exception as ex:
@@ -899,7 +1016,7 @@ def take_half(con, p, t, px, stop, slog, t_now):
     con.execute("""UPDATE positions SET qty=?, part_ts=?, part_px=?, part_qty=?, part_proceeds=?, part_r=?, part_fee=? WHERE id=?""",
                 (p["qty"], t, px, half, proceeds, r, fee, p["id"]))
     slog.append([t, stop, f"sold half at {px / p['entry_price']:.1f}x for ${proceeds:.2f}"])
-    if p["account"] in (C.ACCT_5S, C.ACCT_REAL):
+    if p["account"] in (C.ACCT_5S, C.ACCT_REAL, C.ACCT_HF):
         k = cash_key(p["account"])
         meta_set(con, k, meta_get(con, k, C.START_EQUITY) + proceeds)
         log.info("PAPER SELL HALF [acct %d] %s at %.1fx $%.2f", p["account"], p["symbol"], px / p["entry_price"], proceeds)
@@ -915,7 +1032,7 @@ def close_position(con, p, ts, px, reason, stop=None, peak=None, slog=None):
                    stop=COALESCE(?,stop),peak=COALESCE(?,peak),stop_log=COALESCE(?,stop_log),last_update=? WHERE id=?""",
                 (ts, px, reason, proceeds, pnl, pnl / p["size_usd"] * 100, px, stop, peak,
                  json.dumps(slog[-30:]) if slog is not None else None, now(), p["id"]))
-    if p["account"] in (C.ACCT_5S, C.ACCT_REAL):
+    if p["account"] in (C.ACCT_5S, C.ACCT_REAL, C.ACCT_HF):
         k = cash_key(p["account"])
         meta_set(con, k, meta_get(con, k, C.START_EQUITY) + proceeds)
         log.info("PAPER SELL [acct %d] %s %s pnl $%.2f (%.0f%%)", p["account"], p["symbol"], reason, pnl, pnl / p["size_usd"] * 100)
@@ -981,13 +1098,13 @@ def update_position(con, p, pool_now=None):
     mirror_ts = None
     if ls and ls["sold_frac"] >= C.MIRROR_SELL_FRAC:
         # realistic accounts sell when the scanner saw the smart wallet sell; the old test 5 s after it sold
-        if p["account"] in (C.ACCT_REAL, C.ACCT_REAL_SHADOW) and ls["det_ts"]:
+        if p["account"] in (C.ACCT_REAL, C.ACCT_REAL_SHADOW, C.ACCT_HF) and ls["det_ts"]:
             mirror_ts = max(ls["det_ts"], ls["ts"])
         else:
             mirror_ts = ls["ts"] + C.COPY_DELAY_S
     last_ts, last_px = p["last_candle_ts"], p["last_price"]
     v3 = is_v3(p)
-    live_fill = v3 and p["account"] in (C.ACCT_REAL, C.ACCT_REAL_SHADOW)
+    live_fill = v3 and p["account"] in (C.ACCT_REAL, C.ACCT_REAL_SHADOW, C.ACCT_HF)
     if v3:
         alt_step(con, p, cs, mirror_ts, t_now, live_fill)
     for (t, o, h, l, c) in cs:
@@ -1047,7 +1164,7 @@ def guard_all(con):
         age = now() - (p["last_update"] or 0)
         if p["account"] in (C.ACCT_5S_SHADOW, C.ACCT_REAL_SHADOW) and age < every:
             continue
-        if p["account"] in (C.ACCT_5S, C.ACCT_REAL) and age < 55:
+        if p["account"] in (C.ACCT_5S, C.ACCT_REAL, C.ACCT_HF) and age < 55:
             continue
         due.append(p)
     # one candle fetch per coin, from the earliest point any due position on it needs
@@ -1282,7 +1399,13 @@ def main():
         meta_set(con, "start_ts", now()); meta_set(con, "cash", C.START_EQUITY); con.commit()
     if meta_get(con, "real_start_ts") is None:   # realistic-entry accounts start fresh the first time this code runs
         meta_set(con, "real_start_ts", now()); meta_set(con, "cash_real", C.START_EQUITY); con.commit()
+    if meta_get(con, "card_v") != 1:   # first start with the wallet scorecard: rebuild the follow list now
+        meta_set(con, "board_ts", 0); meta_set(con, "card_v", 1); con.commit()
+    if meta_get(con, "hf_start_ts") is None:   # rug-filter shadow test account: judged on new trades only
+        meta_set(con, "hf_start_ts", now()); meta_set(con, "cash_hf", C.START_EQUITY); con.commit()
     log.info("scanner start (PAPER MODE ONLY - no wallet, no keys, nothing signed)")
+    if C.REMOVED_ERROR:
+        log.warning("removed_wallets.json could not be read (%s): no wallets removed this run", C.REMOVED_ERROR)
     STREAM = streammod.WalletStream(C.WS_URLS, noisy=(meta_get(con, "feed") or {}).get("noisy") or [])
     STREAM.set_wallets([r[0] for r in con.execute("SELECT address FROM wallets WHERE active=1")])
     if not STREAM.start():
@@ -1305,6 +1428,7 @@ def main():
             _t("feed", drain_stream, con)
             cands, polled = _t("poll", poll_wallets, con)
             _t("filters", process_new_buys, con, cands)
+            drain_chain_info(con)
             _t("feed2", drain_stream, con)
             _t("guard", guard_all, con)
             _t("alt exits", alt_all, con)
@@ -1313,7 +1437,7 @@ def main():
             if sum(tm.values()) > 60:
                 log.info("slow loop: %s", ", ".join(f"{k} {v:.0f}s" for k, v in tm.items() if v >= 5))
             if now() - last_eq > 300:
-                for acct, table in ((C.ACCT_5S, "equity"), (C.ACCT_REAL, "equity_real")):
+                for acct, table in ((C.ACCT_5S, "equity"), (C.ACCT_REAL, "equity_real"), (C.ACCT_HF, "equity_hf")):
                     st = account_state(con, acct)
                     con.execute(f"INSERT OR REPLACE INTO {table} VALUES(?,?,?,?,?)", (now(), st["cash"], st["open_value"], st["equity"], st["n_open"]))
                 last_eq = now()
