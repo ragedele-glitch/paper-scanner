@@ -26,6 +26,8 @@ jobs:
     env:
       DASH_KEY: ${{ secrets.DASH_KEY }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Free Helius key (read-only): used first for the live feed and the RPC reads, public nodes stay as backup.
+      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
       # Live mode settings (repository variables, Settings > Secrets and variables > Actions > Variables).
       # None are set, so LIVE_MODE is empty and live mode stays off.
       LIVE_MODE: ${{ vars.LIVE_MODE }}
