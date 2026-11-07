@@ -33,6 +33,7 @@ main{padding:12px;max-width:760px;margin:0 auto}
 svg{display:block;width:100%}
 table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:6px 4px;text-align:right;border-top:1px solid var(--line)}td:first-child,th:first-child{text-align:left}th{color:var(--mut);font-weight:600}
 footer{color:var(--mut);font-size:12px;text-align:center;padding:4px 12px 24px}
+.lv .dot{display:inline-block;width:7px;height:7px;margin-right:5px;background:var(--g);vertical-align:middle}.fu{animation:fu 1.2s}.fd{animation:fd 1.2s}@keyframes fu{from{background:rgba(34,197,94,.35)}to{background:transparent}}@keyframes fd{from{background:rgba(239,68,68,.35)}to{background:transparent}}
 </style></head><body>
 <header>
  <div class="top"><div class="title">Rage Meme Bot<span class="paper">PAPER</span></div><div id="pill" class="pill"><span class="dot"></span>Loading…</div></div>
@@ -67,8 +68,9 @@ function curve(pts){if(pts.length<2)return'<div class="empty">Curve appears afte
  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="height:170px"><line x1="0" x2="${W}" y1="${Y(200)}" y2="${Y(200)}" stroke="#3a4250" stroke-dasharray="4 4"/><path d="${d} L${X(x1)},${H} L${X(x0)},${H}Z" fill="${col}" opacity=".12"/><path d="${d}" fill="none" stroke="${col}" stroke-width="2.2" vector-effect="non-scaling-stroke"/></svg><div class="rd" style="display:flex;justify-content:space-between"><span>${T(x0)}</span><span>dashed line = $200 start</span><span>now</span></div>`}
 function upbar(u){return `<div class="bar">${u.cells.map(c=>`<i title="${T(c.h)}: ${c.pct}%" style="background:${c.pct>=90?"#22c55e":c.pct>=30?"#eab308":c.pct>0?"#7c2d12":"#2a303a"}"></i>`).join("")}</div><div class="rd" style="display:flex;justify-content:space-between"><span>48 h ago</span><span>each block = 1 hour awake</span><span>now</span></div>`}
 function errs(st){if(!st.errors.length)return'<div class="s g">No data-source errors in the last 15 minutes.</div>';return st.errors.map(e=>`<div class="s"><span class="r">●</span> ${esc(e.what)} — ${e.count}×, last ${TT(e.last)}</div>`).join("")}
-function posCard(p){return `<div class="row"><div class="rh"><span>${esc(p.coin)} <span class="m s">${esc(p.mint)}</span></span><span class="${cls(p.pnl)}">${sgn(p.pnl)} (${pct(p.pnl_pct)})</span></div>
-<div class="rd">Bought ${usd(p.size)} at ${px(p.entry_price)} · now ${px(p.now_price)} <span class="m">(price ${ago(p.price_age)})</span></div>
+function posCard(p){const k=esc(p.coin+"|"+p.entry_ts);return `<div class="row"><div class="rh"><span>${esc(p.coin)} <span class="m s">${esc(p.mint)}</span></span><span data-lvh="${k}" class="${cls(p.pnl)}">${sgn(p.pnl)} (${pct(p.pnl_pct)})</span></div>
+<div class="lv" data-lv="${k}"></div>
+<div class="rd">Bought ${usd(p.size)} at ${px(p.entry_price)} · bot's last price ${px(p.now_price)} <span class="m">(${ago(p.price_age+(S.now-S.gen))})</span></div>
 <div class="rd">Stop ${px(p.stop)} (${pct(p.stop_pct,0)} from entry, ${p.stop_kind=="trailing"?"trailing, profit locked":p.stop_kind=="breakeven"?"at breakeven":"starting stop"}) · best so far ${pct(p.peak_pct,0)}</div>${p.half?`<div class="rd g">Half sold at ${p.half.x.toFixed(1)}x for ${usd(p.half.got)} · the rest rides under the trail</div>`:""}
 <div class="rd">Copied ${esc(p.wallet)} · open ${dur(S.now-p.entry_ts)} (since ${T(p.entry_ts)})</div></div>`}
 function histCard(h){return `<div class="row"><div class="rh"><span>${esc(h.coin)} <span class="m s">${esc(h.mint)}</span></span><span class="${cls(h.pnl)}">${sgn(h.pnl)} (${pct(h.pnl_pct)})</span></div>
@@ -124,7 +126,7 @@ function render(){nav();if(!S){if(errMsg)$("#main").innerHTML=`<div class="warn"
  if(!st.awake)h+=`<div class="warn"><b>The bot is asleep.</b> Last check-in ${T(st.last_beat)} (${ago(S.now-st.last_beat)}). While asleep it sees no buys and doesn't move stops. It restarts by itself within about 15 minutes. To start it now, open <a style="color:#fff" href="${wf}" target="_blank" rel="noopener">GitHub Actions</a>, tap <b>Run workflow</b>, then <b>Run workflow</b> again.</div>`;
  if(stale&&st.awake)h+=`<div class="warn">The newest data is ${ago(S.now-S.gen)}, so the numbers below may be a little old.</div>`;
  if(tab=="ov"){
-  h+=`<div class="card"><h3>$200 paper account${a.kind=="realistic"?" · realistic entry":""}</h3><div class="big ${cls(a.change_usd)}">${usd(a.equity)}</div><div class="${cls(a.change_usd)}">${sgn(a.change_usd)} (${pct(a.change_pct,2)}) since ${a.since?D(a.since):"start"}</div>${curve(a.curve)}
+  h+=`<div class="card"><h3>$200 paper account${a.kind=="realistic"?" · realistic entry":""}</h3><div class="big ${cls(a.change_usd)}">${usd(a.equity)}</div><div id="lveq" class="rd"></div><div class="${cls(a.change_usd)}">${sgn(a.change_usd)} (${pct(a.change_pct,2)}) since ${a.since?D(a.since):"start"}</div>${curve(a.curve)}
   <div class="grid" style="margin-top:10px"><div class="kv"><span>Cash</span><b>${usd(a.cash)}</b></div><div class="kv"><span>In open trades</span><b>${usd(a.open_value)}</b></div><div class="kv"><span>Max drawdown</span><b class="r">${a.mdd_pct.toFixed(1)}%</b></div><div class="kv"><span>Open trades</span><b>${a.n_open} of ${a.max_open}</b></div></div></div>`;
   if(S.account_5s&&a.kind=="realistic"){const b=S.account_5s;h+=`<div class="card"><h3>Old test: buying 5 s after the wallet</h3><div class="rd">The first version assumed a copy 5 seconds after the smart wallet bought, which was faster than the scanner could ever see the buy. The account above buys at the moment the scanner actually saw it. This one is kept for comparison.</div><div class="grid" style="margin-top:8px"><div class="kv"><span>Equity</span><b class="${cls(b.change_usd)}">${usd(b.equity)}</b><span>${sgn(b.change_usd)} since ${D(b.since)}</span></div><div class="kv"><span>Closed trades</span><b>${b.closed}</b><span>${b.wins} won</span></div></div></div>`}
   h+=rugCard();h+=exitsCard();h+=realCard();if(st.lag){const L=st.lag,fd=st.feed||{},f=v=>v==null?"–":v<10?v.toFixed(1)+" s":Math.round(v)+" s";h+=`<div class="card"><h3>How fast buys are seen</h3><div class="grid"><div class="kv"><span>Live feed</span><b class="${fd.connected?"g":"r"}">${fd.connected?"Connected":"Down"}</b><span>${fd.share_24h==null?"":fd.share_24h+"% of check-ins, 24 h"}</span></div><div class="kv"><span>Median delay, live feed</span><b>${f(L.feed_24h.median)}</b><span>${L.feed_24h.n||0} buys, 24 h</span></div><div class="kv"><span>Median delay, backup re-read</span><b>${f(L.reread_24h.median)}</b><span>${L.reread_24h.n||0} buys, 24 h</span></div><div class="kv"><span>Median delay before the feed</span><b>${f(L.before_feed.median)}</b><span>${L.before_feed.n||0} buys</span></div></div></div>`}
@@ -146,7 +148,7 @@ function render(){nav();if(!S){if(errMsg)$("#main").innerHTML=`<div class="warn"
  if(tab=="log")h+=`<div class="card"><h3>What the bot did, newest first</h3>${S.activity.length?S.activity.map(e=>`<div class="row"><div class="rh" style="font-weight:400"><span class="${e.kind=="bad"?"r":e.kind=="buy"?"g":e.kind=="sell"?"y":""}">${esc(e.text)}</span><span class="m s" style="white-space:nowrap">${T(e.ts)}</span></div></div>`).join(""):'<div class="empty">Nothing logged yet.</div>'}</div>`;
  if(tab=="wal")h+=cardBoard()+walBoard();
   if(tab=="wal")h+=`<div class="card"><h3>Smart wallets followed (${S.wallets.length})</h3><div class="rd" style="margin-bottom:6px">Top wallets from the Kolscan leaderboard, re-read every 6 hours.</div>${S.wallets.map(w=>`<div class="row"><div class="rh"><span>#${w.rank??"–"} ${esc(w.name)} <span class="m s">${esc(w.addr)}</span></span><span class="${cls(w.pnl_usd)} s">${w.pnl_usd!=null?sgn(w.pnl_usd,0):""}</span></div><div class="rd">${w.wins??0} wins / ${w.losses??0} losses on Kolscan · checked every ${w.every_s}s · last ${w.last_check?ago(S.now-w.last_check):"never"}</div></div>`).join("")}</div>`;
- $("#main").innerHTML=h;$("#foot").innerHTML=`Data from ${TT(S.gen)} Lagos time (${ago(S.now-S.gen)}) · the bot sends new data every 2 min, and this page checks every minute<br><a style="color:var(--mut)" href="${wf}" target="_blank" rel="noopener">The bot runs on GitHub Actions</a><br>Paper mode only: no wallet, no keys, no real money. This page can only watch.`}
+ $("#main").innerHTML=h;$("#foot").innerHTML=`Data from ${TT(S.gen)} Lagos time (${ago(S.now-S.gen)}) · the bot sends new data every 2 min, and this page checks every minute. While this page is open, open-trade prices refresh about every 10 seconds straight from Jupiter (DexScreener as backup)<br><a style="color:var(--mut)" href="${wf}" target="_blank" rel="noopener">The bot runs on GitHub Actions</a><br>Paper mode only: no wallet, no keys, no real money. This page can only watch.`}
 function b64(s){s=s.replace(/-/g,"+").replace(/_/g,"/");while(s.length%4)s+="=";return Uint8Array.from(atob(s),c=>c.charCodeAt(0))}
 async function fetchBlob(){const u1=`https://api.github.com/repos/${OWNER}/${REPO}/contents/state.enc?ref=data&t=${Date.now()}`;
  try{const r=await fetch(u1,{cache:"no-store",headers:{Accept:"application/vnd.github.raw"}});if(r.ok)return(await r.text()).trim()}catch(e){}
@@ -157,5 +159,38 @@ async function load(){if(!K){errMsg="This link is missing its key. Open the full
   const txt=await new Response(new Blob([plain]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
   S=JSON.parse(txt);S.gen=S.now;lastOk=Date.now()/1000;errMsg=""}catch(e){if(!S)errMsg=String(e.name)=="OperationError"?"The key in this link doesn't match. Open the full link you were sent.":"Couldn't load the bot's data yet. It will retry by itself."}
  render()}
-load();setInterval(load,60000);
+// ---- live market prices for open paper trades (display only: the bot, its stops and its books are not touched)
+const LQ={};let lqIv=10000,lqTimer=null,lqBusy=false,lqErr="",lqLast=0;
+const LQ_FRESH=45;
+function lpx(v){if(v==null)return"–";if(v>=1)return"$"+v.toFixed(4);return"$"+Number(v.toPrecision(4)).toString()}
+function lkey(p){return p.coin+"|"+p.entry_ts}
+function lmint(p){if(p.mint_full)return p.mint_full;const re=new RegExp("PAPER BUY \\[acct 1\\] "+p.coin.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")+" ([1-9A-HJ-NP-Za-km-z]{32,44}) ");for(const a of (S.activity||[])){const m=re.exec(a.text||"");if(m&&m[1].slice(0,4)==p.mint.slice(0,4))return m[1]}return null}
+function lval(p,P){if(!(P>0))return null;if(p.mtm){const m=p.mtm,v=Math.max(0,m.qa*P-m.sub),pnl=v+m.base;return{v,pnl,pc:pnl/p.size*100,exact:true}}
+ if(!(p.now_price>0))return null;const got=p.half?p.half.got:0,vb=Math.max(0,p.pnl+p.size-got),qa=vb/p.now_price,v=Math.max(0,vb+qa*(P-p.now_price)),pnl=p.pnl+(v-vb);return{v,pnl,pc:pnl/p.size*100,exact:false}}
+async function lqJup(mints){const r=await fetch("https://lite-api.jup.ag/price/v3?ids="+mints.join(","),{cache:"no-store"});if(!r.ok)throw new Error("Jupiter "+r.status);const d=await r.json(),o={};for(const m of mints){const q=d&&d[m];if(q&&+q.usdPrice>0)o[m]=+q.usdPrice}return o}
+async function lqDex(ps){const mints=[...new Set(ps.map(x=>x.m))];const r=await fetch("https://api.dexscreener.com/tokens/v1/solana/"+mints.join(",")+"?_="+Date.now(),{cache:"no-store"});if(!r.ok)throw new Error("DexScreener "+r.status);const d=await r.json(),o={};
+ for(const x of ps){const pr=(Array.isArray(d)?d:[]).filter(q=>q.baseToken&&q.baseToken.address==x.m);const q=pr.find(q=>q.pairAddress==x.p.pool)||pr.sort((a,b)=>((b.liquidity||{}).usd||0)-((a.liquidity||{}).usd||0))[0];if(q&&+q.priceUsd>0)o[x.m]=+q.priceUsd}return o}
+async function liveTick(){clearTimeout(lqTimer);
+ if(!document.hidden&&S&&!lqBusy){const ps=(S.positions||[]).map(p=>({p,m:lmint(p)})).filter(x=>x.m);
+  if(ps.length){lqBusy=true;const mints=[...new Set(ps.map(x=>x.m))],now=()=>Date.now()/1000;let n=0,errs=[];
+   try{const g=await lqJup(mints);for(const m in g){LQ[m]={prev:LQ[m]&&LQ[m].price,price:g[m],t:now(),src:"Jupiter"};n++}}catch(e){errs.push(String(e.message||e))}
+   const miss=ps.filter(x=>!(LQ[x.m]&&now()-LQ[x.m].t<5));if(miss.length){try{const g=await lqDex(miss);for(const m in g){LQ[m]={prev:LQ[m]&&LQ[m].price,price:g[m],t:now(),src:"DexScreener"};n++}}catch(e){errs.push(String(e.message||e))}}
+   if(n){lqErr="";lqIv=10000;lqLast=now()}else{lqErr="Price sources didn't answer"+(errs.some(e=>/429/.test(e))?" (rate limit)":"")+", retrying.";lqIv=Math.min(lqIv*2,60000)}
+   lqBusy=false}}
+ liveFill();lqTimer=setTimeout(liveTick,lqIv)}
+function liveFill(){if(!S)return;const now=Date.now()/1000;let all=true,eq=S.account?S.account.cash:null,any=false;
+ for(const p of (S.positions||[])){const k=lkey(p),m=lmint(p),q=m&&LQ[m],fresh=q&&now-q.t<LQ_FRESH,l=fresh?lval(p,q.price):null;
+  const box=document.querySelector(`[data-lv="${CSS.escape(k)}"]`),hd=document.querySelector(`[data-lvh="${CSS.escape(k)}"]`);
+  if(l){any=true;eq+=l.v}else all=false;
+  if(hd){if(l){const t=`${sgn(l.pnl)} (${pct(l.pc)})`;if(hd.textContent!=t){hd.textContent=t;hd.className=cls(l.pnl);if(q.prev&&q.prev!=q.price){hd.classList.add(q.price>q.prev?"fu":"fd")}}}else{const t=`${sgn(p.pnl)} (${pct(p.pnl_pct)})`;if(hd.textContent!=t){hd.textContent=t;hd.className=cls(p.pnl)}}}
+  if(!box)continue;let h="";
+  if(!m)h=`<div class="rd m">Live price: waiting for the bot's next data update (starts with its next run).</div>`;
+  else if(l){const mv=(q.price/p.entry_price-1)*100;h=`<div class="rd"><span class="dot on"></span><b>Live ${lpx(q.price)}</b> <span class="${cls(mv)}">${pct(mv)} vs entry</span> · <span class="m">${q.src}, checked ${ago(now-q.t)}</span></div><div class="rd m">If sold now ≈ ${usd(l.v)} after the bot's paper costs${l.exact?"":" (estimate)"}. The P&L at the top uses this live price. It's paper, and a real sale could get less.</div>${q.price<=p.stop?`<div class="rd y">Live price is at or under the stop. The bot sells on its own next price check, not from this page.</div>`:""}`}
+  else if(q)h=`<div class="rd y">Live price is old (${ago(now-q.t)}), showing the bot's last numbers.${lqErr?" "+esc(lqErr):""}</div>`;
+  else h=`<div class="rd m">${lqErr?esc(lqErr)+" Showing the bot's last numbers.":"Getting live price…"}</div>`;
+  if(box.innerHTML!=h)box.innerHTML=h}
+ const e=document.getElementById("lveq");if(e){const t=(any&&all&&S.positions.length)?`With live prices now: <b class="${cls(eq-S.account.start)}">${usd(eq)}</b> <span class="m">(updates every ~10 s)</span>`:"";if(e.innerHTML!=t)e.innerHTML=t}}
+const _render=render;render=function(){_render();liveFill()};
+document.addEventListener("visibilitychange",()=>{if(!document.hidden)liveTick()});
+load().then(liveTick);setInterval(load,60000);setInterval(liveFill,1000);
 </script></body></html>

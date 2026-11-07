@@ -83,6 +83,25 @@ def sell_proceeds(qty, px):
     return max(0.0, qty * px * (1 - C.SLIPPAGE) * (1 - C.BOT_FEE - C.POOL_FEE) - C.NETWORK_FEE_USD)
 
 
+def mtm_terms(p):
+    """Terms the page needs to re-price an open paper position at a fresh market price, with the same costs as the bot:
+    value = max(0, qa * price - sub), P&L = value + base. Display only; the bot's own books are not touched."""
+    try:
+        keys = p.keys()
+        qty = p["qty"] or 0
+        if "fill_model" in keys and p["fill_model"] == "live":
+            qa = qty * (p["r_sell_est"] or 0) * (1 - C.BOT_FEE)
+            sub = p["fee_in"] or 0
+            entry_fee = p["fee_in"] or 0
+        else:
+            qa = qty * (1 - C.SLIPPAGE) * (1 - C.BOT_FEE - C.POOL_FEE)
+            sub = C.NETWORK_FEE_USD
+            entry_fee = C.NETWORK_FEE_USD
+        return {"qa": qa, "sub": sub, "base": (p["part_proceeds"] or 0) - p["size_usd"] - entry_fee}
+    except Exception:
+        return None
+
+
 def short(a):
     return (a[:4] + "…" + a[-4:]) if a and len(a) > 10 else (a or "")
 
@@ -260,6 +279,9 @@ def build_state():
                 "peak_pct": (p["peak"] / p["entry_price"] - 1) * 100 if p["entry_price"] else None,
                 "wallet": names.get(p["leader"]) or short(p["leader"]), "entry_ts": p["entry_ts"],
                 "price_age": now - (p["last_update"] or p["entry_ts"]),
+                # for the page's live market prices (display only): full mint, the bot's pool, cost terms
+                "mint_full": p["mint"], "pool": p["pool"], "mtm": mtm_terms(p),
+                "last_candle_ts": p["last_candle_ts"],
             })
         equity = cash + open_val
         curve = [(t0, C.START_EQUITY)] + [(r["ts"], r["equity"]) for r in q(f"SELECT ts,equity FROM {eq_table} WHERE ts>=? ORDER BY ts", (t0 or 0,))]
