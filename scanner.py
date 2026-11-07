@@ -255,6 +255,17 @@ def follow_set(con, t):
            if r[0] not in C.REMOVED_WALLETS]
     try:
         board = walletcard.kolscan_boards()
+        # vetted wallets from other boards (vetted_wallets.json, Rage Nov 7): scored as if on Kolscan's 30-day board
+        try:
+            vf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vetted_wallets.json")
+            for v in json.load(open(vf)).get("follow", []):
+                a = v["address"]
+                fresh = time.mktime(time.strptime(v["checked"], "%Y-%m-%d")) > t - 14 * 86400
+                if fresh and a not in board and a not in C.REMOVED_WALLETS:
+                    board[a] = {int(k): dict(r) for k, r in v["record"].items()}
+                    board[a]["name"] = v.get("name", "")[:40]
+        except Exception as e:
+            log.warning("vetted_wallets.json not used (%s)", e)
         # new candidates from the 7- and 30-day boards: profitable on both
         # also: on the 30-day board only, profitable, with a 50%+ win rate over 20+ trades (Rage, Nov 7)
         for a, b in board.items():
