@@ -1,4 +1,4 @@
-# Paper scanner
+# Rage Meme Bot
 
 A **paper-mode** Solana memecoin copy-trade scanner. It watches public smart wallets from the Kolscan leaderboard, runs safety filters on the coins they buy, and simulates trades on a $200 paper account.
 

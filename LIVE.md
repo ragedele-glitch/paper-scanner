@@ -57,7 +57,7 @@ The code also always leaves 0.02 SOL in the wallet for fees.
 - **Fast:** open `live_control.json` in this repository (the GitHub app can edit it) and change `false` to `true`.
   Within about a minute the bot stops opening trades and sells every coin in the wallet back to SOL.
   If the bot can't read that file for 10 minutes, it stops opening trades by itself.
-- **Hard stop:** Actions > Paper scanner > cancel the running run, then the ... menu > Disable workflow.
+- **Hard stop:** Actions > Rage Meme Bot > cancel the running run, then the ... menu > Disable workflow.
   That stops everything at once but doesn't sell. Sell anything left from your wallet app.
 
 ## Turning it on later

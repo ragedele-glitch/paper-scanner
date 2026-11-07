@@ -1,4 +1,4 @@
-name: Paper scanner
+name: Rage Meme Bot
 
 # PAPER MODE. No wallet, no keys, nothing is signed or sent on-chain.
 # Live mode (live.py) is switched OFF: it only wakes up if the repository variable LIVE_MODE is set to
