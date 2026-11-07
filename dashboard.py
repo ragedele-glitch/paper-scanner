@@ -487,6 +487,11 @@ def build_state():
     except Exception as e:
         creator_test = {"error": f"{type(e).__name__}: {e}"}
     try:
+        import poolband
+        pool_band = poolband.view(con2())
+    except Exception as e:
+        pool_band = {"error": f"{type(e).__name__}: {e}"}
+    try:
         import wallet_stats
         wallet_board = wallet_stats.boards(con2(), real_start, start_ts)
     except Exception as e:
@@ -502,6 +507,7 @@ def build_state():
                    "lag": lag},
         "account": account, "account_5s": account_5s, "rug_filter": rug, "wallet_card": card,
         "creator_test": creator_test,
+        "pool_band": pool_band,
         "exits": exits,
         "entry_compare": {"n": len(entry_gap), "median_gap_pct": entry_gap[len(entry_gap) // 2] if entry_gap else None,
                           "real_shadow": {"n": len(sh_real), "pnl": sum(r[0] for r in sh_real)}},

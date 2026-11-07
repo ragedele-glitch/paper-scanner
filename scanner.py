@@ -182,6 +182,11 @@ MIGRATIONS = [
     "hf_top10 REAL", "hf_top1 REAL",   # top-10 / top-1 holders' % of supply, leaving out the curve and the copied wallet
     "hf_block INT",                    # 1 = the holder-filter test account skipped it; 0 = took it; NULL = not checked
     "hf_info TEXT",                    # holder check details (JSON) or why it failed
+    "pb_liq REAL",                     # pool-band shadow test (Nov 7 evening, logged only): pool $ the rule saw
+    "pb_src TEXT",                     # where that pool figure came from: 'dexscreener' or 'rugcheck'
+    "pb_curve INT",                    # 1 = coin still on the pump.fun curve when seen (RugCheck pool can be off)
+    "pb_band INT",                     # 1 = the $30-46k band version would have skipped it
+    "pb_u46 INT",                      # 1 = the pool-under-$46k version would have skipped it
     "chain_info TEXT")]                # creator and early-buyer numbers (JSON), filled in a few seconds later
 
 
@@ -636,6 +641,10 @@ def handle_candidate(con, c, pairs):
     a = analyse_rug(r, tp["pairAddress"]) if r else None
     liq = liq_dex if liq_dex else (a["liq"] if a else None)
     sig["liq_usd"] = liq
+    pb = pool_band(liq, "dexscreener" if liq_dex else ("rugcheck" if liq else None), tp.get("dexId") == "pumpfun")
+    sig.update(pb)
+    if pb["pb_band"] or pb["pb_u46"]:
+        note.append("pool-band test (logged only, nothing skipped): " + pool_band_text(pb))
     rest = []
     if liq is None or liq < C.LIQ_MIN_USD:
         rest.append("liquidity_under_25k")
@@ -738,6 +747,22 @@ def handle_candidate(con, c, pairs):
         open_position(con, sid, C.ACCT_5S_SHADOW, mint, sym, pool, wallet, entry_5s, px_5, src_5, 20.0)
         if open_main(con, sid, C.ACCT_5S, mint, sym, pool, wallet, entry_5s, px_5, src_5, c["name"], "5 s test: "):
             live_hook(live.on_paper_buy, con, sid, mint, sym, buy_ts)
+
+
+def pool_band(liq, src, is_curve):
+    """Pool-band shadow test (Nov 7 evening). Logged only: never blocks, skips or sells anything."""
+    if liq is None:
+        return dict(pb_liq=None, pb_src=None, pb_curve=1 if is_curve else 0, pb_band=None, pb_u46=None)
+    return dict(pb_liq=liq, pb_src=src, pb_curve=1 if is_curve else 0,
+                pb_band=1 if C.PB_BAND_LO <= liq < C.PB_BAND_HI else 0,
+                pb_u46=1 if liq < C.PB_UNDER_MAX else 0)
+
+
+def pool_band_text(pb):
+    v = [x for x, on in (("$30-46k band", pb["pb_band"]), ("under $46k", pb["pb_u46"])) if on]
+    src = {"dexscreener": "DexScreener", "rugcheck": "RugCheck"}.get(pb["pb_src"], "unknown")
+    return (f"pool ${pb['pb_liq']/1000:.0f}k from {src}" + (" (pump.fun curve)" if pb["pb_curve"] else "")
+            + ", would skip: " + ", ".join(v))
 
 
 def holder_check(mint, pool, wallet, is_curve):
@@ -1705,6 +1730,8 @@ def main():
         meta_set(con, "board_ts", 0); meta_set(con, "card_v", 2); con.commit()
     if meta_get(con, "hf_start_ts") is None:   # rug-filter shadow test account: judged on new trades only
         meta_set(con, "hf_start_ts", now()); meta_set(con, "cash_hf", C.START_EQUITY); con.commit()
+    if meta_get(con, "pb_start_ts") is None:   # pool-band shadow test (logged only): judged on new trades only
+        meta_set(con, "pb_start_ts", now()); con.commit()
     paper_reset(con)
     try:
         manual_close(con)

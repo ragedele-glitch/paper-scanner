@@ -94,6 +94,16 @@ MANUAL_CLOSE = {"id": "2026-11-07-rage-close-losers", "requested_ts": 1794047160
                           "CFYhdWXsYfS7swnJgHRwb5toTHMEQD7Ljd5gGwKLpump": "KILROY"}}
 HF_TOP10_MAX = 22.0
 HF_RT_MAX = 20.0
+# Pool-band shadow test (Rage, Nov 7 evening). LOGGED ONLY: it never skips, blocks or sells anything. For every new
+# coin the bot records whether each version below would have skipped it, and which source the pool figure came from
+# (DexScreener, or RugCheck when DexScreener had none, which is common for coins still on the pump.fun curve and can
+# be wrong: Lealana was logged at $223k). From the 28-big-losers study (main account, ~79 closed trades):
+#  band:  pool from $30k up to $46k -> 16 of 28 big losers, no main-account winners (edges picked around winners;
+#         on the 5 s accounts it still hit DEGEN, [bracat] and FUN). A hypothesis, judged on new trades only.
+#  under: pool under $46k -> 20 of 28 big losers, but also 7 winners worth $18.59 (PIRATE, one VERIFIED)
+PB_BAND_LO, PB_BAND_HI = 30_000.0, 46_000.0
+PB_UNDER_MAX = 46_000.0
+PB_JUDGE_N = 30             # closed new trades on the main account before the test is worth judging
 SLIPPAGE = 0.03             # 3% worse price on every buy and every sell
 BOT_FEE = 0.01              # 1% copy-bot fee per side (typical Telegram copy bots)
 POOL_FEE = 0.01             # ~1% DEX / pump.fun fee per side
