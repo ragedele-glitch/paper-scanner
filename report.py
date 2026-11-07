@@ -125,6 +125,11 @@ def make_report(con, host="GitHub Actions (public repo ragedele-glitch/paper-sca
     except Exception as e:
         L.append(f"Ideal vs live-like failed: {type(e).__name__}")
     try:
+        import creators
+        L.extend(creators.report_lines(con))
+    except Exception as e:
+        L.append(f"Creator check summary failed: {type(e).__name__}")
+    try:
         import wallet_stats
         L.extend(wallet_stats.report_lines(con, real_start, start))
     except Exception as e:
