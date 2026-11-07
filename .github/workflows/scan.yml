@@ -43,6 +43,10 @@ jobs:
       LIVE_KILL: ${{ vars.LIVE_KILL }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # A queued run waits up to 4 h behind the running one; always start on the newest code, not the commit
+          # that was current when it was queued (Nov 7: a run queued at 10:31 UTC would have missed later fixes).
+          ref: main
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
