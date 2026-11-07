@@ -161,7 +161,8 @@ def history(creator, exclude_curve=None):
     curves.pop(exclude_curve, None)
     order = sorted(curves, key=lambda c: not curves[c]["complete"])      # graduated first
     coins = []
-    for c in order[:MAX_RESOLVE]:
+    cap = 5 if len(curves) >= 100 else MAX_RESOLVE      # launch-service wallets: sample only, keep the queue quick
+    for c in order[:cap]:
         m = mint_of_curve(c)
         coins.append({"curve": c, "mint": m, "grad": curves[c]["complete"], "sold_pct": curves[c]["sold_pct"]})
     dex, sol = dex_state([x["mint"] for x in coins if x["mint"]])
