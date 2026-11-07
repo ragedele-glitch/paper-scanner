@@ -116,6 +116,12 @@ CMP_MIN_TRADES = 20
 CMP_MIN_DIFFER = 5
 MIRROR_SELL_FRAC = 0.50     # exit if the smart wallet sells 50%+ of its bag
 TIME_STOP_S = 24 * 3600     # close anything still open after 24 hours
+# Stale-candle guard (Nov 7): GeckoTerminal has no candles for some pools (e.g. a PumpSwap pool paired with another
+# memecoin, like SMOOVE/NIO), so the bot's price froze at entry and the stop was never checked. When the newest candle
+# is older than this, the bot checks stops, the 2x half-sell and the trail on a live market price instead
+# (Jupiter first, DexScreener's biggest pool as backup). Price source only: stop levels and rules are unchanged.
+QUOTE_STALE_S = 180
+QUOTE_MAX_AGE_S = 60        # a live price older than this is not used
 
 EXCLUDE_MINTS = {
     "So11111111111111111111111111111111111111112",  # wSOL

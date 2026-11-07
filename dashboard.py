@@ -278,7 +278,9 @@ def build_state():
                 "half": ({"px": p["part_px"], "x": p["part_px"] / p["entry_price"], "got": p["part_proceeds"]} if p["part_ts"] else None),
                 "peak_pct": (p["peak"] / p["entry_price"] - 1) * 100 if p["entry_price"] else None,
                 "wallet": names.get(p["leader"]) or short(p["leader"]), "entry_ts": p["entry_ts"],
-                "price_age": now - (p["last_update"] or p["entry_ts"]),
+                # real age of the price the bot is using (candle end or live-quote time), not of its last check-in
+                "price_age": now - ((p["price_ts"] if "price_ts" in p.keys() else None) or ((p["last_candle_ts"] or p["entry_ts"]) + 60)),
+                "price_src": (p["price_src"] if "price_src" in p.keys() else None) or "candle",
                 # for the page's live market prices (display only): full mint, the bot's pool, cost terms
                 "mint_full": p["mint"], "pool": p["pool"], "mtm": mtm_terms(p),
                 "last_candle_ts": p["last_candle_ts"],

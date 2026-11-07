@@ -172,7 +172,9 @@ MIGRATIONS = [
     "be_px REAL",          # price where the trade breaks even after all costs
     "exit_trigger_px REAL", "exit_fill_src TEXT",   # stop level vs the price a live sell would really have got
     "part_ts REAL", "part_px REAL", "part_qty REAL", "part_proceeds REAL", "part_r REAL", "part_fee REAL",
-    "alts TEXT", "alts_open INT")   # the same trade under the other exit rules, for comparison
+    "alts TEXT", "alts_open INT",   # the same trade under the other exit rules, for comparison
+    "price_src TEXT",     # where the bot's last price came from: 'candle', 'jupiter' or 'dexscreener' (live quote)
+    "price_ts REAL")      # when that price was true (candle end or quote time), so the page can show its real age
 ] + [f"ALTER TABLE signals ADD COLUMN {c}" for c in (
     "holders INT", "transfer_fee_pct REAL", "lp_locked_pct REAL", "token_program TEXT",
     "rt_pct REAL", "fill_note TEXT",
@@ -1107,6 +1109,46 @@ def close_live(con, p, px):
     return proceeds, pnl
 
 
+QUOTES = {}   # mint -> (fetched_ts, usd_price, source), shared by every account holding the coin
+
+
+def live_quotes(mints):
+    """Current USD market price per mint, for coins whose candles have gone stale. Jupiter first (one batched call),
+    DexScreener's biggest pool as backup. Cached 20 s. A coin with no answer is simply left out (never made up)."""
+    t = now(); out = {}; need = []
+    for m in set(mints):
+        e = QUOTES.get(m)
+        if e and t - e[0] < 20:
+            out[m] = e
+        else:
+            need.append(m)
+    for i in range(0, len(need), 50):
+        chunk = need[i:i + 50]
+        try:
+            d = fills._jup("/price/v3?ids=" + ",".join(chunk)) or {}
+            for m in chunk:
+                v = (d.get(m) or {}).get("usdPrice")
+                if v and float(v) > 0:
+                    QUOTES[m] = out[m] = (now(), float(v), "jupiter")
+        except Exception as ex:
+            log.warning("jupiter price error %s", ex)
+    rest = [m for m in need if m not in out]
+    if rest:
+        for m, ps in dex_pairs(rest).items():
+            tp = top_pair(ps)
+            try:
+                v = float(tp["priceUsd"]) if tp and tp.get("priceUsd") else 0
+            except (TypeError, ValueError):
+                v = 0
+            if v > 0:
+                QUOTES[m] = out[m] = (now(), v, "dexscreener")
+    return out
+
+
+def candles_stale(last_candle_ts, entry_ts, t_now):
+    return t_now - ((last_candle_ts or entry_ts) + 60) > C.QUOTE_STALE_S
+
+
 def candle_since(p):
     return int(p["last_candle_ts"]) + 60 if p["last_update"] else int(p["entry_ts"] // 60 * 60) + 60
 
@@ -1125,7 +1167,10 @@ def update_position(con, p, pool_now=None):
     p = dict(p)
     pool = pool_now or p["pool"]
     t_now = now()
-    cs = candles_cached(pool, p["mint"], candle_since(p))
+    try:
+        cs = candles_cached(pool, p["mint"], candle_since(p))
+    except Exception as ex:   # no candles this time: the stale-candle guard below still checks the live price
+        log.warning("candles error %s %s", p["symbol"], ex); cs = []
     cs = [c for c in cs if c[0] + 60 <= t_now - 20]   # completed candles only
     stop, peak, entry = p["stop"], p["peak"], p["entry_price"]
     slog = json.loads(p["stop_log"] or "[]")
@@ -1166,14 +1211,51 @@ def update_position(con, p, pool_now=None):
                 lab = "breakeven" if v3 and p["be_px"] and abs(ns - p["be_px"]) < 1e-9 * ns else f"peak +{(peak/entry-1)*100:.0f}%"
                 slog.append([t, ns, lab]); stop = ns
         last_ts, last_px = t, c
-    # no candle (no trades) for a long time -> time stop at last known price
-    if t_now >= p["entry_ts"] + C.TIME_STOP_S and (not cs or cs[-1][0] < p["entry_ts"] + C.TIME_STOP_S):
+    price_src, price_ts = "candle", ((last_ts or p["entry_ts"]) + 60)
+    # Stale-candle guard: no new candle for a while (GeckoTerminal may not chart this pool at all), so check the
+    # stop, the 2x half-sell, the trail and the wallet's sell on the live market price instead of a frozen one.
+    q = None
+    if candles_stale(last_ts, p["entry_ts"], t_now):
+        e = live_quotes([p["mint"]]).get(p["mint"])
+        if e and t_now - e[0] <= C.QUOTE_MAX_AGE_S:
+            q = e
+    if q:
+        qt, qpx, qsrc = q
+        kw = dict(stop=stop, peak=peak, slog=slog)
+        tag = f" (live {qsrc} price, no candles)"
+        if t_now >= p["entry_ts"] + C.TIME_STOP_S:
+            if mirror_ts and mirror_ts < p["entry_ts"] + C.TIME_STOP_S:
+                close_position(con, p, qt, qpx, "smart wallet sold" + tag, **kw)
+            else:
+                close_position(con, p, qt, qpx, "24h time stop" + tag, **kw)
+            con.execute("UPDATE positions SET price_src=?, price_ts=? WHERE id=?", (qsrc, qt, p["id"])); return
+        if mirror_ts and qt >= mirror_ts:
+            close_position(con, p, qt, qpx, "smart wallet sold" + tag, **kw)
+            con.execute("UPDATE positions SET price_src=?, price_ts=? WHERE id=?", (qsrc, qt, p["id"])); return
+        if qpx <= stop:
+            if v3:
+                con.execute("UPDATE positions SET exit_trigger_px=?, exit_fill_src=? WHERE id=?", (stop, "live quote " + qsrc, p["id"]))
+            close_position(con, p, qt, qpx, stop_reason(p, stop, False) + tag, **kw)
+            con.execute("UPDATE positions SET price_src=?, price_ts=? WHERE id=?", (qsrc, qt, p["id"])); return
+        if v3 and not p.get("part_ts") and qpx >= entry * C.HALF_AT:
+            take_half(con, p, qt, qpx, stop, slog, t_now); p["part_ts"] = qt
+        if qpx > peak:
+            peak = qpx
+            ns = stop_for(REAL_SPEC, entry, peak, stop, p["be_px"]) if v3 else new_stop(entry, peak, stop)
+            if ns > stop:
+                lab = "breakeven" if v3 and p["be_px"] and abs(ns - p["be_px"]) < 1e-9 * ns else f"peak +{(peak/entry-1)*100:.0f}% (live price)"
+                slog.append([qt, ns, lab]); stop = ns
+        last_px, price_src, price_ts = qpx, qsrc, qt
+    # no candle (no trades) for a long time and no live price either -> time stop at last known price
+    elif t_now >= p["entry_ts"] + C.TIME_STOP_S and (not cs or cs[-1][0] < p["entry_ts"] + C.TIME_STOP_S):
         kw = dict(stop=stop, peak=peak, slog=slog)
         if mirror_ts and mirror_ts < p["entry_ts"] + C.TIME_STOP_S:
             close_position(con, p, mirror_ts, last_px, "smart wallet sold", **kw); return
-        close_position(con, p, p["entry_ts"] + C.TIME_STOP_S, last_px, "24h time stop", **kw); return
-    con.execute("UPDATE positions SET stop=?,peak=?,last_candle_ts=?,last_price=?,last_update=?,stop_log=?,pool=? WHERE id=?",
-                (stop, peak, last_ts, last_px, t_now, json.dumps(slog[-30:]), pool, p["id"]))
+        close_position(con, p, p["entry_ts"] + C.TIME_STOP_S, last_px, "24h time stop (no price data)", **kw); return
+    # last_candle_ts stays the newest real candle, so candles that turn up later are still read
+    con.execute("""UPDATE positions SET stop=?,peak=?,last_candle_ts=?,last_price=?,last_update=?,stop_log=?,pool=?,
+                   price_src=?,price_ts=? WHERE id=?""",
+                (stop, peak, last_ts, last_px, t_now, json.dumps(slog[-30:]), pool, price_src, price_ts, p["id"]))
 
 
 def guard_all(con):
@@ -1202,6 +1284,13 @@ def guard_all(con):
         if p["account"] in (C.ACCT_5S, C.ACCT_REAL, C.ACCT_HF) and age < 55:
             continue
         due.append(p)
+    # live prices in one batched call for every due coin whose candles have gone stale (stale-candle guard)
+    st = [p["mint"] for p in due if candles_stale(p["last_candle_ts"], p["entry_ts"], now() + 60)]
+    if st:
+        try:
+            live_quotes(st)
+        except Exception as ex:
+            log.warning("live quotes error %s", ex)
     # one candle fetch per coin, from the earliest point any due position on it needs
     first = {}
     for p in due:
@@ -1215,8 +1304,8 @@ def guard_all(con):
                 break
             try:
                 candles_cached(k[0], k[1], first[k])
-            except Exception as ex:
-                log.warning("guard candles error %s %s", p["symbol"], ex); continue
+            except Exception as ex:   # carry on: update_position falls back to the live price
+                log.warning("guard candles error %s %s", p["symbol"], ex)
         try:
             update_position(con, p, pools.get(p["mint"]))
             con.commit()
