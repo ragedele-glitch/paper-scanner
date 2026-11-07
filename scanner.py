@@ -26,6 +26,7 @@ import holders
 import walletcard
 import live   # live mode: switched off unless LIVE_MODE is set; with it off every hook returns at once
 import stream as streammod
+import wscore   # wallet-score shadow test (Nov 7 evening): logged only, never blocks
 
 STREAM = None          # the live wallet feed (stream.WalletStream), started in main()
 SEEN_SIGS = deque(maxlen=20000); SEEN_SIG_SET = set()
@@ -192,7 +193,7 @@ MIGRATIONS = [
 
 def migrate(con):
     con.executescript(SCHEMA)
-    for m in MIGRATIONS:
+    for m in MIGRATIONS + wscore.MIGRATIONS:
         try:
             con.execute(m)
         except sqlite3.OperationalError:
@@ -1732,6 +1733,10 @@ def main():
         meta_set(con, "hf_start_ts", now()); meta_set(con, "cash_hf", C.START_EQUITY); con.commit()
     if meta_get(con, "pb_start_ts") is None:   # pool-band shadow test (logged only): judged on new trades only
         meta_set(con, "pb_start_ts", now()); con.commit()
+    try:   # wallet-score shadow test (logged only, never blocks): GMGN read in a background thread, new trades only
+        wscore.start(con)
+    except Exception as e:
+        log.warning("wallet-score shadow test could not start %s", e)
     paper_reset(con)
     try:
         manual_close(con)
@@ -1767,6 +1772,10 @@ def main():
             cands, polled = _t("poll", poll_wallets, con)
             _t("filters", process_new_buys, con, cands)
             drain_chain_info(con)
+            try:   # wallet-score shadow test: scores logged signals from the GMGN cache (no network here, never blocks)
+                _t("wscore", wscore.tick, con)
+            except Exception as e:
+                log.warning("wallet-score shadow test error %s", e); con.rollback()
             _t("feed2", drain_stream, con)
             _t("guard", guard_all, con)
             _t("alt exits", alt_all, con)

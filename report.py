@@ -136,6 +136,11 @@ def make_report(con, host="GitHub Actions (public repo ragedele-glitch/paper-sca
     except Exception as e:
         L.append(f"Pool-band test summary failed: {type(e).__name__}")
     try:
+        import wscore
+        L.extend(wscore.report_lines(con))
+    except Exception as e:
+        L.append(f"Wallet score test summary failed: {type(e).__name__}")
+    try:
         import wallet_stats
         L.extend(wallet_stats.report_lines(con, real_start, start))
     except Exception as e:
