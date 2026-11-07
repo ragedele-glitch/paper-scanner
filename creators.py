@@ -200,22 +200,40 @@ def judge(hist, as_of, sol=None):
 _MEM = {}
 
 
-def creator_info(mint, det_ts=None):
-    """Creator record for a new signal. Best effort; never raises; never touches the database."""
+RANK = {"rugged_before": 4, "clean": 3, "no_grads": 2, "first_coin": 1, "unknown": 0}
+
+
+def _hist(creator, curve):
+    hit = _MEM.get(creator)
+    if hit and time.time() - hit["fetched"] < CACHE_S:
+        return hit, True
+    h = history(creator, exclude_curve=curve)
+    _MEM[creator] = h
+    return h, False
+
+
+def creator_info(mint, det_ts=None, deployer=None):
+    """Creator record for a new signal. Best effort; never raises; never touches the database.
+    deployer: the wallet that paid for the coin's first transaction, when the bot already found it. pump.fun's
+    curve 'creator' (who gets creator fees) is usually the same wallet; when it isn't, both are checked and the
+    worse record wins (rugged before > clean > no graduations > first coin)."""
     det_ts = det_ts or time.time()
     t0 = time.time()
     try:
         cv, curve = creator_of(mint)
         if not cv:
             return {"flag": "unknown", "why": "not a pump.fun coin (no bonding curve)"}
-        creator = cv["creator"]
-        hit = _MEM.get(creator)
-        if hit and time.time() - hit["fetched"] < CACHE_S:
-            hist = hit; cached = True
-        else:
-            hist = history(creator, exclude_curve=curve)
-            _MEM[creator] = hist; cached = False
+        hist, cached = _hist(cv["creator"], curve)
         out = judge(hist, det_ts)
+        if deployer and deployer != cv["creator"]:
+            try:
+                d = judge(_hist(deployer, curve)[0], det_ts)
+                out["deployer"] = {k: d[k] for k in ("creator", "flag", "n_prev", "n_grad", "n_rug", "n_all_coins")}
+                if RANK[d["flag"]] > RANK[out["flag"]]:
+                    out["flag"] = d["flag"]; out["flag_from"] = "deployer"
+            except Exception as e:
+                out["deployer"] = {"creator": deployer, "error": str(e)[:120]}
+        out["launcher"] = out["n_all_coins"] >= 100        # launch-service wallet, not one dev's track record
         out.update(src="pump.fun curve", cached=cached, secs=round(time.time() - t0, 1))
         return out
     except Exception as e:

@@ -240,7 +240,7 @@ def chain_and_holder_info(mint, curve, leader, det_ts, is_curve, pool=None):
         out["hx"] = {"error": str(e)[:200]}
     try:   # creator (dev) track record, logged only (Rage, Nov 7 shadow test); never blocks or sells
         import creators
-        out["cr"] = creators.creator_info(mint, det_ts)
+        out["cr"] = creators.creator_info(mint, det_ts, deployer=out.get("creator"))
     except Exception as e:
         out["cr"] = {"flag": "unknown", "why": str(e)[:200]}
     return out
