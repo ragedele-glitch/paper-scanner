@@ -256,11 +256,14 @@ def follow_set(con, t):
     try:
         board = walletcard.kolscan_boards()
         # new candidates from the 7- and 30-day boards: profitable on both
+        # also: on the 30-day board only, profitable, with a 50%+ win rate over 20+ trades (Rage, Nov 7)
         for a, b in board.items():
-            if b.get(7, {}).get("sol", 0) > 0 and b.get(30, {}).get("sol", 0) > 0:
+            m = b.get(30, {})
+            strong30 = m.get("sol", 0) > 0 and m.get("w", 0) + m.get("l", 0) >= 20 and m["w"] / (m["w"] + m["l"]) >= 0.5
+            if (b.get(7, {}).get("sol", 0) > 0 and m.get("sol", 0) > 0) or (7 not in b and strong30):
                 con.execute("""INSERT INTO wallets(address,name,first_seen,last_seen,last_rank,pnl_sol,poll_s,last_poll)
                     VALUES(?,?,?,?,99,?,60,0) ON CONFLICT(address) DO UPDATE SET last_seen=MAX(last_seen, excluded.last_seen),
-                    pnl_sol=COALESCE(pnl_sol, excluded.pnl_sol)""", (a, b.get("name", ""), t, t, b[7]["sol"]))
+                    pnl_sol=COALESCE(pnl_sol, excluded.pnl_sol)""", (a, b.get("name", ""), t, t, b.get(7, m)["sol"]))
         cards = walletcard.score_all(con, board, t)
         seen = {r[0]: r[1] for r in con.execute("SELECT address,last_seen FROM wallets")}
         pos = {r[0]: r[1] for r in con.execute("SELECT address,COALESCE(pnl_sol,0) FROM wallets")}
@@ -1523,8 +1526,8 @@ def main():
         meta_set(con, "start_ts", now()); meta_set(con, "cash", C.START_EQUITY); con.commit()
     if meta_get(con, "real_start_ts") is None:   # realistic-entry accounts start fresh the first time this code runs
         meta_set(con, "real_start_ts", now()); meta_set(con, "cash_real", C.START_EQUITY); con.commit()
-    if meta_get(con, "card_v") != 1:   # first start with the wallet scorecard: rebuild the follow list now
-        meta_set(con, "board_ts", 0); meta_set(con, "card_v", 1); con.commit()
+    if meta_get(con, "card_v") != 2:   # first start with the scorecard / strict 50% win-rate rules (Nov 7): rebuild now
+        meta_set(con, "board_ts", 0); meta_set(con, "card_v", 2); con.commit()
     if meta_get(con, "hf_start_ts") is None:   # rug-filter shadow test account: judged on new trades only
         meta_set(con, "hf_start_ts", now()); meta_set(con, "cash_hf", C.START_EQUITY); con.commit()
     paper_reset(con)

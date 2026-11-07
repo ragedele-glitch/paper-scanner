@@ -18,6 +18,19 @@ Each item: 1 pass, 0.5 borderline, 0 fail, None not enough data yet.
             winners Limfork 30 and Schoen 37), while the wallets that kept losing buy 60-105 a day.
             40 or fewer buys a day passes, 60 or fewer half.
 
+Strict rules (Rage, Nov 7 2026: "remove and replace all smart wallets whose win is not up to 50%", "heavy on the
+wallet performance, that's our best shot of filtering rugs out"). Checked before anything else except pinned and
+removed; a wallet that fails one is benched (watchlist, re-scored every refresh, followed again once it passes):
+  - win rate must be measured (10+ trades on Kolscan: 30-day, else 7-day, else daily) and 50% or more
+  - Kolscan profit positive on every board it shows on
+  - rug-heavy: more than 65% of 5+ checked coins down 25%+ an hour after its buy -> benched (on the bot's copies
+    these wallets lost $21.92 over 18 trades, the under-50% ones made $104.55 over 16)
+  - more than 40 buys a day, median buy over $2,000, or losing on 3+ of the bot's copies -> benched
+  - win rate only from a one-day board and fewer than 5 of its coins seen by the scanner -> benched
+  - a wallet not yet scored on the scanner's data ('new') needs a 7- or 30-day record of 20+ trades and a median
+    buy of $500 or less (or none seen yet)
+  The rug-heavy and busy limits are waived for a wallet that made the bot money on its copies (proven).
+
 Status (what the scanner does with it):
   pinned   Rage's proven wallets (Stigman, Fox): always followed, even off the leaderboard
   removed  kept losing on the bot's copies (removed_wallets.json): never followed again until taken out of that file
@@ -36,6 +49,8 @@ from collections import defaultdict
 import config as C
 
 PASS = 4.0
+MIN_WINRATE = 50.0   # Rage, Nov 7 2026
+RUG_HEAVY = 65.0
 
 
 def kolscan_boards():
@@ -129,14 +144,52 @@ def proven(r):
     return (f["copies"] + f["copies_5s"]) > 0 and f["copy_net"] + f["copy_net_5s"] > 0
 
 
+def strict_fail(r):
+    """Rage's strict rules (Nov 7 2026). The reason a wallet is benched, or None if it passes."""
+    f, sc = r["facts"], r["score"]
+    wr = f.get("winrate")
+    if wr is None:
+        return "win rate not proven (under 10 trades on record)"
+    if wr < MIN_WINRATE:
+        return f"win rate {wr}% is under 50%"
+    if sc.get("pnl") is not None and sc["pnl"] < 1:
+        return "Kolscan profit not positive on every board"
+    n = f["copies"] + f["copies_5s"]
+    if n >= 3 and f["copy_net"] + f["copy_net_5s"] < 0:
+        return "losing on the bot's copies"
+    if sc.get("size") == 0:
+        return "buys too big (median over $2,000)"
+    if proven(r):
+        return None
+    if f.get("winrate_tf") == 1 and (f.get("coins_checked") or 0) < 5:
+        return "only a one-day Kolscan record, and too few of its coins seen to check for rugs"
+    if f.get("down25_pct") is not None and (f.get("coins_checked") or 0) >= 5 and f["down25_pct"] > RUG_HEAVY:
+        return f"rug-heavy ({f['down25_pct']}% of its coins down 25%+ an hour after it bought)"
+    if sc.get("calm") is not None and (f.get("buys_per_day") or 0) > 40:
+        return f"too busy ({f['buys_per_day']} buys a day)"
+    return None
+
+
 def status(a, r):
     if a in C.PINNED_WALLETS:
         return "pinned"
     if a in C.REMOVED_WALLETS:
         return "removed"
     f = r["facts"]
+    why = strict_fail(r)
+    f["bench_why"] = why
+    if why:
+        return "bench"
     if proven(r):
         return "keep"
     if r["items"] < 4:
+        # not scored on the scanner's own data yet: only a strong 7- or 30-day record (20+ trades, 50%+) and buys
+        # near the bot's size (or not yet seen) earn a trial (Rage, Nov 7 2026)
+        kb = f.get("kolscan", {})
+        rec = kb.get(f.get("winrate_tf")) or kb.get(str(f.get("winrate_tf"))) or {}
+        strong = f.get("winrate_tf") in (7, 30) and rec.get("w", 0) + rec.get("l", 0) >= 20
+        if not strong or r["score"].get("size") not in (None, 1):
+            f["bench_why"] = "record too short or buys too big for a trial"
+            return "bench"
         return "new" if r["score"].get("pnl") == 1 else "bench"
     return "keep" if r["total"] >= PASS else "bench"
