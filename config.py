@@ -49,7 +49,14 @@ MIN_LEADER_BUY_USD = 20     # ignore dust/airdrops worth under $20
 # --- Filter (rules from the post) ---
 DEV_MAX_PCT = 5.0
 LIQ_MIN_USD = 25_000
-TOP10_MAX_PCT = 35.0
+TOP10_MAX_PCT = 35.0        # old 5-second comparison accounts keep this, so they stay comparable to their history
+# Main account block (Rage, Nov 7, 2026): skip the coin when RugCheck's top-10 real holders (pools, LP, lockers,
+# bonding curve and the burn address left out) own MORE than this. Backtest on every closed trade: the highest
+# winner was FAUCET at 32.39% (speculative 30.68% on the $200 account), so 32.5% blocks no winner on record.
+# Any lower cutoff blocks winners (22% would block VERIFIED, Lealana, speculative, VETO, BAGSPAY, COM, PIN...).
+# Applies to the realistic-entry accounts ($200 main, flat-$20 test, rug-filter shadow). No RugCheck data = skip,
+# as before (no closed trade ever lacked it).
+MAIN_TOP10_MAX_PCT = 32.5
 BUNDLE_INSIDER_PCT = 5.0    # insider/bundle-linked holders owning 5%+ of supply = bundled
 PUMP_1H_MAX_PCT = 100.0
 

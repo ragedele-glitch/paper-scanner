@@ -467,8 +467,10 @@ def analyse_rug(r, pool):
                 excl.add(v["owner"])
     if pool:
         excl.add(pool)
+    excl.add("1nc1nerator11111111111111111111111111111111")       # burn address: burned coins belong to nobody
     holders = [h for h in (r.get("topHolders") or []) if h.get("owner") not in excl and h.get("address") not in excl]
     top10 = sum(float(h.get("pct") or 0) for h in holders[:10])
+    top1 = max([float(h.get("pct") or 0) for h in holders] or [0.0])     # biggest single real holder, logged only
     insider = sum(float(h.get("pct") or 0) for h in holders if h.get("insider"))
     dev = 0.0
     if supply > 0 and r.get("creatorBalance"):
@@ -485,7 +487,7 @@ def analyse_rug(r, pool):
             lp = (m.get("lp") or {}).get("lpLockedPct")
     return dict(holders=r.get("totalHolders"), transfer_fee=float(tf) if tf is not None else None, lp_locked=lp,
                 token_program=r.get("tokenProgram") or r.get("tokenType"),
-                dev=dev, top10=top10, insider=insider, graph=int(r.get("graphInsidersDetected") or 0),
+                dev=dev, top10=top10, top1=top1, insider=insider, graph=int(r.get("graphInsidersDetected") or 0),
                 mint_auth=1 if tok.get("mintAuthority") else 0, freeze_auth=1 if tok.get("freezeAuthority") else 0,
                 score=r.get("score_normalised"), risks=risks, rugged=bool(r.get("rugged")), liq=liq)
 
@@ -634,6 +636,9 @@ def handle_candidate(con, c, pairs):
             rest.append("dev_over_5pct")
         if a["top10"] > C.TOP10_MAX_PCT:
             rest.append("top10_over_35pct")
+        elif a["top10"] > C.MAIN_TOP10_MAX_PCT and "top10_over_32.5pct" not in killed:
+            killed.append("top10_over_32.5pct")          # main (realistic) accounts only; 5 s test keeps 35%
+        note.append(f"rugcheck biggest real holder {a['top1']:.1f}%, top-10 {a['top10']:.1f}% (pools/curve/burn left out)")
         if a["insider"] >= C.BUNDLE_INSIDER_PCT or any(re.search(r"bundl|insider", x, re.I) for x in a["risks"]):
             rest.append("bundled_buys")
         if a["mint_auth"]:
