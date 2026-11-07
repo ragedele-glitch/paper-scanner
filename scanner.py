@@ -149,6 +149,8 @@ CREATE TABLE IF NOT EXISTS equity_hf(ts REAL PRIMARY KEY, cash REAL, open_value 
 CREATE TABLE IF NOT EXISTS paper_resets(reset_id TEXT, ts REAL, account INT, session_since REAL, cash_before REAL,
   open_value_before REAL, equity_before REAL, n_open INT, closed INT, wins INT, realised REAL, cash_after REAL,
   PRIMARY KEY(reset_id, account));
+CREATE TABLE IF NOT EXISTS price_ticks(ts REAL, mint TEXT, px REAL, src TEXT);
+CREATE INDEX IF NOT EXISTS ticks_mint ON price_ticks(mint, ts);
 """
 MIGRATIONS = [
     "ALTER TABLE signals ADD COLUMN detect_src TEXT",      # 'stream' (live feed) or 'poll' (holdings re-read)
@@ -176,7 +178,11 @@ MIGRATIONS = [
     "alts TEXT", "alts_open INT",   # the same trade under the other exit rules, for comparison
     "price_src TEXT",     # where the bot's last price came from: 'candle', 'jupiter' or 'dexscreener' (live quote)
     "price_ts REAL",      # when that price was true (candle end or quote time), so the page can show its real age
-    "be15 INT")           # 1 = the +15% breakeven rule is on for this trade (Nov 7 evening); NULL = previous exits
+    "be15 INT",           # 1 = the +15% breakeven rule is on for this trade (Nov 7 evening); NULL = previous exits
+    "floor_px REAL",      # +$5 floor (Nov 7 night, main account): price where the whole bag sells for +$5 after costs
+    "floor_on INT",       # 1 = the +$5 floor is on for this trade
+    "live_chk INT",       # 1 = stops are checked on live prices every few seconds (not 1-minute candles)
+    "live_ts REAL")       # newest live price (or candle end) the trade's exits have been checked up to
 ] + [f"ALTER TABLE signals ADD COLUMN {c}" for c in (
     "holders INT", "transfer_fee_pct REAL", "lp_locked_pct REAL", "token_program TEXT",
     "rt_pct REAL", "fill_note TEXT",
@@ -843,8 +849,15 @@ def open_position(con, sid, account, mint, sym, pool, leader, entry_ts, px, src,
     else:
         fee = C.NETWORK_FEE_USD; sf = (1 - C.SLIPPAGE) * (1 - C.BOT_FEE - C.POOL_FEE)
     be_px = (size + 2 * fee) / (qty * sf) if qty and sf > 0 else px * C.BE_LEVEL
-    alts = {k: alt_init(spec, px, qty, entry_ts, be_px) for k, spec in ALTS.items()}
+    main = account in C.FLOOR_ACCTS or account in C.LIVE_ACCTS
+    alts = {k: alt_init(spec, px, qty, entry_ts, be_px) for k, spec in ALL_ALTS.items() if main or k not in MAIN_ALTS}
+    if "live_nofloor" in alts:
+        alts["live_nofloor"]["last"] = entry_ts   # stepped on live prices: last = newest live price checked
     fill = dict(fill or {}, rules="v3", be15=1, be_px=be_px, alts=json.dumps(alts), alts_open=len(alts))
+    if account in C.FLOOR_ACCTS:   # +$5 floor (Nov 7 night, main account)
+        fill.update(floor_on=1, floor_px=floor_price(be_px, size, fee))
+    if account in C.LIVE_ACCTS:    # live-price stops (Nov 7 night, main account)
+        fill.update(live_chk=1, live_ts=entry_ts)
     cur = con.execute("""INSERT INTO positions(signal_id,account,mint,symbol,pool,leader,entry_ts,entry_price,entry_src,size_usd,qty,
         stop,peak,last_candle_ts,last_price,last_update,status,stop_log) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?)""",
                 (sid, account, mint, sym, pool, leader, entry_ts, px, src, size, qty, stop, px,
@@ -970,6 +983,281 @@ def be15_switch(con):
     con.commit()
 
 
+def floor_switch(con):
+    """+$5 floor + live-price stops switch-on (Rage, Nov 7 night), MAIN $200 account only. Every open main-account
+    trade not switched yet gets both rules now. Its comparison copies are saved first from the trade's state at this
+    moment (current exits on candles, the floor on candles, live checks without the floor), so the comparison lines
+    start here. If the trade has already been above +$5 after costs, the floor is armed now. Safe at every start."""
+    if not meta_get(con, "floor_on_ts"):
+        meta_set(con, "floor_on_ts", now())
+    logbook = meta_get(con, "floor_switch_log") or []
+    accts = sorted(set(C.FLOOR_ACCTS) | set(C.LIVE_ACCTS))
+    if not accts:
+        return
+    rows = con.execute(f"""SELECT * FROM positions WHERE status='open' AND rules='v3' AND floor_on IS NULL AND live_chk IS NULL
+                           AND account IN ({','.join('?' * len(accts))})""", accts).fetchall()
+    for r in rows:
+        p = dict(r); entry, peak, stop, be = p["entry_price"], p["peak"], p["stop"], p["be_px"]
+        fee = (p["fee_in"] or 0) if is_live(p) else C.NETWORK_FEE_USD
+        fl = floor_price(be or entry * C.BE_LEVEL, p["size_usd"], fee) if p["account"] in C.FLOOR_ACCTS else None
+        alts = json.loads(p["alts"] or "{}")
+        part = bool(p["part_ts"])
+        base = {"st": "open", "stop": stop, "peak": peak,
+                "last": int(p["last_candle_ts"] or (p["entry_ts"] // 60 * 60)), "px": p["last_price"] or entry,
+                "frac": (1.0 - C.HALF_FRAC) if part else 1.0,
+                "q0": (p["qty"] or 0) + ((p["part_qty"] or 0) if part else 0),
+                "legs": [[p["part_ts"], p["part_px"], C.HALF_FRAC, p["part_proceeds"] or 0]] if part else []}
+        alts.setdefault("cur_exits", json.loads(json.dumps(base)))
+        fc = json.loads(json.dumps(base)); fc["stop"] = stop_for(FLOOR_SPEC, entry, peak, stop, be, fl)
+        alts.setdefault("floor_candle", fc)
+        ln = json.loads(json.dumps(base)); ln["last"] = now()
+        alts.setdefault("live_nofloor", ln)
+        spec = FLOOR_SPEC if fl else REAL_SPEC
+        ns = stop_for(spec, entry, peak, stop, be, fl)
+        slog = json.loads(p["stop_log"] or "[]")
+        moved = ns > stop
+        if moved:
+            slog.append([now(), ns, "+$5 floor (switched on at load)"])
+        n_open = sum(1 for a in alts.values() if a["st"] == "open")
+        covered = max((p["last_candle_ts"] or p["entry_ts"] // 60 * 60) + 60, p["price_ts"] or 0)
+        con.execute("""UPDATE positions SET floor_on=?, floor_px=?, live_chk=?, live_ts=?, stop=?, stop_log=?, alts=?, alts_open=?
+                       WHERE id=?""", (1 if fl else None, fl, 1 if p["account"] in C.LIVE_ACCTS else None, covered, ns,
+                                       json.dumps(slog[-30:]), json.dumps(alts), n_open, p["id"]))
+        log.info("+$5 FLOOR + LIVE STOPS ON [acct %d] %s peak %+.0f%% floor %.10g%s", p["account"], p["symbol"],
+                 (peak / entry - 1) * 100, fl or 0, f", floor armed now, stop moved up to {ns:.10g}" if moved else "")
+        logbook.append([now(), p["id"], p["account"], p["symbol"], (peak / entry - 1) * 100, stop, ns, moved, fl,
+                        p["entry_price"], p["size_usd"]])
+    meta_set(con, "floor_switch_log", logbook[-50:])
+    con.commit()
+
+
+# ----------------------------------------------------------------------------- live prices (main account, Nov 7 night)
+TICKS = {}          # mint -> [(ts, usd_price, source)], last 30 minutes, filled by the ticker thread
+TICK_LOCK = threading.Lock()
+TICK_WANT = {}      # mint -> pool: coins to price every TICK_S (set by live_guard)
+TICK_NEW = deque()  # prices to record in price_ticks
+TICK_STATS = {"ok": 0, "fail": 0, "jup": 0, "dex": 0, "last_ok": 0.0, "err": None, "started": 0.0, "backoff_until": 0.0,
+              "jup_last": 0.0}
+TICK_SAVED = {}     # mint -> (ts, px) last recorded, to skip repeats
+PEND = {}           # (position id, copy name) -> [trigger ts, stop level, reason]: a stop hit, sell at the next price
+
+
+def tick_fetch(want):
+    t = now(); got = {}
+    mints = list(want)
+    for i in range(0, len(mints), 30):
+        chunk = mints[i:i + 30]
+        try:
+            d = http(C.DEX_TOKENS + ",".join(chunk), kind="dex", timeout=8, tries=1) or []
+        except urllib.error.HTTPError as e:
+            TICK_STATS["fail"] += 1; TICK_STATS["err"] = f"dexscreener HTTP {e.code}"
+            if e.code == 429:
+                TICK_STATS["backoff_until"] = now() + 20
+            continue
+        except Exception as e:
+            TICK_STATS["fail"] += 1; TICK_STATS["err"] = f"dexscreener {type(e).__name__}"
+            continue
+        by = {}
+        for x in d:
+            if x.get("chainId") == "solana":
+                by.setdefault(x["baseToken"]["address"], []).append(x)
+        for m, ps in by.items():
+            own = next((x for x in ps if x.get("pairAddress") == want.get(m)), None)
+            tp = own or top_pair(ps)
+            try:
+                v = float(tp["priceUsd"]) if tp and tp.get("priceUsd") else 0
+            except (TypeError, ValueError):
+                v = 0
+            if v > 0:
+                got[m] = (t, v, "dexscreener")
+    rest = [m for m in mints if m not in got]
+    if rest and now() - TICK_STATS["jup_last"] >= C.TICK_JUP_S:   # backup, kept rare: Jupiter's keyless limit is shared
+        TICK_STATS["jup_last"] = now()
+        try:
+            d = fills._jup("/price/v3?ids=" + ",".join(rest[:50])) or {}
+            for m in rest[:50]:
+                v = (d.get(m) or {}).get("usdPrice")
+                if v and float(v) > 0:
+                    got[m] = (now(), float(v), "jupiter")
+        except Exception as e:
+            TICK_STATS["fail"] += 1; TICK_STATS["err"] = f"jupiter {type(e).__name__}"
+    if got:
+        TICK_STATS["ok"] += 1; TICK_STATS["last_ok"] = now()
+        with TICK_LOCK:
+            for m, (ts, v, src) in got.items():
+                TICK_STATS["jup" if src == "jupiter" else "dex"] += 1
+                arr = TICKS.setdefault(m, [])
+                arr.append((ts, v, src))
+                while arr and arr[0][0] < ts - 1800:
+                    arr.pop(0)
+                TICK_NEW.append((ts, m, v, src))
+    return got
+
+
+def ticker():
+    TICK_STATS["started"] = now()
+    while True:
+        t0 = now()
+        try:
+            want = dict(TICK_WANT)
+            if want and now() >= TICK_STATS["backoff_until"]:
+                tick_fetch(want)
+        except Exception as e:
+            TICK_STATS["fail"] += 1; TICK_STATS["err"] = f"{type(e).__name__}: {str(e)[:80]}"
+        time.sleep(max(0.3, C.TICK_S - (now() - t0)))
+
+
+def start_ticker():
+    if C.LIVE_ACCTS and not TICK_STATS["started"]:
+        threading.Thread(target=ticker, name="live-prices", daemon=True).start()
+
+
+def live_fresh(mint):
+    with TICK_LOCK:
+        arr = TICKS.get(mint)
+        return bool(arr) and now() - arr[-1][0] <= C.TICK_FRESH_S
+
+
+def ticks_after(mint, ts):
+    with TICK_LOCK:
+        return [x for x in TICKS.get(mint, []) if x[0] > ts]
+
+
+def tick_walk(st, spec, entry, be, fl, ticks, mirror_ts, entry_ts, why_stop, key):
+    """Walk the exit rules over live prices in time order. st: stop, peak, half (bool), last. A stop hit is a trigger:
+    the sell fills at the first live price EXEC_DELAY_S or more after it (rugs and dumps fill worse, as live).
+    Returns events in order: ("half", t, px), ("stop", t, new_stop), ("close", t, px, reason, trigger_stop, fill_src)."""
+    ev = []
+    for (t, px, src) in ticks:
+        if t <= st["last"]:
+            continue
+        st["last"], st["px"] = t, px
+        pend = PEND.get(key)
+        if pend:
+            if t >= pend[0] + C.EXEC_DELAY_S:
+                PEND.pop(key, None)
+                ev.append(("close", t, px, pend[2], pend[1], f"live price {t - pend[0]:.0f}s after trigger ({src})"))
+                return ev
+            continue
+        if mirror_ts and t >= mirror_ts:
+            ev.append(("close", t, px, "smart wallet sold (live price)", None, None)); return ev
+        if t >= entry_ts + C.TIME_STOP_S:
+            ev.append(("close", t, px, "24h time stop (live price)", None, None)); return ev
+        if st["stop"] and px <= st["stop"]:
+            PEND[key] = [t, st["stop"], why_stop(st["stop"], st["peak"]) + " (live price)"]
+            continue
+        if spec.get("half_at") and not st["half"] and px >= entry * spec["half_at"]:
+            ev.append(("half", t, px)); st["half"] = True
+        if px > st["peak"]:
+            st["peak"] = px
+            ns = stop_for(spec, entry, px, st["stop"], be, fl)
+            if ns > st["stop"]:
+                ev.append(("stop", t, ns)); st["stop"] = ns
+    return ev
+
+
+def flush_ticks(con):
+    rows = []
+    while TICK_NEW:
+        ts, m, v, src = TICK_NEW.popleft()
+        last = TICK_SAVED.get(m)
+        if last and last[1] == v and ts - last[0] < 60:
+            continue
+        TICK_SAVED[m] = (ts, v); rows.append((ts, m, v, src))
+    if rows:
+        con.executemany("INSERT INTO price_ticks(ts,mint,px,src) VALUES(?,?,?,?)", rows)
+    return len(rows)
+
+
+def live_guard(con):
+    """Main-account exits on live prices (every few seconds) instead of 1-minute candles."""
+    if not C.LIVE_ACCTS:
+        return
+    t_now = now()
+    flush_ticks(con)
+    accts = sorted(C.LIVE_ACCTS)
+    q = ','.join('?' * len(accts))
+    rows = con.execute(f"""SELECT * FROM positions WHERE account IN ({q}) AND live_chk=1 AND
+                           (status='open' OR (alts_open>0 AND alts LIKE '%"live_nofloor": {{"st": "open"%'))""", accts).fetchall()
+    TICK_WANT.clear()
+    TICK_WANT.update({r["mint"]: r["pool"] for r in rows})
+    for r in rows:
+        p = dict(r)
+        try:
+            live_step(con, p, t_now)
+            con.commit()
+        except Exception as ex:
+            log.warning("live price exits error %s %s", p["symbol"], ex); con.rollback()
+
+
+def live_step(con, p, t_now):
+    entry, be, fl = p["entry_price"], p["be_px"], fpx(p)
+    mirror_ts = mirror_time(con, p)
+    alts = json.loads(p["alts"] or "{}")
+    la = alts.get("live_nofloor")
+    starts = [p["live_ts"] or p["entry_ts"]] if p["status"] == "open" else []
+    if la and la["st"] == "open":
+        starts.append(la["last"])
+    if not starts:
+        return
+    ticks = ticks_after(p["mint"], min(starts))
+    # comparison copy: live checks without the floor
+    if la and la["st"] == "open":
+        entry_fee = (p["fee_in"] or 0) if is_live(p) else C.NETWORK_FEE_USD
+        st = {"stop": la["stop"], "peak": la["peak"], "half": la["frac"] < 1.0, "last": la["last"], "px": la["px"]}
+        ev = tick_walk(st, LIVE_ALTS["live_nofloor"], entry, be, None, ticks, mirror_ts, p["entry_ts"],
+                       lambda s, pk: stop_reason(p, s, False), (p["id"], "live_nofloor"))
+
+        def leg(ts, px, frac):
+            v, r, fee = sell_leg(p, la["q0"] * frac, px, ts, t_now)
+            la["legs"].append([ts, px, frac, v])
+        for e in ev:
+            if e[0] == "half":
+                leg(e[1], e[2], C.HALF_FRAC); la["frac"] = 1.0 - C.HALF_FRAC
+            elif e[0] == "close":
+                leg(e[1], e[2], la["frac"]); la["frac"] = 0.0
+                la.update(st="closed", exit_ts=e[1], exit_px=e[2], reason=e[3], trigger=e[4], fill_src=e[5],
+                          pnl=sum(x[3] for x in la["legs"]) - p["size_usd"] - entry_fee)
+        if la["st"] == "open":
+            la.update(stop=st["stop"], peak=st["peak"], last=st["last"], px=st["px"])
+            if t_now >= p["entry_ts"] + C.TIME_STOP_S + 120:   # no live price near the 24 h mark
+                leg(p["entry_ts"] + C.TIME_STOP_S, la["px"], la["frac"]); la["frac"] = 0.0
+                la.update(st="closed", exit_ts=p["entry_ts"] + C.TIME_STOP_S, exit_px=la["px"], reason="24h time stop",
+                          pnl=sum(x[3] for x in la["legs"]) - p["size_usd"] - entry_fee)
+        la["upd"] = t_now
+        n_open = sum(1 for a in alts.values() if a["st"] == "open")
+        con.execute("UPDATE positions SET alts=?, alts_open=? WHERE id=?", (json.dumps(alts), n_open, p["id"]))
+        p["alts"], p["alts_open"] = json.dumps(alts), n_open
+    if p["status"] != "open":
+        return
+    # the real trade
+    peak0 = p["peak"]
+    st = {"stop": p["stop"], "peak": p["peak"], "half": bool(p["part_ts"]), "last": p["live_ts"] or p["entry_ts"],
+          "px": p["last_price"]}
+    ev = tick_walk(st, spec_of(p), entry, be, fl, ticks, mirror_ts, p["entry_ts"],
+                   lambda s, pk: stop_reason(p, s, False, pk), (p["id"], "real"))
+    slog = json.loads(p["stop_log"] or "[]")
+    src = None
+    if ticks:
+        src = next((x[2] for x in reversed(ticks) if x[0] <= st["last"]), ticks[-1][2])
+    for e in ev:
+        if e[0] == "half":
+            take_half(con, p, e[1], e[2], st["stop"], slog, t_now); p["part_ts"] = e[1]
+        elif e[0] == "stop":
+            slog.append([e[1], e[2], stop_label(p, e[2], st["peak"]) + " (live price)"])
+        elif e[0] == "close":
+            if e[4] is not None:
+                con.execute("UPDATE positions SET exit_trigger_px=?, exit_fill_src=? WHERE id=?", (e[4], e[5], p["id"]))
+            con.execute("UPDATE positions SET live_ts=?, price_src=?, price_ts=? WHERE id=?",
+                        (e[1], "live-" + (src or "dexscreener"), e[1], p["id"]))
+            close_position(con, p, e[1], e[2], e[3], stop=st["stop"], peak=st["peak"], slog=slog)
+            return
+    if st["last"] > (p["live_ts"] or 0) or st["peak"] != peak0 or ev:
+        con.execute("""UPDATE positions SET stop=?, peak=?, live_ts=?, last_price=?, stop_log=?, price_src=?, price_ts=?
+                       WHERE id=?""", (st["stop"], st["peak"], st["last"], st["px"], json.dumps(slog[-30:]),
+                                       "live-" + (src or "dexscreener"), st["last"], p["id"]))
+
+
 def account_state(con, account=C.ACCT_5S):
     cash = meta_get(con, cash_key(account), C.START_EQUITY)
     opens = con.execute("SELECT * FROM positions WHERE account=? AND status='open'", (account,)).fetchall()
@@ -1000,10 +1288,20 @@ ALTS = {
     "old_exits": dict(max_loss=C.MAX_LOSS_PCT, be=C.BE2_TRIGGER, half_at=None, trail=C.TRAIL_STEPS),
     # the new exits without the $5 stop and the breakeven rule
     "no_stop_be": dict(max_loss=None, be=None, half_at=C.HALF_AT, trail=C.TRAIL_V3),
+    # main $200 account only (Nov 7 night): the exits before the +$5 floor and live-price stops, on 1-minute candles
+    "cur_exits": REAL_SPEC,
 }
+# +$5 floor (Rage, Nov 7 night, main account): the current exits plus a stop at +$5 profit once the trade has been there
+FLOOR_SPEC = dict(REAL_SPEC, floor=True)
+# the +$5 floor on 1-minute candles (no live prices), so the floor and the live checks each show their own effect
+ALTS["floor_candle"] = FLOOR_SPEC
+# checked on live prices every few seconds, like the real main-account trade: live checks without the floor
+LIVE_ALTS = {"live_nofloor": REAL_SPEC}
+ALL_ALTS = dict(ALTS, **LIVE_ALTS)
+MAIN_ALTS = {"cur_exits", "floor_candle", "live_nofloor"}   # only main-account trades carry these
 
 
-def stop_for(spec, entry, peak, old, be_px):
+def stop_for(spec, entry, peak, old, be_px, floor_px=None):
     gain = peak / entry - 1 + 1e-9
     s = entry * (1 - spec["max_loss"]) if spec.get("max_loss") else 0.0
     for trig, dist in spec["trail"]:
@@ -1015,15 +1313,32 @@ def stop_for(spec, entry, peak, old, be_px):
         b = be_px or entry * C.BE_LEVEL
         if peak >= b:   # as in the replay: armed once the trade has been up 15% AND above its breakeven price
             s = max(s, b)
+    if spec.get("floor") and floor_px and peak >= floor_px:   # has been above +$5 after costs: floor at +$5
+        s = max(s, floor_px)
     return max(old, s)
 
 
+def fpx(p):
+    return p["floor_px"] if "floor_px" in p.keys() else None
+
+
+def floor_price(be_px, size, fee):
+    """Price where the whole bag sells for +FLOOR_USD after all costs. be_px is where it sells for $0 after costs
+    (size + buy fee + sell fee), and the sell value scales with price, so the +$5 price is be_px * (cost + 5) / cost."""
+    cost = size + 2 * fee
+    return be_px * (cost + C.FLOOR_USD) / cost if be_px and cost > 0 else None
+
+
 def spec_of(p):
+    if "floor_on" in p.keys() and p["floor_on"]:
+        return FLOOR_SPEC
     return REAL_SPEC if ("be15" in p.keys() and p["be15"]) else PREV_SPEC
 
 
 def stop_label(p, ns, peak):
     entry = p["entry_price"]
+    if fpx(p) and abs(ns - fpx(p)) < 1e-9 * ns:
+        return "+$5 floor"
     if p["be_px"] and abs(ns - p["be_px"]) < 1e-9 * ns:
         return "breakeven (+15% rule)" if peak / entry - 1 + 1e-9 < C.BE2_TRIGGER else "breakeven"
     return f"peak +{(peak/entry-1)*100:.0f}%"
@@ -1044,9 +1359,11 @@ def stop_reason(p, stop, gapped, peak=None):
     if is_v3(p):
         if stop < entry:
             r = "max-loss stop"
+        elif fpx(p) and abs(stop - fpx(p)) <= 1e-9 * stop:
+            r = "+$5 floor stop"
         elif p["be_px"] and abs(stop - p["be_px"]) <= 1e-9 * stop:
             r = "breakeven stop"
-            if peak is not None and spec_of(p) is REAL_SPEC and peak / entry - 1 + 1e-9 < C.BE2_TRIGGER:
+            if peak is not None and spec_of(p) is not PREV_SPEC and peak / entry - 1 + 1e-9 < C.BE2_TRIGGER:
                 return r + " (+15% rule)" + (" (gapped)" if gapped else "")
         else:
             r = "trailing stop"
@@ -1130,9 +1447,9 @@ def alt_step(con, p, cs, mirror_ts, t_now, live_fill):
     alts = json.loads(p["alts"]); entry = p["entry_price"]; be = p["be_px"]
     entry_fee = (p["fee_in"] or 0) if is_live(p) else C.NETWORK_FEE_USD
     for name, a in alts.items():
-        if a["st"] != "open" or name not in ALTS:
+        if a["st"] != "open" or name not in ALL_ALTS or (name in LIVE_ALTS and live_fresh(p["mint"])):
             continue
-        spec = ALTS[name]
+        spec = ALL_ALTS[name]
 
         def leg(ts, px, frac):
             v, r, fee = sell_leg(p, a["q0"] * frac, px, ts, t_now)
@@ -1156,7 +1473,7 @@ def alt_step(con, p, cs, mirror_ts, t_now, live_fill):
             if spec.get("half_at") and a["frac"] == 1.0 and h >= entry * spec["half_at"]:
                 leg(t, max(o, entry * spec["half_at"]), C.HALF_FRAC); a["frac"] = 1.0 - C.HALF_FRAC
             if h > a["peak"]:
-                a["peak"] = h; a["stop"] = stop_for(spec, entry, a["peak"], a["stop"], be)
+                a["peak"] = h; a["stop"] = stop_for(spec, entry, a["peak"], a["stop"], be, fpx(p))
             a["last"], a["px"] = t, c
         if a["st"] == "open" and t_now >= p["entry_ts"] + C.TIME_STOP_S and a["last"] < p["entry_ts"] + C.TIME_STOP_S - 60:
             if mirror_ts and mirror_ts < p["entry_ts"] + C.TIME_STOP_S:
@@ -1179,9 +1496,10 @@ def alt_quote_step(con, p, qt, qpx, mirror_ts, t_now):
     entry_fee = (p["fee_in"] or 0) if is_live(p) else C.NETWORK_FEE_USD
     tag = " (live price, no candles)"
     for name, a in alts.items():
-        if a["st"] != "open" or name not in ALTS or qt <= max(a["last"] + 60, a.get("qlast") or 0):
+        if a["st"] != "open" or name not in ALL_ALTS or qt <= max(a["last"] + 60, a.get("qlast") or 0) \
+                or (name in LIVE_ALTS and live_fresh(p["mint"])):
             continue
-        spec = ALTS[name]
+        spec = ALL_ALTS[name]
 
         def leg(ts, px, frac):
             v, r, fee = sell_leg(p, a["q0"] * frac, px, ts, t_now)
@@ -1202,7 +1520,7 @@ def alt_quote_step(con, p, qt, qpx, mirror_ts, t_now):
         if spec.get("half_at") and a["frac"] == 1.0 and qpx >= entry * spec["half_at"]:
             leg(qt, qpx, C.HALF_FRAC); a["frac"] = 1.0 - C.HALF_FRAC
         if qpx > a["peak"]:
-            a["peak"] = qpx; a["stop"] = stop_for(spec, entry, a["peak"], a["stop"], be)
+            a["peak"] = qpx; a["stop"] = stop_for(spec, entry, a["peak"], a["stop"], be, fpx(p))
         a["px"] = qpx
     n_open = sum(1 for a in alts.values() if a["st"] == "open")
     con.execute("UPDATE positions SET alts=?, alts_open=? WHERE id=?", (json.dumps(alts), n_open, p["id"]))
@@ -1229,6 +1547,9 @@ def alt_all(con):
         try:
             t_now = now(); p = dict(p)
             alts = json.loads(p["alts"])
+            if all(k in LIVE_ALTS for k, a in alts.items() if a["st"] == "open") and live_fresh(p["mint"]):
+                con.execute("UPDATE positions SET last_update=? WHERE id=?", (t_now, p["id"])); con.commit()
+                continue   # stepped on live prices by live_guard
             since = min(a["last"] for a in alts.values() if a["st"] == "open") + 60
             cs = candles_cached(p["pool"], p["mint"], int(since))
             cs = [c for c in cs if c[0] + 60 <= t_now - 20]
@@ -1389,6 +1710,20 @@ def update_position(con, p, pool_now=None):
     live_fill = v3 and p["account"] in (C.ACCT_REAL, C.ACCT_REAL_SHADOW, C.ACCT_HF)
     if v3:
         alt_step(con, p, cs, mirror_ts, t_now, live_fill)
+    live_on = v3 and bool(p.get("live_chk"))
+    if live_on and live_fresh(p["mint"]):
+        # live-price stops (main account, Nov 7 night): live_guard checks this trade's exits every few seconds;
+        # candles only move the candle comparison copies along here
+        if cs:
+            last_ts = max(last_ts or 0, cs[-1][0])
+        if v3 and candles_stale(last_ts, p["entry_ts"], t_now):
+            tk = ticks_after(p["mint"], 0)
+            if tk:
+                alt_quote_step(con, p, tk[-1][0], tk[-1][1], mirror_ts, t_now)
+        con.execute("UPDATE positions SET last_candle_ts=?, last_update=?, pool=? WHERE id=?", (last_ts, t_now, pool, p["id"]))
+        return
+    if live_on:   # no fresh live price: candle checks, from where the live checks stopped
+        cs = [c for c in cs if c[0] + 60 > (p["live_ts"] or 0)]
     for (t, o, h, l, c) in cs:
         if t <= p["entry_ts"] - 60:
             continue
@@ -1408,7 +1743,7 @@ def update_position(con, p, pool_now=None):
             take_half(con, p, t, max(o, entry * C.HALF_AT), stop, slog, t_now); p["part_ts"] = t
         if h > peak:
             peak = h
-            ns = stop_for(spec_of(p), entry, peak, stop, p["be_px"]) if v3 else new_stop(entry, peak, stop)
+            ns = stop_for(spec_of(p), entry, peak, stop, p["be_px"], fpx(p)) if v3 else new_stop(entry, peak, stop)
             if ns > stop:
                 lab = stop_label(p, ns, peak) if v3 else f"peak +{(peak/entry-1)*100:.0f}%"
                 slog.append([t, ns, lab]); stop = ns
@@ -1445,7 +1780,7 @@ def update_position(con, p, pool_now=None):
             take_half(con, p, qt, qpx, stop, slog, t_now); p["part_ts"] = qt
         if qpx > peak:
             peak = qpx
-            ns = stop_for(spec_of(p), entry, peak, stop, p["be_px"]) if v3 else new_stop(entry, peak, stop)
+            ns = stop_for(spec_of(p), entry, peak, stop, p["be_px"], fpx(p)) if v3 else new_stop(entry, peak, stop)
             if ns > stop:
                 lab = (stop_label(p, ns, peak) if v3 else f"peak +{(peak/entry-1)*100:.0f}%") + " (live price)"
                 slog.append([qt, ns, lab]); stop = ns
@@ -1460,6 +1795,9 @@ def update_position(con, p, pool_now=None):
     con.execute("""UPDATE positions SET stop=?,peak=?,last_candle_ts=?,last_price=?,last_update=?,stop_log=?,pool=?,
                    price_src=?,price_ts=? WHERE id=?""",
                 (stop, peak, last_ts, last_px, t_now, json.dumps(slog[-30:]), pool, price_src, price_ts, p["id"]))
+    if live_on:   # live checks pick up after what the candles (or the quote) covered
+        con.execute("UPDATE positions SET live_ts=MAX(COALESCE(live_ts,0),?) WHERE id=?",
+                    (price_ts if price_src != "candle" else (last_ts or p["entry_ts"]) + 60, p["id"]))
 
 
 def guard_all(con):
@@ -1746,6 +2084,17 @@ def main():
         be15_switch(con)
     except Exception as e:   # never let it stop the scanner; it is retried at the next start
         log.warning("+15%% breakeven switch error %s", e); con.rollback()
+    try:
+        if not meta_get(con, "floor_on_ts"):
+            guard_all(con); con.commit()   # bring open trades up to date on the old rules first, so the switch sees their peak
+    except Exception as e:
+        log.warning("pre-switch catch-up error %s", e); con.rollback()
+    try:
+        floor_switch(con)
+        con.execute("DELETE FROM price_ticks WHERE ts < ?", (now() - C.TICK_KEEP_DAYS * 86400,)); con.commit()
+    except Exception as e:   # never let it stop the scanner; it is retried at the next start
+        log.warning("+$5 floor switch error %s", e); con.rollback()
+    start_ticker()
     log.info("scanner start (PAPER MODE ONLY - no wallet, no keys, nothing signed)")
     if C.REMOVED_ERROR:
         log.warning("removed_wallets.json could not be read (%s): no wallets removed this run", C.REMOVED_ERROR)
@@ -1769,6 +2118,7 @@ def main():
             def _t(name, fn, *a):
                 t1 = now(); r = fn(*a); tm[name] = now() - t1; return r
             _t("feed", drain_stream, con)
+            _t("live0", live_guard, con)
             cands, polled = _t("poll", poll_wallets, con)
             _t("filters", process_new_buys, con, cands)
             drain_chain_info(con)
@@ -1777,7 +2127,9 @@ def main():
             except Exception as e:
                 log.warning("wallet-score shadow test error %s", e); con.rollback()
             _t("feed2", drain_stream, con)
+            _t("live", live_guard, con)
             _t("guard", guard_all, con)
+            _t("live2", live_guard, con)
             _t("alt exits", alt_all, con)
             live_hook(live.tick, con)
             _t("checkpoints", checkpoints, con)
@@ -1811,6 +2163,7 @@ def main():
         while now() - loop_t < C.LOOP_S:
             try:
                 drain_stream(con, wait_s=1.0) if STREAM is not None else time.sleep(1)
+                live_guard(con)   # main-account exits on live prices, every second between full loops
             except Exception as e:
                 log.error("feed loop error %s\n%s", e, traceback.format_exc())
                 try:

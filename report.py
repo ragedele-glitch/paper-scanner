@@ -99,6 +99,10 @@ def make_report(con, host="GitHub Actions (public repo ragedele-glitch/paper-sca
         L.append(f"EXIT RULES (With +15% breakeven, switched on Sat 7 Nov): $5 max-loss stop (-{int(C.MAX_LOSS_PCT*100)}%), "
                  f"breakeven from +{int(C.BE15_TRIGGER*100)}%, half sold at {C.HALF_AT:g}x, trail widening 25% -> 40% past 3x. "
                  f"Compared on the same trades with 'Old exits, no +15% breakeven' (breakeven only from +{int(C.BE2_TRIGGER*100)}%):")
+        L.append(f"  MAIN $200 ONLY (switched on Sat 7 Nov night): +${C.FLOOR_USD:g} floor (once a trade has been above +${C.FLOOR_USD:g} "
+                 f"after costs, its stop sits at +${C.FLOOR_USD:g}) + live-price stops (checked every {C.TICK_S} s, not 1-minute candles). "
+                 "New main trades are also followed under 'current exits on candles', 'floor on candles' and 'live checks, no floor'. "
+                 "The copied-wallet sell stays on everywhere.")
         for acct, lab in ((C.ACCT_REAL, "realistic $200"), (C.ACCT_REAL_SHADOW, "realistic every survivor"),
                           (C.ACCT_5S, "5 s $200"), (C.ACCT_5S_SHADOW, "5 s every survivor")):
             L.extend(dashboard.compare_lines(dashboard.exit_compare(con, acct), lab))

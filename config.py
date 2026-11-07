@@ -154,6 +154,24 @@ TIME_STOP_S = 24 * 3600     # close anything still open after 24 hours
 # (Jupiter first, DexScreener's biggest pool as backup). Price source only: stop levels and rules are unchanged.
 QUOTE_STALE_S = 180
 QUOTE_MAX_AGE_S = 60        # a live price older than this is not used
+# +$5 floor + live-price stops (Rage, Sat Nov 7 2026 night: "activate the two rules on the main account").
+# MAIN $200 account only; the flat-$20, rug-filter and both 5 s accounts keep the exits above as comparison.
+# 1) +$5 floor: once a trade's profit after all costs has been above +$5, its stop moves up to the price where the
+#    whole remaining bag would sell for +$5 after costs, and never moves back down. Not a sell on the way up: the
+#    trail, the 2x half-sell, breakeven, the -25% stop and the copied-wallet sell carry on as before.
+#    Replay (Nov 7): main +$28.95, flat-$20 +$21.19, 5 s +$21.24, 5 s flat +$36.39; cut one winner.
+# 2) Live-price stops: every open main-account trade is priced every few seconds (DexScreener, Jupiter backup; no
+#    Helius credits) and every stop, the floor, breakeven, the trail and the 2x half-sell are checked on those prices
+#    instead of 1-minute candles. A stop hit sells at the next live price EXEC_DELAY_S+ after the trigger. If live
+#    prices stop coming for TICK_FRESH_S, the trade falls back to the candle checks. Every live price is recorded
+#    (table price_ticks) so the real effect on fills can be measured later.
+FLOOR_ACCTS = {ACCT_REAL}
+FLOOR_USD = 5.0
+LIVE_ACCTS = {ACCT_REAL}
+TICK_S = 4                  # live price check every 4 s
+TICK_FRESH_S = 30           # live checks are used while the newest live price is no older than this
+TICK_JUP_S = 12             # Jupiter backup for coins DexScreener did not price: at most once per 12 s (shared limit)
+TICK_KEEP_DAYS = 14         # recorded live prices kept this long
 
 EXCLUDE_MINTS = {
     "So11111111111111111111111111111111111111112",  # wSOL
