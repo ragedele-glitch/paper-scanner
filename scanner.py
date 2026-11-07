@@ -751,7 +751,8 @@ def queue_chain_info(sid, mint, pool, wallet, det, is_curve):
     try:
         if CHAIN_POOL is None:
             CHAIN_POOL = ThreadPoolExecutor(max_workers=1)
-        CHAIN_JOBS.append((sid, CHAIN_POOL.submit(holders.chain_info, mint, pool, wallet, det, is_curve)))
+        # chain_info + the stronger holder checks (logged only, never block or sell; Nov 7 test)
+        CHAIN_JOBS.append((sid, CHAIN_POOL.submit(holders.chain_and_holder_info, mint, pool, wallet, det, is_curve, pool)))
     except Exception as e:
         log.warning("chain info not queued for %s: %s", mint, e)
 
