@@ -121,6 +121,11 @@ TRAIL_STEPS = [             # (peak gain reached, stop distance under the peak)
 # Exit rules v3 (from Nov 4, 2026 afternoon; positions opened earlier keep the rules above)
 MAX_LOSS_PCT = 0.25         # $5 max-loss stop: 25% under entry = $5 on a $20 trade (real fill can be worse)
 BE2_TRIGGER = 0.50          # once up 50%, stop moves to the real breakeven price after all costs
+# +15% breakeven (Rage, Nov 7 evening: "switch it for the real"). Once a trade has been up 15% (candle high or live
+# Jupiter/DexScreener price), its stop moves up to the breakeven-after-costs price and never moves back down.
+# Replay on every closed trade (Nov 7): main $200 +$22.29, flat-$20 +$24.24, 5 s +$20.22, 5 s flat-$20 +$33.92;
+# cut winners BAGSPAY and PIRATE. All paper accounts use it; the previous exits are still followed per trade.
+BE15_TRIGGER = 0.15
 HALF_AT = 2.0               # runner plan: at 2x the entry price sell half (takes back about the stake)
 HALF_FRAC = 0.5
 TRAIL_V3 = [                # runner trail: widens as the trade grows, so the second half can run

@@ -36,11 +36,21 @@ EXITS = {
     "max-loss stop": "$5 max-loss stop hit", "max-loss stop (gapped)": "$5 max-loss stop hit (price jumped past it)",
     "breakeven stop": "Breakeven stop hit (winner closed at no loss)",
     "breakeven stop (gapped)": "Breakeven stop hit (price jumped past it)",
+    "breakeven stop (+15% rule)": "+15% breakeven stop hit (closed at about $0)",
+    "breakeven stop (+15% rule) (gapped)": "+15% breakeven stop hit (price jumped past it)",
     "closed manually by Rage (live jupiter price)": "Closed manually by Rage (live Jupiter price)",
     "closed manually by Rage (live dexscreener price)": "Closed manually by Rage (live DexScreener price)",
 }
-ALT_NAMES = {"old_exits": "Old exits (no half sell, old tightening trail)",
-             "no_stop_be": "New exits without the $5 stop and breakeven"}
+ALT_NAMES = {"pre_be15": "Old exits, no +15% breakeven",
+             "old_exits": "First exits (no half sell, old tightening trail, no +15% breakeven)",
+             "no_stop_be": "Exits without the $5 stop and without any breakeven"}
+ALT_SHORT = {"pre_be15": "old exits, no +15% breakeven", "old_exits": "first exits", "no_stop_be": "no stop, no breakeven"}
+BE15_LABEL = "With +15% breakeven"
+BE15_OFF = "Old exits, no +15% breakeven"
+
+
+def be15_on(p):
+    return bool("be15" in p.keys() and p["be15"])
 
 
 def exit_compare(con, acct):
@@ -279,6 +289,10 @@ def build_state():
                               "trailing" if p["stop"] > p["entry_price"] else
                               ("breakeven" if abs(p["stop"] / p["entry_price"] - 1) < .2 and p["stop"] >= p["entry_price"] else "initial")),
                 "half": ({"px": p["part_px"], "x": p["part_px"] / p["entry_price"], "got": p["part_proceeds"]} if p["part_ts"] else None),
+                "exits_label": BE15_LABEL if be15_on(p) else BE15_OFF,
+                "alts": ({k: {"label": ALT_NAMES[k], "pnl": a.get("pnl"), "reason": EXITS.get(a.get("reason"), a.get("reason")),
+                              "open": a.get("st") == "open"} for k, a in json.loads(p["alts"]).items() if k in ALT_NAMES}
+                         if p["alts"] else None),
                 "peak_pct": (p["peak"] / p["entry_price"] - 1) * 100 if p["entry_price"] else None,
                 "wallet": names.get(p["leader"]) or short(p["leader"]), "entry_ts": p["entry_ts"],
                 # real age of the price the bot is using (candle end or live-quote time), not of its last check-in
@@ -303,6 +317,7 @@ def build_state():
                          "size": c["size_usd"], "pnl": c["pnl_usd"], "pnl_pct": c["pnl_pct"],
                          "reason": EXITS.get(c["exit_reason"], c["exit_reason"]),
                          "half": ({"x": c["part_px"] / c["entry_price"], "got": c["part_proceeds"]} if c["part_ts"] else None),
+                         "exits_label": BE15_LABEL if be15_on(c) else BE15_OFF,
                          "stop_fill": ({"stop": c["exit_trigger_px"], "fill": c["exit_price"], "src": c["exit_fill_src"]}
                                        if c["exit_trigger_px"] else None),
                          "alts": ({k: {"label": ALT_NAMES[k], "pnl": a.get("pnl"), "reason": EXITS.get(a.get("reason"), a.get("reason")),
@@ -446,11 +461,16 @@ def build_state():
     errs, activity = parse_log(now)
     awake = last_beat is not None and now - last_beat < 120
     live_st = live_status(con)
+    b15_ts = meta.get("be15_on_ts")
+    be15_since = (", live from " + time.strftime("%-I:%M %p", time.gmtime(b15_ts + 3600)) + " Lagos time") if b15_ts else ", live from the next bot run"
+    be15 = {"label": BE15_LABEL, "off_label": BE15_OFF, "on_ts": b15_ts,
+            "note": "+15% breakeven switched on Sat 7 Nov" + be15_since}
     exits = {"min_trades": C.CMP_MIN_TRADES, "min_differ": C.CMP_MIN_DIFFER, "groups": [
-        {"label": "Realistic $200 account", **exit_compare(con, C.ACCT_REAL)},
-        {"label": "Realistic, every survivor ($20 each)", **exit_compare(con, C.ACCT_REAL_SHADOW)},
-        {"label": "Old 5 s test, $200 account", **exit_compare(con, C.ACCT_5S)},
-        {"label": "Old 5 s test, every survivor", **exit_compare(con, C.ACCT_5S_SHADOW)}]}
+        {"label": "Realistic $200 account · With +15% breakeven", **exit_compare(con, C.ACCT_REAL)},
+        {"label": "Realistic, every survivor ($20 each) · With +15% breakeven", **exit_compare(con, C.ACCT_REAL_SHADOW)},
+        {"label": "Old 5 s test, $200 account · With +15% breakeven", **exit_compare(con, C.ACCT_5S)},
+        {"label": "Old 5 s test, every survivor · With +15% breakeven", **exit_compare(con, C.ACCT_5S_SHADOW)}],
+        "short": ALT_SHORT}
     con.close()
     try:
         import report
@@ -498,14 +518,20 @@ def build_state():
         "wallet_board": wallet_board,
         "realism": realism,
         "activity": activity,
+        "be15": be15,
         "rules": {"size": f"{int(C.POS_FRACTION*100)}% of the account per trade, max {C.MAX_OPEN} open",
                   "stop": (f"$5 max-loss stop: {int(C.MAX_LOSS_PCT*100)}% under entry (a dump can fill worse; the real fill is recorded). "
                            f"From +{int(C.BE2_TRIGGER*100)}% the stop never sits below breakeven after all costs"),
                   "runner": (f"Runner plan: at {C.HALF_AT:g}x sell half to take back the stake; the rest rides under a trail that widens: "
                              + ", ".join(f"{int(d*100)}% under the peak from {'+' + str(int(g*100)) + '%' if g < 1 else str(g + 1).rstrip('0').rstrip('.') + 'x'}"
                                          for g, d in C.TRAIL_V3)),
-                  "compare": ("Every trade is also followed under the old exits and under the new exits without the $5 stop and "
-                              "breakeven, so both P&Ls can be compared on the same trades"),
+                  "be15": (f"+15% breakeven ({BE15_LABEL}, switched on Sat 7 Nov{be15_since}): once a trade has been up "
+                           f"{int(C.BE15_TRIGGER*100)}% (candle or live Jupiter/DexScreener price), its stop moves up to the price that "
+                           "sells for about $0 after that trade's own costs, and never moves back down. On every paper account: main $200, "
+                           "flat-$20 test, rug-filter test and the old 5 s tests"),
+                  "compare": ("Every trade is also followed under the old exits with no +15% breakeven (labelled \"Old exits, no +15% "
+                              "breakeven\"), the first exits, and exits without the $5 stop and breakeven, so the P&Ls can be "
+                              "compared on the same trades. Trades closed before Sat 7 Nov ran on the old exits"),
                   "costs": f"{int(C.SLIPPAGE*100)}% slippage + {int((C.BOT_FEE+C.POOL_FEE)*100)}% fees each way + ${C.NETWORK_FEE_USD:.2f} network fee",
                   "costs_live": (f"lands {C.EXEC_DELAY_S} s after seen; real Jupiter quotes for the trade size (price impact + DEX fees, "
                                  f"sell re-quoted at exit); {int(C.BOT_FEE*100)}% bot fee each way; base + live priority fee + "

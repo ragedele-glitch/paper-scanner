@@ -96,8 +96,9 @@ def make_report(con, host="GitHub Actions (public repo ragedele-glitch/paper-sca
         L.append(f"  Same coins, realistic entry price vs 5 s entry: median {gaps[len(gaps) // 2]:+.1f}% ({len(gaps)} coins).")
     try:
         import dashboard
-        L.append(f"EXIT RULES (from Nov 4 afternoon): $5 max-loss stop (-{int(C.MAX_LOSS_PCT*100)}%), breakeven from +{int(C.BE2_TRIGGER*100)}%, "
-                 f"half sold at {C.HALF_AT:g}x, trail widening 25% -> 40% past 3x. Same trades, both P&Ls:")
+        L.append(f"EXIT RULES (With +15% breakeven, switched on Sat 7 Nov): $5 max-loss stop (-{int(C.MAX_LOSS_PCT*100)}%), "
+                 f"breakeven from +{int(C.BE15_TRIGGER*100)}%, half sold at {C.HALF_AT:g}x, trail widening 25% -> 40% past 3x. "
+                 f"Compared on the same trades with 'Old exits, no +15% breakeven' (breakeven only from +{int(C.BE2_TRIGGER*100)}%):")
         for acct, lab in ((C.ACCT_REAL, "realistic $200"), (C.ACCT_REAL_SHADOW, "realistic every survivor"),
                           (C.ACCT_5S, "5 s $200"), (C.ACCT_5S_SHADOW, "5 s every survivor")):
             L.extend(dashboard.compare_lines(dashboard.exit_compare(con, acct), lab))

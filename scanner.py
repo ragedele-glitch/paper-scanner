@@ -174,7 +174,8 @@ MIGRATIONS = [
     "part_ts REAL", "part_px REAL", "part_qty REAL", "part_proceeds REAL", "part_r REAL", "part_fee REAL",
     "alts TEXT", "alts_open INT",   # the same trade under the other exit rules, for comparison
     "price_src TEXT",     # where the bot's last price came from: 'candle', 'jupiter' or 'dexscreener' (live quote)
-    "price_ts REAL")      # when that price was true (candle end or quote time), so the page can show its real age
+    "price_ts REAL",      # when that price was true (candle end or quote time), so the page can show its real age
+    "be15 INT")           # 1 = the +15% breakeven rule is on for this trade (Nov 7 evening); NULL = previous exits
 ] + [f"ALTER TABLE signals ADD COLUMN {c}" for c in (
     "holders INT", "transfer_fee_pct REAL", "lp_locked_pct REAL", "token_program TEXT",
     "rt_pct REAL", "fill_note TEXT",
@@ -817,7 +818,7 @@ def open_position(con, sid, account, mint, sym, pool, leader, entry_ts, px, src,
         fee = C.NETWORK_FEE_USD; sf = (1 - C.SLIPPAGE) * (1 - C.BOT_FEE - C.POOL_FEE)
     be_px = (size + 2 * fee) / (qty * sf) if qty and sf > 0 else px * C.BE_LEVEL
     alts = {k: alt_init(spec, px, qty, entry_ts, be_px) for k, spec in ALTS.items()}
-    fill = dict(fill or {}, rules="v3", be_px=be_px, alts=json.dumps(alts), alts_open=len(alts))
+    fill = dict(fill or {}, rules="v3", be15=1, be_px=be_px, alts=json.dumps(alts), alts_open=len(alts))
     cur = con.execute("""INSERT INTO positions(signal_id,account,mint,symbol,pool,leader,entry_ts,entry_price,entry_src,size_usd,qty,
         stop,peak,last_candle_ts,last_price,last_update,status,stop_log) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?)""",
                 (sid, account, mint, sym, pool, leader, entry_ts, px, src, size, qty, stop, px,
@@ -909,6 +910,40 @@ def manual_close(con):
     con.commit()
 
 
+def be15_switch(con):
+    """+15% breakeven switch-on (Rage, Nov 7 evening). Every open v3 paper trade still on the previous exits gets the
+    rule now: its previous-exits copy is saved first (from the trade's state at this moment, so the comparison line
+    starts here), then, if the trade has already been up 15%+ and above its breakeven price, its stop moves up to
+    breakeven now. Safe to run at every start: trades already switched are skipped."""
+    if not meta_get(con, "be15_on_ts"):
+        meta_set(con, "be15_on_ts", now())
+    logbook = meta_get(con, "be15_switch_log") or []
+    rows = con.execute("SELECT * FROM positions WHERE status='open' AND rules='v3' AND be15 IS NULL").fetchall()
+    for r in rows:
+        p = dict(r); entry, peak, stop, be = p["entry_price"], p["peak"], p["stop"], p["be_px"]
+        alts = json.loads(p["alts"] or "{}")
+        if "pre_be15" not in alts:
+            part = bool(p["part_ts"])
+            alts["pre_be15"] = {"st": "open", "stop": stop, "peak": peak,
+                                "last": int(p["last_candle_ts"] or (p["entry_ts"] // 60 * 60)), "px": p["last_price"] or entry,
+                                "frac": (1.0 - C.HALF_FRAC) if part else 1.0,
+                                "q0": (p["qty"] or 0) + ((p["part_qty"] or 0) if part else 0),
+                                "legs": [[p["part_ts"], p["part_px"], C.HALF_FRAC, p["part_proceeds"] or 0]] if part else []}
+        ns = stop_for(REAL_SPEC, entry, peak, stop, be)
+        slog = json.loads(p["stop_log"] or "[]")
+        moved = ns > stop
+        if moved:
+            slog.append([now(), ns, "breakeven (+15% rule, switched on at load)"])
+        n_open = sum(1 for a in alts.values() if a["st"] == "open")
+        con.execute("UPDATE positions SET be15=1, stop=?, stop_log=?, alts=?, alts_open=? WHERE id=?",
+                    (ns, json.dumps(slog[-30:]), json.dumps(alts), n_open, p["id"]))
+        log.info("+15%% BREAKEVEN ON [acct %d] %s peak %+.0f%%%s", p["account"], p["symbol"], (peak / entry - 1) * 100,
+                 f", stop moved up to breakeven {ns:.10g}" if moved else "")
+        logbook.append([now(), p["id"], p["account"], p["symbol"], (peak / entry - 1) * 100, stop, ns, moved])
+    meta_set(con, "be15_switch_log", logbook[-50:])
+    con.commit()
+
+
 def account_state(con, account=C.ACCT_5S):
     cash = meta_get(con, cash_key(account), C.START_EQUITY)
     opens = con.execute("SELECT * FROM positions WHERE account=? AND status='open'", (account,)).fetchall()
@@ -928,8 +963,13 @@ def new_stop(entry, peak, old):
     return max(old, s)
 
 
-REAL_SPEC = dict(max_loss=C.MAX_LOSS_PCT, be=C.BE2_TRIGGER, half_at=C.HALF_AT, trail=C.TRAIL_V3)
+# exits before the +15% breakeven rule ($5 stop, breakeven from +50%, half at 2x, widening trail)
+PREV_SPEC = dict(max_loss=C.MAX_LOSS_PCT, be=C.BE2_TRIGGER, half_at=C.HALF_AT, trail=C.TRAIL_V3)
+# current exits: the same plus breakeven from +15% (Rage, Nov 7 evening)
+REAL_SPEC = dict(PREV_SPEC, be15=C.BE15_TRIGGER)
 ALTS = {
+    # the same trade without the +15% breakeven, to see what the new rule costs or saves
+    "pre_be15": PREV_SPEC,
     # the old exits on the same trade: $5 stop + breakeven, the old tightening trail, no half sell
     "old_exits": dict(max_loss=C.MAX_LOSS_PCT, be=C.BE2_TRIGGER, half_at=None, trail=C.TRAIL_STEPS),
     # the new exits without the $5 stop and the breakeven rule
@@ -945,7 +985,22 @@ def stop_for(spec, entry, peak, old, be_px):
             s = peak * (1 - dist)
     if spec.get("be") and gain >= spec["be"]:
         s = max(s, be_px or entry * C.BE_LEVEL)
+    if spec.get("be15") and gain >= spec["be15"]:
+        b = be_px or entry * C.BE_LEVEL
+        if peak >= b:   # as in the replay: armed once the trade has been up 15% AND above its breakeven price
+            s = max(s, b)
     return max(old, s)
+
+
+def spec_of(p):
+    return REAL_SPEC if ("be15" in p.keys() and p["be15"]) else PREV_SPEC
+
+
+def stop_label(p, ns, peak):
+    entry = p["entry_price"]
+    if p["be_px"] and abs(ns - p["be_px"]) < 1e-9 * ns:
+        return "breakeven (+15% rule)" if peak / entry - 1 + 1e-9 < C.BE2_TRIGGER else "breakeven"
+    return f"peak +{(peak/entry-1)*100:.0f}%"
 
 
 def alt_init(spec, px, qty, entry_ts, be_px):
@@ -957,13 +1012,16 @@ def is_v3(p):
     return "rules" in p.keys() and p["rules"] == "v3"
 
 
-def stop_reason(p, stop, gapped):
+def stop_reason(p, stop, gapped, peak=None):
+    """peak: given only for the real trade; a breakeven stop reached before +50% is the +15% rule's."""
     entry = p["entry_price"]
     if is_v3(p):
         if stop < entry:
             r = "max-loss stop"
         elif p["be_px"] and abs(stop - p["be_px"]) <= 1e-9 * stop:
             r = "breakeven stop"
+            if peak is not None and spec_of(p) is REAL_SPEC and peak / entry - 1 + 1e-9 < C.BE2_TRIGGER:
+                return r + " (+15% rule)" + (" (gapped)" if gapped else "")
         else:
             r = "trailing stop"
         return r + (" (gapped)" if gapped else "")
@@ -1082,6 +1140,48 @@ def alt_step(con, p, cs, mirror_ts, t_now, live_fill):
         a["upd"] = t_now
     n_open = sum(1 for a in alts.values() if a["st"] == "open")
     con.execute("UPDATE positions SET alts=?, alts_open=? WHERE id=?", (json.dumps(alts), n_open, p["id"]))
+    if isinstance(p, dict):
+        p["alts"], p["alts_open"] = json.dumps(alts), n_open
+
+
+def alt_quote_step(con, p, qt, qpx, mirror_ts, t_now):
+    """Comparison copies on a coin with no fresh candles: check their stop, 2x half-sell, trail and the wallet's sell on
+    the live price, the same way the real trade is checked (otherwise they would wait for candles that never come)."""
+    if not ("alts" in p.keys() and p["alts"]):
+        return
+    alts = json.loads(p["alts"]); entry = p["entry_price"]; be = p["be_px"]
+    entry_fee = (p["fee_in"] or 0) if is_live(p) else C.NETWORK_FEE_USD
+    tag = " (live price, no candles)"
+    for name, a in alts.items():
+        if a["st"] != "open" or name not in ALTS or qt <= max(a["last"] + 60, a.get("qlast") or 0):
+            continue
+        spec = ALTS[name]
+
+        def leg(ts, px, frac):
+            v, r, fee = sell_leg(p, a["q0"] * frac, px, ts, t_now)
+            a["legs"].append([ts, px, frac, v])
+
+        def done(ts, px, why):
+            leg(ts, px, a["frac"]); a["frac"] = 0.0
+            a.update(st="closed", exit_ts=ts, exit_px=px, reason=why,
+                     pnl=sum(x[3] for x in a["legs"]) - p["size_usd"] - entry_fee)
+
+        a["qlast"] = qt
+        if qt >= p["entry_ts"] + C.TIME_STOP_S:
+            done(qt, qpx, "24h time stop" + tag); continue
+        if mirror_ts and qt >= mirror_ts:
+            done(qt, qpx, "smart wallet sold" + tag); continue
+        if a["stop"] and qpx <= a["stop"]:
+            done(qt, qpx, stop_reason(p, a["stop"], False) + tag); continue
+        if spec.get("half_at") and a["frac"] == 1.0 and qpx >= entry * spec["half_at"]:
+            leg(qt, qpx, C.HALF_FRAC); a["frac"] = 1.0 - C.HALF_FRAC
+        if qpx > a["peak"]:
+            a["peak"] = qpx; a["stop"] = stop_for(spec, entry, a["peak"], a["stop"], be)
+        a["px"] = qpx
+    n_open = sum(1 for a in alts.values() if a["st"] == "open")
+    con.execute("UPDATE positions SET alts=?, alts_open=? WHERE id=?", (json.dumps(alts), n_open, p["id"]))
+    if isinstance(p, dict):
+        p["alts"], p["alts_open"] = json.dumps(alts), n_open
 
 
 def mirror_time(con, p):
@@ -1101,12 +1201,19 @@ def alt_all(con):
         if LIM["gecko"].free() < 4:
             break
         try:
-            t_now = now()
+            t_now = now(); p = dict(p)
             alts = json.loads(p["alts"])
             since = min(a["last"] for a in alts.values() if a["st"] == "open") + 60
             cs = candles_cached(p["pool"], p["mint"], int(since))
             cs = [c for c in cs if c[0] + 60 <= t_now - 20]
-            alt_step(con, p, cs, mirror_time(con, p), t_now, p["account"] in (C.ACCT_REAL, C.ACCT_REAL_SHADOW, C.ACCT_HF))
+            mts = mirror_time(con, p)
+            alt_step(con, p, cs, mts, t_now, p["account"] in (C.ACCT_REAL, C.ACCT_REAL_SHADOW, C.ACCT_HF))
+            # no fresh candles: follow the comparison copies on the live price, as the real trade was
+            if p["alts_open"] and candles_stale(max([c[0] for c in cs] or [min(a["last"] for a in json.loads(p["alts"]).values()
+                                                                               if a["st"] == "open")]), p["entry_ts"], t_now):
+                e = live_quotes([p["mint"]]).get(p["mint"])
+                if e and t_now - e[0] <= C.QUOTE_MAX_AGE_S:
+                    alt_quote_step(con, p, e[0], e[1], mts, t_now)
             con.execute("UPDATE positions SET last_update=? WHERE id=?", (t_now, p["id"]))
             con.commit()
         except Exception as ex:
@@ -1270,14 +1377,14 @@ def update_position(con, p, pool_now=None):
                 con.execute("UPDATE positions SET exit_trigger_px=?, exit_fill_src=? WHERE id=?", (stop, src, p["id"]))
             else:
                 px = o if o <= stop else (stop if c >= stop else c)
-            close_position(con, p, t, px, stop_reason(p, stop, o <= stop), **kw); return
+            close_position(con, p, t, px, stop_reason(p, stop, o <= stop, peak), **kw); return
         if v3 and not p.get("part_ts") and h >= entry * C.HALF_AT:
             take_half(con, p, t, max(o, entry * C.HALF_AT), stop, slog, t_now); p["part_ts"] = t
         if h > peak:
             peak = h
-            ns = stop_for(REAL_SPEC, entry, peak, stop, p["be_px"]) if v3 else new_stop(entry, peak, stop)
+            ns = stop_for(spec_of(p), entry, peak, stop, p["be_px"]) if v3 else new_stop(entry, peak, stop)
             if ns > stop:
-                lab = "breakeven" if v3 and p["be_px"] and abs(ns - p["be_px"]) < 1e-9 * ns else f"peak +{(peak/entry-1)*100:.0f}%"
+                lab = stop_label(p, ns, peak) if v3 else f"peak +{(peak/entry-1)*100:.0f}%"
                 slog.append([t, ns, lab]); stop = ns
         last_ts, last_px = t, c
     price_src, price_ts = "candle", ((last_ts or p["entry_ts"]) + 60)
@@ -1290,6 +1397,8 @@ def update_position(con, p, pool_now=None):
             q = e
     if q:
         qt, qpx, qsrc = q
+        if v3:
+            alt_quote_step(con, p, qt, qpx, mirror_ts, t_now)
         kw = dict(stop=stop, peak=peak, slog=slog)
         tag = f" (live {qsrc} price, no candles)"
         if t_now >= p["entry_ts"] + C.TIME_STOP_S:
@@ -1304,15 +1413,15 @@ def update_position(con, p, pool_now=None):
         if qpx <= stop:
             if v3:
                 con.execute("UPDATE positions SET exit_trigger_px=?, exit_fill_src=? WHERE id=?", (stop, "live quote " + qsrc, p["id"]))
-            close_position(con, p, qt, qpx, stop_reason(p, stop, False) + tag, **kw)
+            close_position(con, p, qt, qpx, stop_reason(p, stop, False, peak) + tag, **kw)
             con.execute("UPDATE positions SET price_src=?, price_ts=? WHERE id=?", (qsrc, qt, p["id"])); return
         if v3 and not p.get("part_ts") and qpx >= entry * C.HALF_AT:
             take_half(con, p, qt, qpx, stop, slog, t_now); p["part_ts"] = qt
         if qpx > peak:
             peak = qpx
-            ns = stop_for(REAL_SPEC, entry, peak, stop, p["be_px"]) if v3 else new_stop(entry, peak, stop)
+            ns = stop_for(spec_of(p), entry, peak, stop, p["be_px"]) if v3 else new_stop(entry, peak, stop)
             if ns > stop:
-                lab = "breakeven" if v3 and p["be_px"] and abs(ns - p["be_px"]) < 1e-9 * ns else f"peak +{(peak/entry-1)*100:.0f}% (live price)"
+                lab = (stop_label(p, ns, peak) if v3 else f"peak +{(peak/entry-1)*100:.0f}%") + " (live price)"
                 slog.append([qt, ns, lab]); stop = ns
         last_px, price_src, price_ts = qpx, qsrc, qt
     # no candle (no trades) for a long time and no live price either -> time stop at last known price
@@ -1601,6 +1710,10 @@ def main():
         manual_close(con)
     except Exception as e:   # never let it stop the scanner; it is retried at the next start
         log.warning("manual close error %s", e); con.rollback()
+    try:
+        be15_switch(con)
+    except Exception as e:   # never let it stop the scanner; it is retried at the next start
+        log.warning("+15%% breakeven switch error %s", e); con.rollback()
     log.info("scanner start (PAPER MODE ONLY - no wallet, no keys, nothing signed)")
     if C.REMOVED_ERROR:
         log.warning("removed_wallets.json could not be read (%s): no wallets removed this run", C.REMOVED_ERROR)
