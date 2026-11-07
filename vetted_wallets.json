@@ -1,21 +1,45 @@
 {
-  "_about": "Wallets found off Kolscan (GMGN smart-money board) that passed Rage's full checklist in a fresh check. The scanner treats each 'follow' entry as if it were on the Kolscan 30-day board with the record below, so it goes through the same scorecard and strict rules as every other wallet (win rate, profit, size, pace, rug-heavy check on the bot's own data, losing copies). An entry stops counting 14 days after 'checked' unless it is re-checked. 'watch' entries are notes only: they are not followed.",
-  "follow": [
-    {
-      "address": "GsbHhw9VTx7e91hBD4ewhNLNFdNiZAVzjBwgcgoG8NZJ",
-      "name": "GsbH (GMGN)",
-      "source": "GMGN smart_degen board, Nov 7 2026",
-      "checked": "2026-11-07",
-      "record": {"30": {"w": 12, "l": 9, "sol": 48.5}},
-      "note": "Fresh check from its last 20 days of GMGN activity: 12 of 21 closed coins won (57%; GMGN's own 30-day figure 52%, 7-day 69%), about +$4,360 realized (+$841 in 7 days), 1.4 new coins a day, median buy about $247, median hold about 17 hours, no sells within 60 seconds of a buy, no coin lost over half, 1 of 8 checked coins down 25%+ an hour after its buy. Coins mostly in pools of $36k to $2M. DEX mix of 28 coins: PumpSwap 19, Raydium 4, Orca 4, Meteora 1."
+ "_about": "Wallets found off Kolscan (GMGN smart-money board) that passed Rage's full checklist in a fresh check. The scanner treats each 'follow' entry as if it were on the Kolscan 30-day board with the record below, so it goes through the same scorecard and strict rules as every other wallet (win rate, profit, size, pace, rug-heavy check on the bot's own data, losing copies). An entry stops counting 14 days after 'checked' unless it is re-checked. 'watch' entries are notes only: they are not followed.",
+ "follow": [
+  {
+   "address": "GsbHhw9VTx7e91hBD4ewhNLNFdNiZAVzjBwgcgoG8NZJ",
+   "name": "GsbH (GMGN)",
+   "source": "GMGN smart_degen board, Nov 7 2026",
+   "checked": "2026-11-07",
+   "record": {
+    "30": {
+     "w": 12,
+     "l": 9,
+     "sol": 48.5
     }
-  ],
-  "watch": [
-    {
-      "address": "AnaxgqRVY7ixsjvmwpQzx39wegSRJmY15s6k6o9V9YZ",
-      "name": "Anax (GMGN)",
-      "checked": "2026-11-07",
-      "note": "Borderline: GMGN's 30-day win rate is 47.8% (under 50%), though 7-day is 62% and the fresh count was 48 of 91 (53%). Otherwise clean: +$2,288 30-day and +$2,492 7-day on GMGN, about $199 buys, holds about 20 hours, no big losses, 0 of 6 coins crashed, big pools, DEX mix PumpSwap 47, Raydium 18, Meteora 8, Orca 6. Move to 'follow' once its 30-day win rate is 50% or more."
-    }
-  ]
+   },
+   "note": "Fresh check from its last 20 days of GMGN activity: 12 of 21 closed coins won (57%; GMGN's own 30-day figure 52%, 7-day 69%), about +$4,360 realized (+$841 in 7 days), 1.4 new coins a day, median buy about $247, median hold about 17 hours, no sells within 60 seconds of a buy, no coin lost over half, 1 of 8 checked coins down 25%+ an hour after its buy. Coins mostly in pools of $36k to $2M. DEX mix of 28 coins: PumpSwap 19, Raydium 4, Orca 4, Meteora 1."
+  }
+ ],
+ "watch": [
+  {
+   "address": "AnaxgqRVY7ixsjvmwpQzx39wegSRJmY15s6k6o9V9YZ",
+   "name": "Anax (GMGN)",
+   "checked": "2026-11-07",
+   "note": "Re-checked Nov 7, 5-7 PM: still borderline. GMGN's 30-day win rate is 48.2% (under 50%); 7-day 62.8%. Fresh on-chain count 47 of 90 closed (52%) over 30 days, +$3,905 realized (+$610 last 7 days), no coin lost more than half, top coin 14% of profit, about $199 buys, about 3.8 new coins a day, holds about 20 hours, never sells inside 60 seconds, 0 of 3 checked coins crashed, DEX mix PumpSwap 47, Raydium 18, Meteora 8, Orca 6. Move to 'follow' once GMGN's 30-day rate is 50% or more."
+  },
+  {
+   "address": "4oqLr7WAC6VeLWnhDkw8QA4HFbxsT8iAgNbCXmNJzexZ",
+   "name": "4oqL (DexScreener runners)",
+   "checked": "2026-11-07",
+   "note": "Borderline. Profitable top trader on FUSE and WHITE. 120 of 213 closed (56%) over 21 days, +$4,101 realized (+$1,648 last 7 days), top coin 6% of profit, about 11 new coins a day, about $150 buys, holds about 2 hours, never sells inside 60 seconds, PumpSwap 53 / Raydium 25. Held because: 30 coins lost more than half; the rug check could only test 1 coin; 5 of its last 10 pools are under $25k (bot would skip them); GMGN says 32% of tokens it sold were never bought by this wallet (tokens moved in from other wallets). Re-check with a fuller rug test."
+  },
+  {
+   "address": "FLCC138S8d7Zf5d1XUHHZemshqPyJsgRAHxLuCznoKyy",
+   "name": "FLCC (DexScreener runners)",
+   "checked": "2026-11-07",
+   "note": "Borderline. Profitable on GATO and CBUCKS. 9 of 17 closed (53%) over 30 days, +$8,491 realized, but +$8,818 of it came in the last 7 days (older trades lost money) and one coin is 49% of profit. 1.3 new coins a day, about $199 buys, holds about 11.5 hours, 1 big loss, PumpSwap 19 / Orca 7 / Raydium 6. No coin could be rug-checked. Re-check when it has 25+ closed trades."
+  },
+  {
+   "address": "32mRYcNZJfG8gFrn9gvqusUtaWekXVAVQpkc97j5M9iT",
+   "name": "32mR (Cielo discovery)",
+   "checked": "2026-11-07",
+   "note": "Borderline. 88 of 109 closed (81%) over 20 days, +$28,937 realized (+$3,392 last 7 days), top coin 22%, about $101 buys, holds about 45 minutes. Held because: about 20 new coins and 39 buys a day (at the 40 limit); only 109 of 405 coins were ever sold, so the win rate skips the bags it kept; 6 of its last 10 pools are under $25k and it bought two coins 7-10 minutes after launch in $3k pools, one fell 87% within the hour."
+  }
+ ]
 }
