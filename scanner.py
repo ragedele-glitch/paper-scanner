@@ -843,6 +843,55 @@ def paper_reset(con):
     con.commit()
 
 
+def manual_close(con):
+    """One-time manual close (config MANUAL_CLOSE), applied once per id at scanner start. Paper only."""
+    M = getattr(C, "MANUAL_CLOSE", None)
+    if not M:
+        return
+    done = meta_get(con, "manual_closes_done", []) or []
+    if M["id"] in done:
+        return
+    t = now()
+    logbook = meta_get(con, "manual_close_log", []) or []
+    if t > M.get("expires_ts", float("inf")):
+        log.warning("MANUAL CLOSE %s expired before it could finish; nothing more closed", M["id"])
+        meta_set(con, "manual_closes_done", done + [M["id"]]); con.commit()
+        return
+    mints = list(M["mints"])
+    rows = con.execute(f"SELECT * FROM positions WHERE status='open' AND entry_ts<? AND mint IN ({','.join('?' * len(mints))}) "
+                       "ORDER BY account", [M["requested_ts"]] + mints).fetchall()
+    quotes = live_quotes([r["mint"] for r in rows]) if rows else {}
+    pending = 0
+    for r in rows:
+        p = dict(r)
+        e = quotes.get(p["mint"])
+        if not e:
+            pending += 1
+            log.warning("MANUAL CLOSE [acct %d] %s: no live price, not closed (retried next start)", p["account"], p["symbol"])
+            continue
+        qt, px, src = e
+        part = p.get("part_proceeds") or 0
+        fee_in = (p.get("fee_in") or 0) if is_live(p) else C.NETWORK_FEE_USD
+        est = fills.position_value(p, px) + part - p["size_usd"] - fee_in
+        if M.get("only_if_loss") and est >= 0:
+            log.info("MANUAL CLOSE [acct %d] %s left open: in profit at the live %s price %.10g (est $%+.2f)",
+                     p["account"], p["symbol"], src, px, est)
+            logbook.append([t, M["id"], p["id"], p["account"], p["symbol"], px, src, "left open (in profit)", est])
+            continue
+        slog = json.loads(p["stop_log"] or "[]")
+        slog.append([qt, p["stop"], f"closed manually by Rage at the live {src} price"])
+        close_position(con, p, qt, px, f"closed manually by Rage (live {src} price)", stop=p["stop"], peak=p["peak"], slog=slog)
+        con.execute("UPDATE positions SET price_src=?, price_ts=? WHERE id=?", (src, qt, p["id"]))
+        got = con.execute("SELECT pnl_usd FROM positions WHERE id=?", (p["id"],)).fetchone()[0]
+        log.info("MANUAL CLOSE [acct %d] %s closed at the live %s price %.10g, pnl $%+.2f", p["account"], p["symbol"], src, px, got)
+        logbook.append([t, M["id"], p["id"], p["account"], p["symbol"], px, src, "closed", got])
+    meta_set(con, "manual_close_log", logbook[-50:])
+    if not pending:
+        meta_set(con, "manual_closes_done", done + [M["id"]])
+        log.info("MANUAL CLOSE %s done (%d open trades checked)", M["id"], len(rows))
+    con.commit()
+
+
 def account_state(con, account=C.ACCT_5S):
     cash = meta_get(con, cash_key(account), C.START_EQUITY)
     opens = con.execute("SELECT * FROM positions WHERE account=? AND status='open'", (account,)).fetchall()
@@ -1531,6 +1580,10 @@ def main():
     if meta_get(con, "hf_start_ts") is None:   # rug-filter shadow test account: judged on new trades only
         meta_set(con, "hf_start_ts", now()); meta_set(con, "cash_hf", C.START_EQUITY); con.commit()
     paper_reset(con)
+    try:
+        manual_close(con)
+    except Exception as e:   # never let it stop the scanner; it is retried at the next start
+        log.warning("manual close error %s", e); con.rollback()
     log.info("scanner start (PAPER MODE ONLY - no wallet, no keys, nothing signed)")
     if C.REMOVED_ERROR:
         log.warning("removed_wallets.json could not be read (%s): no wallets removed this run", C.REMOVED_ERROR)

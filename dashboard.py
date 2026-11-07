@@ -36,6 +36,8 @@ EXITS = {
     "max-loss stop": "$5 max-loss stop hit", "max-loss stop (gapped)": "$5 max-loss stop hit (price jumped past it)",
     "breakeven stop": "Breakeven stop hit (winner closed at no loss)",
     "breakeven stop (gapped)": "Breakeven stop hit (price jumped past it)",
+    "closed manually by Rage (live jupiter price)": "Closed manually by Rage (live Jupiter price)",
+    "closed manually by Rage (live dexscreener price)": "Closed manually by Rage (live DexScreener price)",
 }
 ALT_NAMES = {"old_exits": "Old exits (no half sell, old tightening trail)",
              "no_stop_be": "New exits without the $5 stop and breakeven"}
@@ -43,8 +45,9 @@ ALT_NAMES = {"old_exits": "Old exits (no half sell, old tightening trail)",
 
 def exit_compare(con, acct):
     """New exits vs the comparison copies on the same finished trades (v3 trades where every copy has finished)."""
-    rows = con.execute("SELECT pnl_usd, alts, alts_open, part_ts FROM positions WHERE account=? AND status='closed' AND rules='v3'",
-                       (acct,)).fetchall()
+    # manual closes are left out: they say nothing about which exit rules work better
+    rows = con.execute("SELECT pnl_usd, alts, alts_open, part_ts FROM positions WHERE account=? AND status='closed' AND rules='v3' "
+                       "AND COALESCE(exit_reason,'') NOT LIKE 'closed manually%'", (acct,)).fetchall()
     done = [r for r in rows if not r[2] and r[1]]
     out = {"n": len(done), "waiting": len(rows) - len(done), "new": {"pnl": sum(r[0] for r in done),
            "wins": sum(1 for r in done if r[0] > 0), "losses": sum(1 for r in done if r[0] <= 0)},

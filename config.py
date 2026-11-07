@@ -75,6 +75,16 @@ ACCT_HF = 21
 # archived in the paper_resets table, every closed trade stays in the database (wallet leaderboard, exit comparison
 # and wallet scorecard still use all of them), and the account cards and report count trades closed from the reset on.
 PAPER_RESET = {"id": "2026-11-07-200", "accounts": [ACCT_REAL, ACCT_5S]}   # realistic $200 account and the old 5 s test
+# One-time manual close (Rage asked Nov 7, 2026 at 11:26 AM Lagos: "close any one in loss"). The scanner applies it
+# once, at its next start, on its own saved database (the same way as the reset above, so a running copy can't overwrite
+# it): every paper trade in these coins that was already open at the request time, on every paper account holding it, is
+# sold at the live market price (Jupiter, DexScreener backup) with the bot's normal paper costs, reason "closed manually
+# by Rage". only_if_loss: a trade that has moved into profit by then is left open and logged. A trade with no live price
+# is never closed on a made-up one: it is retried at the next start until expires_ts, then dropped.
+MANUAL_CLOSE = {"id": "2026-11-07-rage-close-losers", "requested_ts": 1794047160.0,   # Sat Nov 7, 10:26 UTC
+                "expires_ts": 1794047160.0 + 12 * 3600, "only_if_loss": True,
+                "mints": {"BSe1q3SL6KQPLeZHFG9nNw5VFbDL3ZXvBmtjBVpYpump": "SMOOVE",
+                          "CFYhdWXsYfS7swnJgHRwb5toTHMEQD7Ljd5gGwKLpump": "KILROY"}}
 HF_TOP10_MAX = 22.0
 HF_RT_MAX = 20.0
 SLIPPAGE = 0.03             # 3% worse price on every buy and every sell
