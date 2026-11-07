@@ -35,13 +35,16 @@ def _lag(con, where, args):
 def _acct(con, acct, cash_key, t0):
     meta = {r[0]: json.loads(r[1]) for r in _q(con, "SELECT key,value FROM meta")}
     cash = meta.get(cash_key, C.START_EQUITY)
+    sess = (meta.get("session_ts") or {}).get(str(acct)) or 0   # paper balance reset: count from the reset on
+    if sess:
+        t0 = sess
     opens = _q(con, "SELECT qty,last_price,size_usd,fill_model,r_sell_est,fee_in FROM positions WHERE account=? AND status='open'", (acct,))
     import fills
     ov = sum(fills.position_value(dict(qty=o[0], fill_model=o[3], r_sell_est=o[4], fee_in=o[5]), o[1] or 0) for o in opens)
-    closed = _q(con, "SELECT pnl_usd FROM positions WHERE account=? AND status='closed'", (acct,))
+    closed = _q(con, "SELECT pnl_usd FROM positions WHERE account=? AND status='closed' AND COALESCE(exit_ts,0)>=?", (acct, sess))
     wins = sum(1 for c in closed if c[0] > 0)
     eq = cash + ov
-    return (f"${eq:.2f} ({(eq / C.START_EQUITY - 1) * 100:+.2f}% from $200 since {time.strftime('%a %b %d %H:%M', time.gmtime(t0 + 3600))} Lagos), "
+    return (f"${eq:.2f} ({(eq / C.START_EQUITY - 1) * 100:+.2f}% from $200 {'reset' if sess else 'since'} {time.strftime('%a %b %d %H:%M', time.gmtime(t0 + 3600))} Lagos), "
             f"{len(closed)} closed ({wins} won, realised ${sum(c[0] for c in closed):+.2f}), {len(opens)} open")
 
 

@@ -238,7 +238,12 @@ def build_state():
     real_start = meta.get("real_start_ts")
     start_ts = meta.get("start_ts", now)
 
+    sessions = meta.get("session_ts") or {}
+
     def account_view(acct, cash, eq_table, t0):
+        sess = sessions.get(str(acct)) or 0   # paper balance reset: count from the reset on (old trades stay in the db)
+        if sess:
+            t0 = sess
         opens = q("SELECT * FROM positions WHERE account=? AND status='open' ORDER BY entry_ts DESC", (acct,))
         open_rows = []; open_val = 0.0
         for p in opens:
@@ -257,7 +262,7 @@ def build_state():
                 "price_age": now - (p["last_update"] or p["entry_ts"]),
             })
         equity = cash + open_val
-        curve = [(t0, C.START_EQUITY)] + [(r["ts"], r["equity"]) for r in q(f"SELECT ts,equity FROM {eq_table} ORDER BY ts")]
+        curve = [(t0, C.START_EQUITY)] + [(r["ts"], r["equity"]) for r in q(f"SELECT ts,equity FROM {eq_table} WHERE ts>=? ORDER BY ts", (t0 or 0,))]
         curve.append((now, equity)); curve.sort()
         peak = -1e18; mdd = 0.0; mdd_usd = 0.0
         for _, v in curve:
@@ -265,7 +270,7 @@ def build_state():
             if peak > 0 and (peak - v) / peak > mdd:
                 mdd = (peak - v) / peak; mdd_usd = peak - v
         hist = []
-        for c in q("SELECT * FROM positions WHERE account=? AND status='closed' ORDER BY exit_ts DESC", (acct,)):
+        for c in q("SELECT * FROM positions WHERE account=? AND status='closed' AND COALESCE(exit_ts,0)>=? ORDER BY exit_ts DESC", (acct, sess)):
             hist.append({"coin": c["symbol"] or short(c["mint"]), "mint": short(c["mint"]), "wallet": names.get(c["leader"]) or short(c["leader"]),
                          "entry_ts": c["entry_ts"], "exit_ts": c["exit_ts"], "entry_price": c["entry_price"], "exit_price": c["exit_price"],
                          "size": c["size_usd"], "pnl": c["pnl_usd"], "pnl_pct": c["pnl_pct"],
@@ -286,7 +291,8 @@ def build_state():
                "change_pct": (equity / C.START_EQUITY - 1) * 100, "change_usd": equity - C.START_EQUITY,
                "mdd_pct": mdd * 100, "mdd_usd": mdd_usd, "curve": curve[-600:], "n_open": len(open_rows),
                "max_open": C.MAX_OPEN, "closed": len(hist), "wins": len(wins),
-               "win_rate": (len(wins) / len(hist) * 100) if hist else None, "total_pnl": sum(h["pnl"] for h in hist)}
+               "win_rate": (len(wins) / len(hist) * 100) if hist else None, "total_pnl": sum(h["pnl"] for h in hist),
+               "reset_ts": sess or None}
         return acc, open_rows, hist
 
     if real_start:

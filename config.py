@@ -69,6 +69,12 @@ ACCT_5S, ACCT_5S_SHADOW = 1, 0         # the same two, entering 5 s after the sm
 #  2. round trip at entry (buy then sell back, real quote at the trade's size) of HF_RT_MAX % or more
 #     (backtest Nov 7: only PVE 30.2% and PAMPIT 20.4% were that high, both losers; no winner above 15.7%)
 ACCT_HF = 21
+# One-time paper balance reset (Rage asked Nov 7, 2026). The scanner applies it once, at its next start, on its own
+# saved database, so a running copy can't overwrite it. Each listed $200 paper account goes back to $200 equity
+# (still-open paper trades keep running and count inside the $200). Nothing is deleted: the old session's totals are
+# archived in the paper_resets table, every closed trade stays in the database (wallet leaderboard, exit comparison
+# and wallet scorecard still use all of them), and the account cards and report count trades closed from the reset on.
+PAPER_RESET = {"id": "2026-11-07-200", "accounts": [ACCT_REAL, ACCT_5S]}   # realistic $200 account and the old 5 s test
 HF_TOP10_MAX = 22.0
 HF_RT_MAX = 20.0
 SLIPPAGE = 0.03             # 3% worse price on every buy and every sell

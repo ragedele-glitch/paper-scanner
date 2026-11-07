@@ -145,6 +145,9 @@ CREATE TABLE IF NOT EXISTS equity(ts REAL PRIMARY KEY, cash REAL, open_value REA
 CREATE TABLE IF NOT EXISTS heartbeat(ts REAL PRIMARY KEY, polled INT, rpc_mb REAL, note TEXT);
 CREATE TABLE IF NOT EXISTS equity_real(ts REAL PRIMARY KEY, cash REAL, open_value REAL, equity REAL, n_open INT);
 CREATE TABLE IF NOT EXISTS equity_hf(ts REAL PRIMARY KEY, cash REAL, open_value REAL, equity REAL, n_open INT);
+CREATE TABLE IF NOT EXISTS paper_resets(reset_id TEXT, ts REAL, account INT, session_since REAL, cash_before REAL,
+  open_value_before REAL, equity_before REAL, n_open INT, closed INT, wins INT, realised REAL, cash_after REAL,
+  PRIMARY KEY(reset_id, account));
 """
 MIGRATIONS = [
     "ALTER TABLE signals ADD COLUMN detect_src TEXT",      # 'stream' (live feed) or 'poll' (holdings re-read)
@@ -803,6 +806,38 @@ def open_position(con, sid, account, mint, sym, pool, leader, entry_ts, px, src,
                     tuple(fill[c] for c in cols) + (cur.lastrowid,))
 
 
+def paper_reset(con):
+    """One-time paper balance reset (config PAPER_RESET), applied once per reset id. Paper only."""
+    R = getattr(C, "PAPER_RESET", None)
+    if not R:
+        return
+    done = meta_get(con, "paper_resets_done", []) or []
+    if R["id"] in done:
+        return
+    t = now()
+    curve = {C.ACCT_5S: "equity", C.ACCT_REAL: "equity_real", C.ACCT_HF: "equity_hf"}
+    start = {C.ACCT_5S: "start_ts", C.ACCT_REAL: "real_start_ts", C.ACCT_HF: "hf_start_ts"}
+    sessions = meta_get(con, "session_ts", {}) or {}
+    for acct in R["accounts"]:
+        st = account_state(con, acct)
+        since = sessions.get(str(acct)) or meta_get(con, start[acct]) or 0
+        n, w, pnl = con.execute("SELECT COUNT(*), COALESCE(SUM(pnl_usd>0),0), COALESCE(SUM(pnl_usd),0) FROM positions "
+                                "WHERE account=? AND status='closed' AND COALESCE(exit_ts,0)>=?", (acct, since)).fetchone()
+        cash_after = C.START_EQUITY - st["open_value"]
+        con.execute("INSERT OR REPLACE INTO paper_resets VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (R["id"], t, acct, since, st["cash"], st["open_value"], st["equity"], st["n_open"], n, w, pnl, cash_after))
+        meta_set(con, cash_key(acct), cash_after)
+        con.execute(f"INSERT OR REPLACE INTO {curve[acct]} VALUES(?,?,?,?,?)",
+                    (t, cash_after, st["open_value"], C.START_EQUITY, st["n_open"]))
+        sessions[str(acct)] = t
+        log.info("PAPER RESET [acct %d] equity $%.2f -> $%.2f (cash $%.2f -> $%.2f, %d open worth $%.2f kept); "
+                 "old session archived: %d closed, %d won, $%+.2f", acct, st["equity"], C.START_EQUITY, st["cash"],
+                 cash_after, st["n_open"], st["open_value"], n, w, pnl)
+    meta_set(con, "session_ts", sessions)
+    meta_set(con, "paper_resets_done", done + [R["id"]])
+    con.commit()
+
+
 def account_state(con, account=C.ACCT_5S):
     cash = meta_get(con, cash_key(account), C.START_EQUITY)
     opens = con.execute("SELECT * FROM positions WHERE account=? AND status='open'", (account,)).fetchall()
@@ -1403,6 +1438,7 @@ def main():
         meta_set(con, "board_ts", 0); meta_set(con, "card_v", 1); con.commit()
     if meta_get(con, "hf_start_ts") is None:   # rug-filter shadow test account: judged on new trades only
         meta_set(con, "hf_start_ts", now()); meta_set(con, "cash_hf", C.START_EQUITY); con.commit()
+    paper_reset(con)
     log.info("scanner start (PAPER MODE ONLY - no wallet, no keys, nothing signed)")
     if C.REMOVED_ERROR:
         log.warning("removed_wallets.json could not be read (%s): no wallets removed this run", C.REMOVED_ERROR)
