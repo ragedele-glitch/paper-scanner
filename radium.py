@@ -195,6 +195,8 @@ def db():
         con.execute("ALTER TABLE trades ADD COLUMN timing TEXT")
     except sqlite3.OperationalError:
         pass
+    # Nov 8: the wallet's exact total over time, for the page's 48 h balance chart (display only)
+    con.execute("CREATE TABLE IF NOT EXISTS wallet_hist (ts REAL PRIMARY KEY, total_usd REAL, sol REAL, sol_px REAL)")
     return con
 
 
@@ -1003,6 +1005,18 @@ class Bot:
 
     def refresh_wallet_view(self):
         """Display only: re-reads the wallet every 30 s (token list every 90 s), in a background thread."""
+        wd, wts = WALLET_VIEW.get("data"), WALLET_VIEW.get("ts")
+        if wd and wts and wts != getattr(self, "_wh_ts", None):       # balance history, one point per 5 min
+            self._wh_ts = wts
+            try:
+                last = self.con.execute("SELECT MAX(ts) FROM wallet_hist").fetchone()[0] or 0
+                if wts - last >= 300:
+                    self.con.execute("INSERT OR REPLACE INTO wallet_hist VALUES (?,?,?,?)",
+                                     (wts, wd.get("total_usd"), wd.get("sol"), wd.get("sol_px")))
+                    self.con.execute("DELETE FROM wallet_hist WHERE ts<?", (wts - 7 * 86400,))
+                    self.con.commit(); DIRTY[0] = True
+            except Exception as e:
+                log(f"wallet history: {e}")
         if not WALLET["address"] or WALLET_VIEW["busy"] or time.time() - (WALLET_VIEW.get("tried") or 0) < 30:
             return
         WALLET_VIEW["busy"] = True; WALLET_VIEW["tried"] = time.time()
@@ -1477,6 +1491,53 @@ class Bot:
         except Exception as e:
             return {"err": type(e).__name__}
 
+    def activity48(self):
+        """Read-only 48 h charts for the page: Radium's engine awake share per hour (same as the Rage Meme Bot page's
+        bar), signals seen / passed per hour, Radium's own buys, skips and sells per hour, and the wallet's total."""
+        t = time.time()
+        end_h = int(t // 3600)
+        hours = list(range(end_h - 47, end_h + 1))
+        out = {"hours": [], "uptime": None, "balance": []}
+        cnt = {h: {"h": h * 3600, "sig": 0, "pass": 0, "buy": 0, "skip": 0, "sell": 0} for h in hours}
+        if os.path.exists(SCANNER_DB):
+            sc = sqlite3.connect(f"file:{SCANNER_DB}?mode=ro", uri=True, timeout=5)
+            try:
+                beats = [r[0] for r in sc.execute("SELECT ts FROM heartbeat WHERE ts>?", (t - 48 * 3600,))]
+                mins = {int(x // 60) for x in beats}
+                cov = lambda m: m in mins or (m - 1) in mins
+                first = min(beats) if beats else t
+                cells = []
+                for h in hours:
+                    ms = range(h * 60, min((h + 1) * 60, int(t // 60) + 1))
+                    cells.append({"h": h * 3600, "pct": round(100 * sum(1 for m in ms if cov(m)) / max(1, len(ms))),
+                                  "before": (h + 1) * 3600 <= first})
+                def share(sec):
+                    ms = range(int((t - sec) // 60), int(t // 60) + 1)
+                    return round(100 * sum(1 for m in ms if cov(m)) / len(ms), 1)
+                out["uptime"] = {"h24": share(86400), "h48": share(48 * 3600), "cells": cells, "first": first}
+                for ts, st in sc.execute("SELECT detected_ts, status FROM signals WHERE detected_ts>?",
+                                         (t - 48 * 3600,)):
+                    c = cnt.get(int(ts // 3600))
+                    if c:
+                        c["sig"] += 1; c["pass"] += 1 if st == "survivor" else 0
+            except Exception as e:
+                out["err"] = f"{type(e).__name__}: {str(e)[:100]}"
+            finally:
+                sc.close()
+        for ts, st, xt in self.con.execute("""SELECT created_ts, status, exit_ts FROM trades WHERE mode NOT LIKE 'old-%'
+                                              AND (created_ts>? OR exit_ts>?)""", (t - 48 * 3600, t - 48 * 3600)):
+            c = cnt.get(int(ts // 3600))
+            if c:
+                c["skip" if st == "skipped" else "buy"] += 1
+            if xt:
+                c = cnt.get(int(xt // 3600))
+                if c:
+                    c["sell"] += 1
+        out["hours"] = [cnt[h] for h in hours]
+        out["balance"] = [[r[0], r[1]] for r in self.con.execute(
+            "SELECT ts, total_usd FROM wallet_hist WHERE ts>? AND total_usd IS NOT NULL ORDER BY ts", (t - 48 * 3600,))]
+        return out
+
     def speed(self):
         """Read-only speed numbers for the page, from Radium's own engine and its own trades: live-feed uptime and
         dropouts, how fast wallet buys are seen (live feed vs backup), and Radium's own steps per trade
@@ -1520,7 +1581,7 @@ class Bot:
                 except Exception:
                     fm = {}
                 fm = fm if isinstance(fm, dict) else {}
-                out["feed"] = {"connected": bool(fm.get("connected")) and t - (fm.get("ts") or 0) < 120,
+                out["feed"] = {"connected": bool(fm.get("connected")),   # same reading as the Bot status card
                                "helius": "helius" in str(fm.get("url") or ""),
                                "share_24h": round(100 * sum(1 for b in beats if b == 1) / len(beats)) if beats else None,
                                "checkins_24h": len(beats), "drops_24h": drops, "reconnects": fm.get("reconnects"),
@@ -1766,6 +1827,10 @@ class Bot:
         except Exception as e:
             spd = {"err": f"{type(e).__name__}: {str(e)[:160]}"}
         per = spd.pop("per", {}) or {}
+        try:
+            act48 = self.activity48()
+        except Exception as e:
+            act48 = {"err": f"{type(e).__name__}: {str(e)[:160]}"}
         wv = WALLET_VIEW
 
         def tr(r):
@@ -1807,6 +1872,7 @@ class Bot:
               "unmanaged_tokens": meta_get(self.con, "unmanaged_tokens", 0),
               "engine": self.engine_info(),
               "speed": spd,
+              "act48": act48,
               # every coin in the wallet, dust included (display only; the address itself is never written)
               "wallet": {"ts": wv["ts"], "err": wv["err"], **(wv["data"] or {})} if WALLET["address"] else None,
               "page": {k: v for k, v in px_extra.items() if k != "names"}}
