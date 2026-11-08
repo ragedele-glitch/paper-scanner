@@ -661,6 +661,26 @@ def col(row, k):
         return None
 
 
+PAGE_START_USD = float(os.environ.get("RADIUM_PAGE_START_USD", "80") or 80)   # dry run: would-be balance starts at the planned funding
+try:
+    from dashboard import FILTERS as DFILT
+except Exception:
+    DFILT = {}
+
+
+def short_addr(a):
+    return (a[:4] + "…" + a[-4:]) if a and len(a) > 10 else (a or "")
+
+
+def _kill_counts(sc, since):
+    n = {}
+    for (k,) in sc.execute("SELECT killed_by FROM signals WHERE status='killed' AND detected_ts>?", (since,)):
+        for x in (k or "").split(","):
+            if x:
+                n[x] = n.get(x, 0) + 1
+    return n
+
+
 def lagos_day_start(t=None):
     t = t or time.time()
     return (t + LAGOS) // 86400 * 86400 - LAGOS
@@ -1292,12 +1312,117 @@ class Bot:
                 self._pub_busy = False
         threading.Thread(target=go, name="page", daemon=True).start()
 
+    def page_extras(self):
+        """Read-only extras for the page so it can match the Rage Meme Bot dashboard: the engine's signals (with what
+        Radium did about each), the wallets with their results, and the would-be value curve. Nothing here trades."""
+        out = {"start_usd": PAGE_START_USD, "fnames": DFILT}
+        mode = S["mode"]
+        cl = self.con.execute("""SELECT exit_ts, pnl_usd, stake_usd, symbol FROM trades WHERE status='closed' AND mode=?
+                                 AND exit_ts IS NOT NULL ORDER BY exit_ts""", (mode,)).fetchall()
+        cum, curve = 0.0, []
+        for r in cl:
+            cum += r[1] or 0
+            curve.append([r[0], round(cum, 4)])
+        out["curve"] = curve[-400:]
+        pn = [((r[1] or 0) / r[2] * 100 if r[2] else 0, r[1] or 0, r[3]) for r in cl]
+        out["best"] = max(pn) if pn else None
+        out["worst"] = min(pn) if pn else None
+        fe = self.con.execute("""SELECT COALESCE(SUM(fee_in_usd),0)+COALESCE(SUM(fee_out_usd),0), AVG(impact_pct),
+                                 AVG(CASE WHEN paper_entry_px>0 AND entry_px>0 THEN (entry_px/paper_entry_px-1)*100 END),
+                                 AVG(lag_s), COALESCE(SUM(stake_usd),0) FROM trades WHERE mode=? AND status IN ('open','closing','closed')""",
+                              (mode,)).fetchone()
+        out["costs"] = {"fees": fe[0], "impact": fe[1], "slip": fe[2], "lag": fe[3], "staked": fe[4]}
+        per = {}
+        for r in self.con.execute("""SELECT leader, status, pnl_usd FROM trades WHERE mode=? AND status IN ('open','closing','closed','skipped')""", (mode,)):
+            d = per.setdefault(r[0], {"closed": 0, "wins": 0, "pnl": 0.0, "open": 0, "skipped": 0})
+            if r[1] == "closed":
+                d["closed"] += 1; d["pnl"] += r[2] or 0; d["wins"] += 1 if (r[2] or 0) > 0 else 0
+            elif r[1] == "skipped":
+                d["skipped"] += 1
+            else:
+                d["open"] += 1
+        if not os.path.exists(SCANNER_DB):
+            out["wallets"] = [dict(name=short_addr(k), addr=short_addr(k), **v) for k, v in per.items()]
+            return out
+        sc = sqlite3.connect(f"file:{SCANNER_DB}?mode=ro", uri=True, timeout=5)
+        sc.row_factory = sqlite3.Row
+        try:
+            t = time.time()
+            names = {r["address"]: r["name"] for r in sc.execute("SELECT address, name FROM wallets")}
+            out["names"] = names
+            # what Radium did with each engine position (by the engine position id)
+            did = {r[0]: (r[1], r[2], r[3], r[4]) for r in self.con.execute(
+                "SELECT paper_id, status, notes, pnl_usd, mode FROM trades WHERE mode NOT LIKE 'old-%'")}
+            pos = {}
+            try:
+                for r in sc.execute("SELECT id, signal_id FROM positions WHERE account=?", (C.ACCT_REAL,)):
+                    pos[r[1]] = r[0]
+            except Exception:
+                pass
+            sigs = []
+            for r in sc.execute("SELECT * FROM signals ORDER BY id DESC LIMIT 200"):
+                r = dict(r)
+                st, notes = r.get("status"), r.get("notes") or ""
+                if st == "survivor":
+                    pid = pos.get(r["id"])
+                    d = did.get(pid) if pid else None
+                    if d is None:
+                        v, lab = "passed", "Passed the filters, Radium didn't buy" + (f": {notes[:90]}" if notes else "")
+                    elif d[0] == "skipped":
+                        v, lab = "skip", "Passed the filters, Radium skipped: " + (d[1] or "")
+                    else:
+                        v, lab = "copied", ("Bought" if d[3] == "live" else "Would buy (dry run)") + (
+                            f", closed {'+' if (d[2] or 0) >= 0 else '-'}${abs(d[2] or 0):.2f}" if d[0] == "closed" else ", open")
+                elif st == "killed":
+                    v = "killed"
+                    lab = "Blocked: " + "; ".join(DFILT.get(k, k) for k in (r.get("killed_by") or "").split(",") if k)
+                elif st == "repeat":
+                    v, lab = "skip", "Skipped: same coin already seen today"
+                elif st == "missed":
+                    v, lab = "skip", "Skipped: spotted too late to copy"
+                else:
+                    v = "ignored"
+                    lab = "Not a real buy: " + ({"no DEX market (airdrop/spam/unlisted)": "airdrop or spam coin with no market",
+                                                 "received by transfer, not bought": "coins were sent to the wallet, not bought"}.get(notes)
+                                                or ("buy too small to matter" if notes.startswith("leader bag only") else notes[:80] or "unknown"))
+                sigs.append({"ts": r.get("detected_ts"), "wallet": r.get("wallet_name") or short_addr(r.get("wallet")),
+                             "coin": r.get("symbol") or short_addr(r.get("mint")), "mint": short_addr(r.get("mint")),
+                             "verdict": v, "label": lab, "liq": r.get("liq_usd"), "h1": r.get("h1_pct"), "lag": r.get("detect_lag_s"),
+                             "p1h": r.get("p1h"), "p24h": r.get("p24h"), "holders": r.get("holders"), "rt": r.get("rt_pct")})
+            out["signals"] = sigs
+            out["sig_counts"] = {k: v for k, v in sc.execute(
+                "SELECT status, COUNT(*) FROM signals WHERE detected_ts>? GROUP BY status", (meta_get(self.con, "since", t) or t,))}
+            out["filters"] = [[DFILT.get(k, k), n] for k, n in sorted(
+                ((k, n) for k, n in _kill_counts(sc, meta_get(self.con, "since", t) or t).items()), key=lambda x: -x[1])][:12]
+            ws = []
+            seen = {}
+            for r in sc.execute("""SELECT wallet, COUNT(*), SUM(status='survivor'), SUM(status='killed') FROM signals
+                                   WHERE detected_ts>? AND status!='ignored' GROUP BY wallet""", (t - 7 * 86400,)):
+                seen[r[0]] = (r[1], r[2] or 0, r[3] or 0)
+            for r in sc.execute("SELECT * FROM wallets WHERE active=1 ORDER BY COALESCE(last_rank, 999), name"):
+                r = dict(r); a = r["address"]
+                d = per.get(a, {"closed": 0, "wins": 0, "pnl": 0.0, "open": 0, "skipped": 0})
+                sn = seen.get(a, (0, 0, 0))
+                ws.append({"name": r.get("name") or short_addr(a), "addr": short_addr(a), "rank": r.get("last_rank"),
+                           "k_pnl": r.get("pnl_usd"), "k_wins": r.get("wins"), "k_losses": r.get("losses"),
+                           "every_s": r.get("poll_s"), "last_check": r.get("last_poll"),
+                           "sig_7d": sn[0], "pass_7d": sn[1], "kill_7d": sn[2], **d})
+            out["wallets"] = ws
+        finally:
+            sc.close()
+        return out
+
     def write_status(self):
         if not self.con:
             return
         self.last_status = time.time()
         ctl = control()
         rows = [dict(r) for r in self.con.execute("SELECT * FROM trades WHERE mode NOT LIKE 'old-%' ORDER BY id DESC LIMIT 60")]
+        try:
+            px_extra = self.page_extras()
+        except Exception as e:
+            px_extra = {"err": str(e)[:160]}
+        names = px_extra.get("names") or {}
         def tr(r):
             ui = int(r["tokens"] or 0) / 10 ** (r["decimals"] or 0) if r["decimals"] is not None else 0
             val = ui * (r["last_px"] or 0)
@@ -1307,7 +1432,13 @@ class Bot:
                     "now_px": r["last_px"], "value": val, "half_usd": r["half_usd"], "exit_usd": r["exit_usd"],
                     "exit_ts": r["exit_ts"], "reason": r["exit_reason"], "pnl": r["pnl_usd"], "paper_pnl": r["paper_pnl"],
                     "paper_reason": r["paper_exit_reason"], "paper_size": r["paper_size"], "note": r["notes"] or r["buy_note"],
-                    "err": r["last_err"], "tries": r["sell_tries"], "stop": r["gstop"] or r["paper_stop"]}
+                    "err": r["last_err"], "tries": r["sell_tries"], "stop": r["gstop"] or r["paper_stop"],
+                    # extra detail for the page (same cards as the Rage Meme Bot page)
+                    "id": r["id"], "mint": r["mint"], "leader": names.get(r["leader"]) or short_addr(r["leader"]),
+                    "qty": ui, "mid": r["mid_px"], "peak": r["peak"] or r["paper_peak"], "be": r["paper_be"],
+                    "floor": r["paper_floor"], "fee_in": r["fee_in_usd"], "fee_out": r["fee_out_usd"], "half_ts": r["half_ts"],
+                    "sol_in": r["sol_in"], "px_ts": r["last_px_ts"], "paper_entry_ts": r["paper_entry_ts"],
+                    "qty0": int(r["tokens0"] or 0) / 10 ** (r["decimals"] or 0) if r["decimals"] is not None and r["tokens0"] else None}
         closed = [r for r in rows if r["status"] == "closed"]
         allc = self.con.execute("SELECT COUNT(*), COALESCE(SUM(pnl_usd),0), COALESCE(SUM(paper_pnl),0), SUM(pnl_usd>0) FROM trades WHERE status='closed' AND mode=?", (S["mode"],)).fetchone()
         nskip = self.con.execute("SELECT COUNT(*) FROM trades WHERE status='skipped' AND mode NOT LIKE 'old-%'").fetchone()[0]
@@ -1328,7 +1459,8 @@ class Bot:
               "skipped": [tr(r) for r in rows if r["status"] == "skipped"][:15],
               "events": [dict(e) for e in self.con.execute("SELECT ts,kind,msg FROM events ORDER BY id DESC LIMIT 40")],
               "unmanaged_tokens": meta_get(self.con, "unmanaged_tokens", 0),
-              "engine": self.engine_info()}
+              "engine": self.engine_info(),
+              "page": {k: v for k, v in px_extra.items() if k != "names"}}
         tmp = STATUS + ".tmp"
         with open(tmp, "w") as f:
             f.write(scrub(json.dumps(st, default=str)))
