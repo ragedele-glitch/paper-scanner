@@ -41,21 +41,7 @@ jobs:
       LIVE_MAX_SIGNAL_AGE_S: ${{ vars.LIVE_MAX_SIGNAL_AGE_S }}
       LIVE_MAX_WALLET_USD: ${{ vars.LIVE_MAX_WALLET_USD }}
       LIVE_KILL: ${{ vars.LIVE_KILL }}
-      # Rage Radium Bot (real-money copy of the main account). RADIUM_MODE: dry-run (default), live, off.
-      RADIUM_MODE: ${{ vars.RADIUM_MODE }}
-      RADIUM_WALLET_ADDRESS: ${{ secrets.RADIUM_WALLET_ADDRESS }}
-      RADIUM_MAX_LOSS_USD: ${{ vars.RADIUM_MAX_LOSS_USD }}
-      RADIUM_MAX_STAKE_USD: ${{ vars.RADIUM_MAX_STAKE_USD }}
-      RADIUM_MIN_STAKE_USD: ${{ vars.RADIUM_MIN_STAKE_USD }}
-      RADIUM_MAX_OPEN: ${{ vars.RADIUM_MAX_OPEN }}
-      RADIUM_DAILY_LOSS_USD: ${{ vars.RADIUM_DAILY_LOSS_USD }}
-      RADIUM_TOTAL_LOSS_USD: ${{ vars.RADIUM_TOTAL_LOSS_USD }}
-      RADIUM_BUY_SLIPPAGE_BPS: ${{ vars.RADIUM_BUY_SLIPPAGE_BPS }}
-      RADIUM_SELL_SLIPPAGE_BPS: ${{ vars.RADIUM_SELL_SLIPPAGE_BPS }}
-      RADIUM_MAX_IMPACT_PCT: ${{ vars.RADIUM_MAX_IMPACT_PCT }}
-      RADIUM_MAX_LAG_S: ${{ vars.RADIUM_MAX_LAG_S }}
-      RADIUM_PRIORITY_MAX_LAMPORTS: ${{ vars.RADIUM_PRIORITY_MAX_LAMPORTS }}
-      RADIUM_FEE_RESERVE_SOL: ${{ vars.RADIUM_FEE_RESERVE_SOL }}
+      # Rage Radium Bot runs in its own workflow since Nov 8 (radium.yml), with its own signal engine and its own page.
     steps:
       - uses: actions/checkout@v4
         with:
@@ -83,7 +69,6 @@ jobs:
           LIVE_WALLET_KEY: ${{ secrets.LIVE_WALLET_KEY }}
           LIVE_RPC_URL: ${{ secrets.LIVE_RPC_URL }}
           JUP_API_KEY: ${{ secrets.JUP_API_KEY }}
-          RADIUM_WALLET_KEY: ${{ secrets.RADIUM_WALLET_KEY }}
       - name: Save state 1
         if: always()
         uses: actions/cache/save@v4
@@ -97,7 +82,6 @@ jobs:
           LIVE_WALLET_KEY: ${{ secrets.LIVE_WALLET_KEY }}
           LIVE_RPC_URL: ${{ secrets.LIVE_RPC_URL }}
           JUP_API_KEY: ${{ secrets.JUP_API_KEY }}
-          RADIUM_WALLET_KEY: ${{ secrets.RADIUM_WALLET_KEY }}
       - name: Save state 2
         if: always()
         uses: actions/cache/save@v4
@@ -111,7 +95,6 @@ jobs:
           LIVE_WALLET_KEY: ${{ secrets.LIVE_WALLET_KEY }}
           LIVE_RPC_URL: ${{ secrets.LIVE_RPC_URL }}
           JUP_API_KEY: ${{ secrets.JUP_API_KEY }}
-          RADIUM_WALLET_KEY: ${{ secrets.RADIUM_WALLET_KEY }}
       - name: Save state 3
         if: always()
         uses: actions/cache/save@v4
@@ -125,13 +108,9 @@ jobs:
           LIVE_WALLET_KEY: ${{ secrets.LIVE_WALLET_KEY }}
           LIVE_RPC_URL: ${{ secrets.LIVE_RPC_URL }}
           JUP_API_KEY: ${{ secrets.JUP_API_KEY }}
-          RADIUM_WALLET_KEY: ${{ secrets.RADIUM_WALLET_KEY }}
       - name: Save state 4
         if: always()
         uses: actions/cache/save@v4
         with:
           path: state
           key: scanner-state-${{ github.run_id }}-${{ github.run_attempt }}-4
-      - name: Hand Rage Radium Bot to the bridge (also if the run failed or was cancelled)
-        if: always()
-        run: python ci_runner.py radium-release

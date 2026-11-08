@@ -1,11 +1,15 @@
-"""Rage Radium Bot: the real-money copy of the main $200 paper account (account 11).
+"""Rage Radium Bot: a standalone real-money copy-trader with its own signal engine (its own GitHub job, radium.yml).
 
-It runs as its own process next to the paper scanner and copies the main account's trades: when the main account
-buys, it buys; when the main account sells half at 2x or closes, it sells. On top of that it has its own guard, so
-open trades are never left unwatched while the paper scanner restarts:
+Since Nov 8 it no longer copies the paper main account. Its own engine (scanner.py run with RADIUM_ENGINE=1, its
+own database) follows the same wallets as the paper main account, reads their buys and sells itself, runs the main
+account's filters ($25k pool minimum, 32.5% top-10 holder block and the other safety checks) and exits on its own
+$20 reference position. When a signal passes, the engine opens a position at once and this process buys; when the
+engine sells half at 2x or closes (stop, breakeven, +$5 floor, trail, copied wallet sold), this process sells. The
+paper accounts run unchanged in their own job, for comparison. On top of that it has its own guard, so open trades
+are never left unwatched while the engine restarts:
   - live prices every ~4 s (DexScreener, Jupiter as backup)
   - its own $5 max-loss line, worked out from its own buy ("$5 is the most I lose")
-  - while the scanner is down (between hourly segments, between runs): the main account's exits on live prices
+  - while the engine is down (between hourly segments, between runs): the main account's exits on live prices
     (-25% stop, +15% breakeven, +$5 floor, trail from +40%, half at 2x, breakeven floor) and its own check of the
     copied wallet's balance, so the copied-wallet sell still works
 
@@ -13,19 +17,19 @@ MODES (repository variable RADIUM_MODE):
   off      nothing runs
   dry-run  (default) does everything for real except signing: real Jupiter quotes, the real swap transaction is
            built for the bot's wallet and checked, then thrown away. Nothing is signed or sent. It records what it
-           would have done and at what quoted price, next to the paper main account.
+           would have done and at what quoted price, next to the engine's $20 reference position.
   live     signs and sends. Needs RADIUM_MODE=live AND the RADIUM_WALLET_KEY secret AND the RADIUM_WALLET_ADDRESS
            secret, and the key must belong to that address. Not set: the user has to fund the wallet, confirm the
            limits and say go first.
 
 ONE TRADER AT A TIME: a lock on the 'radium-lock' branch (compare-and-swap pushes) says which process may trade.
-The scan run's copy owns it while the run is alive; near the end of each run a bridge job starts, the old run hands
-the lock (and the bot's encrypted state) to it, and the next scan run takes it back. Nobody takes the lock from a
+The radium.yml run owns it while the run is alive; near the end of each run a bridge job starts, the old run hands
+the lock (and the bot's encrypted state) to it, and the next radium.yml run takes it back. Nobody takes the lock from a
 run that GitHub still shows as running, so two traders can't both act.
 
 THE KEY: read once from the environment, kept in memory, never written to disk, a log, the state or the dashboard.
 """
-import base64, gzip, json, os, signal, sqlite3, struct, subprocess, sys, tempfile, time, traceback
+import base64, gzip, json, os, signal, sqlite3, struct, subprocess, sys, tempfile, threading, time, traceback
 import urllib.request, urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -788,6 +792,15 @@ class Bot:
         self.con = db()
         if meta_get(self.con, "since") is None:
             meta_set(self.con, "since", time.time()); self.con.commit()
+        src = os.environ.get("RADIUM_SOURCE", "engine")
+        if meta_get(self.con, "source") != src:
+            # Nov 8: switched from copying the paper main account to its own engine. Position ids now come from a
+            # different database, so old rows are set aside (negative id, never matched again; finished ones leave
+            # the totals). Anything still open stays open and is guarded on live prices.
+            self.con.execute("UPDATE trades SET paper_id=-ABS(paper_id)")
+            self.con.execute("UPDATE trades SET mode='old-'||mode WHERE status IN ('closed','skipped','failed')")
+            meta_set(self.con, "since", time.time()); meta_set(self.con, "source", src); self.con.commit()
+            event(self.con, "info", "Now runs on its own signal engine (no longer a copy of the paper main account)")
 
     # ---- the scanner's main account
     def scanner(self):
@@ -873,15 +886,15 @@ class Bot:
 
         def skip(why):
             self.con.execute("UPDATE trades SET status='skipped', notes=? WHERE id=?", (why, tid)); self.con.commit()
-            event(self.con, "skip", f"{sym}: main account bought, Radium skipped: {why}")
+            event(self.con, "skip", f"{sym}: signal passed the filters, skipped: {why}")
 
         why = self.blocked(control())
         if why:
             return skip(why)
         if lag > S["max_lag"]:
-            return skip(f"seen {lag:.0f} s after the paper buy (limit {S['max_lag']:.0f} s)")
+            return skip(f"seen {lag:.0f} s after the engine's buy signal (limit {S['max_lag']:.0f} s)")
         if p["status"] != "open":
-            return skip("the paper trade had already closed")
+            return skip("the engine had already closed it")
         try:
             solpx = sol_usd()
             stake, fees = stake_for(p.get("rt_pct"), solpx)
@@ -924,7 +937,7 @@ class Bot:
                               "; ".join(note) + f"; route {route_label(q)}", mid or entry_px, mid, time.time(), tid))
             self.con.commit(); DIRTY[0] = True
             event(self.con, "buy", f"{'BOUGHT' if S['mode'] == 'live' else 'would buy'} {sym}: ${usd_in:.2f} "
-                                   f"({sol_in:.4f} SOL) at {entry_px:.3g}, {lag:.1f} s after the paper buy, "
+                                   f"({sol_in:.4f} SOL) at {entry_px:.3g}, {lag:.1f} s after the signal, "
                                    f"impact {imp:.1f}%, via {route_label(q)}" + (f" [{note[0]}]" if note else ""))
             self.leader_baseline(tid)
         except Exception as e:
@@ -1057,10 +1070,10 @@ class Bot:
                 self.con.execute("UPDATE trades SET paper_exit_reason=?, paper_pnl=? WHERE id=?", (p["exit_reason"], p["pnl_usd"], t["id"]))
                 self.con.commit()
                 if t["status"] == "open":
-                    self.sell(t, 1.0, f"main account closed: {p['exit_reason']}")
+                    self.sell(t, 1.0, f"exit: {p['exit_reason']}")
             elif p["part_ts"] and not t["half_ts"] and t["status"] == "open":
                 self.con.commit()
-                self.sell(t, C.HALF_FRAC, "main account sold half at 2x")
+                self.sell(t, C.HALF_FRAC, "half at 2x")
         self.con.commit()
 
     def scanner_prices(self, sc, mints):
@@ -1127,7 +1140,7 @@ class Bot:
                     continue
                 if now - t["below_since"] < MIRROR_GRACE_S:
                     continue
-                hit = hit if hit == "half" else hit + ", main account slow to act"
+                hit = hit if hit == "half" else hit + ", engine slow to act"
             elif not hit and t["below_since"]:
                 self.con.execute("UPDATE trades SET below_since=NULL WHERE id=?", (t["id"],))
             if hit == "half":
@@ -1185,6 +1198,78 @@ class Bot:
                                 + (f", {len(other)} other token(s) in the wallet left alone" if other else ""))
 
     # ---- dashboard
+    def engine_info(self):
+        """Health of its own signal engine, for the page: wallets followed, feed, signals in the last hour."""
+        if not os.path.exists(SCANNER_DB):
+            return None
+        try:
+            sc = sqlite3.connect(f"file:{SCANNER_DB}?mode=ro", uri=True, timeout=5)
+            try:
+                t = time.time()
+                hb = sc.execute("SELECT MAX(ts) FROM heartbeat").fetchone()[0]
+                ws = [r[0] or "" for r in sc.execute("SELECT name FROM wallets WHERE active=1 ORDER BY name")]
+                n1 = sc.execute("SELECT COUNT(*), SUM(status='survivor') FROM signals WHERE detected_ts>?", (t - 3600,)).fetchone()
+                why = sc.execute("""SELECT killed_by, COUNT(*) FROM signals WHERE detected_ts>? AND killed_by IS NOT NULL
+                                    GROUP BY killed_by ORDER BY 2 DESC LIMIT 4""", (t - 3600,)).fetchall()
+                lag = sc.execute("""SELECT detect_lag_s FROM signals WHERE detected_ts>? AND detect_lag_s IS NOT NULL
+                                    ORDER BY detect_lag_s""", (t - 86400,)).fetchall()
+                last = sc.execute("""SELECT symbol, detected_ts, status, killed_by FROM signals ORDER BY id DESC LIMIT 12""").fetchall()
+                try:
+                    feed = sc.execute("SELECT value FROM meta WHERE key='feed'").fetchone()
+                    feed = json.loads(feed[0]) if feed else None
+                except Exception:
+                    feed = None
+            finally:
+                sc.close()
+            return {"hb": hb, "up": bool(hb and t - hb < SCANNER_FRESH_S), "wallets": ws,
+                    "sig_1h": n1[0] or 0, "pass_1h": n1[1] or 0, "why_1h": [[k, c] for k, c in why],
+                    "lag_med": lag[len(lag) // 2][0] if lag else None, "lag_n": len(lag),
+                    "feed": ({"connected": bool(feed.get("connected")), "helius": "helius" in str(feed.get("url") or ""),
+                              "reconnects": feed.get("reconnects"), "uptime_s": feed.get("uptime_s"), "ts": feed.get("ts")}
+                             if isinstance(feed, dict) else None),
+                    "last": [{"coin": a or "?", "t": b, "st": c, "why": d} for a, b, c, d in last]}
+        except Exception as e:
+            return {"err": type(e).__name__}
+
+    def publish_page(self):
+        """Its own page (rage-radium-bot repo) reads radium.enc from the radium-data branch: the status sealed with
+        RADIUM_DASH_KEY, so only someone with the page link's key can read it. Runs in a thread, never blocks."""
+        remote = os.environ.get("RADIUM_PAGE_REMOTE") or (f"https://x-access-token:{TOKEN}@github.com/{REPO}.git"
+                                                           if TOKEN and REPO and not os.environ.get("RADIUM_TEST_RUNS") else "")
+        if not os.environ.get("RADIUM_DASH_KEY") or not remote:
+            return
+        if getattr(self, "_pub_busy", False):
+            return
+        self._pub_busy = True
+        def go():
+            try:
+                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                k = os.environ["RADIUM_DASH_KEY"].strip()
+                aes = AESGCM(base64.urlsafe_b64decode(k + "=" * (-len(k) % 4)))
+                with open(STATUS, "rb") as f:
+                    raw = f.read()
+                n = os.urandom(12)
+                blob = base64.b64encode(n + aes.encrypt(n, gzip.compress(raw, 6), None))
+                d = os.path.join(RSTATE, "pagerepo")
+                def g(*a, data=None):
+                    return subprocess.run(["git", *a], cwd=d, input=data, capture_output=True, timeout=60)
+                if not os.path.isdir(os.path.join(d, ".git")):
+                    os.makedirs(d, exist_ok=True)
+                    g("init", "-q"); g("config", "user.name", "rage-radium-bot")
+                    g("config", "user.email", "rage-radium-bot@users.noreply.github.com")
+                    g("remote", "add", "origin", remote)
+                b = g("hash-object", "-w", "--stdin", data=blob).stdout.decode().strip()
+                tree = g("mktree", data=f"100644 blob {b}\tradium.enc\n".encode()).stdout.decode().strip()
+                c = g("commit-tree", tree, "-m", "Rage Radium Bot page data").stdout.decode().strip()
+                r = g("push", "-q", "--force", "origin", f"{c}:refs/heads/radium-data")
+                if r.returncode != 0:
+                    log("page publish failed")
+            except Exception as e:
+                log(f"page publish error {type(e).__name__}")
+            finally:
+                self._pub_busy = False
+        threading.Thread(target=go, name="page", daemon=True).start()
+
     def write_status(self):
         if not self.con:
             return
@@ -1220,7 +1305,8 @@ class Bot:
               "closed": [tr(r) for r in closed[:30]],
               "skipped": [tr(r) for r in rows if r["status"] == "skipped"][:15],
               "events": [dict(e) for e in self.con.execute("SELECT ts,kind,msg FROM events ORDER BY id DESC LIMIT 40")],
-              "unmanaged_tokens": meta_get(self.con, "unmanaged_tokens", 0)}
+              "unmanaged_tokens": meta_get(self.con, "unmanaged_tokens", 0),
+              "engine": self.engine_info()}
         tmp = STATUS + ".tmp"
         with open(tmp, "w") as f:
             f.write(scrub(json.dumps(st, default=str)))
@@ -1261,13 +1347,13 @@ class Bot:
                 ctl = control()
                 sc, hb = self.scanner()
                 up = bool(hb and now - hb < SCANNER_FRESH_S)
-                self.mode_now = "mirror" if up else ("guard (scanner restarting)" if sc else "guard (bridge)")
+                self.mode_now = "engine" if up else ("guard (engine restarting)" if sc else "guard (bridge)")
                 if ctl.get("sell_all_and_stop"):
                     self.sell_everything("phone switch: sell everything and stop")
                 elif sc is not None:
-                    self.mirror_exits(sc)       # paper closes/halves are copied whenever the main account's data is here
+                    self.mirror_exits(sc)       # the engine's closes/halves are acted on whenever its data is here
                     if up:
-                        self.mirror_buys(sc)    # new buys only while the scanner is actually running
+                        self.mirror_buys(sc)    # new buys only while the engine is actually running
                 self.guard(up, sc)
                 self.retry_sells()
                 if sc:
@@ -1285,6 +1371,9 @@ class Bot:
             if now - self.last_status > 10:
                 self.balance()
                 self.write_status()
+                if now - getattr(self, "last_pub", 0) > 60:
+                    self.last_pub = now
+                    self.publish_page()
             time.sleep(1)
 
 

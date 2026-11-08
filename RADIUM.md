@@ -1,8 +1,20 @@
 # Rage Radium Bot
 
-The real-money copy of the main $200 paper account. Same signals, same 13 wallets, same filters, same exits
-(−25% stop, +15% breakeven, +$5 floor, live-price checks, trail from +40%, half at 2x, copied-wallet sell).
-Its code is `radium.py`; it starts with each scan run and hands over to `radium-bridge.yml` between runs.
+A standalone real-money copy-trader with its own job (`radium.yml`), its own signal engine and its own page:
+https://ragedele-glitch.github.io/rage-radium-bot/ (the full link carries the page key after the #).
+
+Since Nov 8 it no longer copies the paper main account. Its engine (`scanner.py` run with `RADIUM_ENGINE=1` and its
+own database, saved in the `radium-engine-` cache) follows the same wallets as the paper main account, reads their
+buys and sells itself and runs the same filters ($25k pool minimum, 32.5% top-10 holder block, safety checks) and
+exits (−25% stop, +15% breakeven, +$5 floor, live-price checks every ~4 s, trail from +40%, half at 2x, breakeven
+floor from +50%, copied-wallet sell) on a $20 reference position. `radium.py` buys the moment the engine opens and
+sells when the engine sells, and guards open trades itself (live prices, its own $5 line, copied-wallet check) while
+the engine restarts. `radium_runner.py` runs both. Between runs `radium-bridge.yml` holds the lock and the trades.
+The paper accounts (`scan.yml`) run unchanged, for comparison. The paper job publishes the main account's wallet
+list, sealed, as `follow.enc` on the data branch; the engine reads it every 5 minutes.
+
+Page data: `radium.enc` on the `radium-data` branch, sealed with the `RADIUM_DASH_KEY` secret. The page code lives in
+the `ragedele-glitch/rage-radium-bot` repo. The wallet address is never written to it.
 
 ## Modes (repository variable `RADIUM_MODE`)
 - `dry-run` (now): real Jupiter quotes and real swap transactions built for the bot's wallet, then thrown away.

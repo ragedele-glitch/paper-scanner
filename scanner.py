@@ -681,6 +681,8 @@ def handle_candidate(con, c, pairs):
         rest.append("safety_check_unavailable")
     killed += rest; killed5 += rest
     sig["killed_by"] = ",".join(killed) or None
+    if C.ENGINE:
+        return engine_enter(con, c, sig, note, killed, tp, price, liq)
     if killed and killed5:
         insert_signal(con, **sig, status="killed", notes="; ".join(note) or None); return
 
@@ -754,6 +756,58 @@ def handle_candidate(con, c, pairs):
         open_position(con, sid, C.ACCT_5S_SHADOW, mint, sym, pool, wallet, entry_5s, px_5, src_5, 20.0)
         if open_main(con, sid, C.ACCT_5S, mint, sym, pool, wallet, entry_5s, px_5, src_5, c["name"], "5 s test: "):
             live_hook(live.on_paper_buy, con, sid, mint, sym, buy_ts)
+
+
+def engine_enter(con, c, sig, note, killed, tp, price, liq):
+    """Rage Radium Bot's engine: the main account's filters have run (same code as above). A coin that passes gets
+    one $20 position at once, priced from DexScreener's live price with a real Jupiter round-trip quote for the
+    costs. No GeckoTerminal wait and no simulated fill delay: Rage Radium Bot buys for real right after this."""
+    if killed:
+        insert_signal(con, **sig, status="killed", notes="; ".join(note) or None); return
+    mint, wallet, pool = c["mint"], c["wallet"], tp["pairAddress"]
+    q = fills.entry_quote(mint, pool, C.ENGINE_SIZE_USD, liq)
+    fee_in = fills.tx_fee_usd(pool)
+    fill = dict(fill_model="live", leader_px=None, seen_px=price, r_buy=q["r_buy"], r_sell_est=q["r_sell"],
+                rt_pct=q["rt_pct"], q_src_in=q["src"], route=q.get("route"), fee_in=fee_in, liq_in=liq,
+                sellable=1 if q["sellable"] else 0)
+    sig["rt_pct"] = q["rt_pct"]
+    note = note + [f"engine buy at DexScreener live price {price:.6g}", f"round trip {q['rt_pct']:.1f}% via {q['src']}"]
+    if not q["sellable"]:
+        note.append("Jupiter could buy but not sell it back (honeypot or sell tax)")
+    sid = insert_signal(con, **sig, status="survivor", notes="; ".join(note))
+    t = now()
+    open_position(con, sid, C.ACCT_REAL, mint, tp["baseToken"].get("symbol"), pool, wallet, t, price,
+                  "dexscreener_live", C.ENGINE_SIZE_USD, fill)
+    con.commit()   # Rage Radium Bot reads this position straight away
+    log.info("ENGINE BUY %s %s @ %.10g, %.1f s after the wallet's buy was seen, copying %s",
+             sig.get("symbol"), mint, price, t - c["det_ts"], c["name"])
+
+
+def engine_wallets(con, force=False):
+    """Rage Radium Bot's engine: follow the wallet list radium_runner.py wrote (the paper main account's current
+    list). Re-read only when the file changes. Returns True when the followed set changed."""
+    f = C.ENGINE_FOLLOW_FILE
+    try:
+        mt = os.path.getmtime(f)
+        if not force and mt == meta_get(con, "engine_follow_mtime", 0):
+            return False
+        lst = json.load(open(f))["wallets"]
+    except Exception as e:
+        log.warning("engine follow list not read (%s), keeping the current wallets", e)
+        return False
+    t = now()
+    keep = [w for w in lst if w.get("address") and w["address"] not in C.REMOVED_WALLETS]
+    if not keep:
+        log.warning("engine follow list is empty, keeping the current wallets")
+        return False
+    con.execute("UPDATE wallets SET active=0")
+    for w in keep:
+        con.execute("""INSERT INTO wallets(address,name,first_seen,last_seen,last_rank,poll_s,last_poll,active)
+            VALUES(?,?,?,?,99,60,0,1) ON CONFLICT(address) DO UPDATE SET active=1, name=excluded.name""",
+                    (w["address"], (w.get("name") or "")[:40], t, t))
+    meta_set(con, "engine_follow_mtime", mt); meta_set(con, "board_ts", t); con.commit()
+    log.info("engine: following %d wallets (%s)", len(keep), ", ".join((w.get("name") or w["address"][:4]) for w in keep)[:300])
+    return True
 
 
 def pool_band(liq, src, is_curve):
@@ -2112,15 +2166,18 @@ def main():
         meta_set(con, "hf_start_ts", now()); meta_set(con, "cash_hf", C.START_EQUITY); con.commit()
     if meta_get(con, "pb_start_ts") is None:   # pool-band shadow test (logged only): judged on new trades only
         meta_set(con, "pb_start_ts", now()); con.commit()
-    try:   # wallet-score shadow test (logged only, never blocks): GMGN read in a background thread, new trades only
-        wscore.start(con)
-    except Exception as e:
-        log.warning("wallet-score shadow test could not start %s", e)
-    paper_reset(con)
-    try:
-        manual_close(con)
-    except Exception as e:   # never let it stop the scanner; it is retried at the next start
-        log.warning("manual close error %s", e); con.rollback()
+    if C.ENGINE:
+        engine_wallets(con, force=True)
+    else:
+        try:   # wallet-score shadow test (logged only, never blocks): GMGN read in a background thread, new trades only
+            wscore.start(con)
+        except Exception as e:
+            log.warning("wallet-score shadow test could not start %s", e)
+        paper_reset(con)
+        try:
+            manual_close(con)
+        except Exception as e:   # never let it stop the scanner; it is retried at the next start
+            log.warning("manual close error %s", e); con.rollback()
     try:
         be15_switch(con)
     except Exception as e:   # never let it stop the scanner; it is retried at the next start
@@ -2136,7 +2193,8 @@ def main():
     except Exception as e:   # never let it stop the scanner; it is retried at the next start
         log.warning("+$5 floor switch error %s", e); con.rollback()
     start_ticker()
-    log.info("scanner start (PAPER MODE ONLY - no wallet, no keys, nothing signed)")
+    log.info("scanner start (RADIUM ENGINE - signals only, no wallet, no keys, nothing signed)" if C.ENGINE else
+             "scanner start (PAPER MODE ONLY - no wallet, no keys, nothing signed)")
     if C.REMOVED_ERROR:
         log.warning("removed_wallets.json could not be read (%s): no wallets removed this run", C.REMOVED_ERROR)
     STREAM = streammod.WalletStream(C.WS_URLS, noisy=(meta_get(con, "feed") or {}).get("noisy") or [])
@@ -2147,7 +2205,12 @@ def main():
     while True:
         loop_t = now()
         try:
-            if now() - (meta_get(con, "board_ts", 0) or 0) > C.BOARD_REFRESH_S:
+            if C.ENGINE:
+                try:
+                    engine_wallets(con)
+                except Exception as e:
+                    log.warning("engine follow list error %s", e); con.rollback()
+            elif now() - (meta_get(con, "board_ts", 0) or 0) > C.BOARD_REFRESH_S:
                 try:
                     refresh_board(con)
                 except Exception as e:
@@ -2162,17 +2225,19 @@ def main():
             _t("live0", live_guard, con)
             cands, polled = _t("poll", poll_wallets, con)
             _t("filters", process_new_buys, con, cands)
-            drain_chain_info(con)
-            try:   # wallet-score shadow test: scores logged signals from the GMGN cache (no network here, never blocks)
-                _t("wscore", wscore.tick, con)
-            except Exception as e:
-                log.warning("wallet-score shadow test error %s", e); con.rollback()
+            if not C.ENGINE:
+                drain_chain_info(con)
+                try:   # wallet-score shadow test: scores logged signals from the GMGN cache (no network here, never blocks)
+                    _t("wscore", wscore.tick, con)
+                except Exception as e:
+                    log.warning("wallet-score shadow test error %s", e); con.rollback()
             _t("feed2", drain_stream, con)
             _t("live", live_guard, con)
             _t("guard", guard_all, con)
             _t("live2", live_guard, con)
-            _t("alt exits", alt_all, con)
-            live_hook(live.tick, con)
+            if not C.ENGINE:
+                _t("alt exits", alt_all, con)
+                live_hook(live.tick, con)
             _t("checkpoints", checkpoints, con)
             if sum(tm.values()) > 60:
                 log.info("slow loop: %s", ", ".join(f"{k} {v:.0f}s" for k, v in tm.items() if v >= 5))

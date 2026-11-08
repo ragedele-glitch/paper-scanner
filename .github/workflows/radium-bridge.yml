@@ -1,6 +1,6 @@
-# Rage Radium Bot bridge: watches Radium's open trades while the paper scanner hands over from one run to the next.
-# Started by the scan run about 7 minutes before it ends. It waits, takes the trading lock (and Radium's state)
-# when the scan run lets go, guards open trades on live prices, then hands back to the next scan run.
+# Rage Radium Bot bridge: watches Radium's open trades while its own job (radium.yml) hands over from one run to the
+# next. Started by the radium.yml run about 7 minutes before it ends. It waits, takes the trading lock (and Radium's
+# state) when that run lets go, guards open trades on live prices, then hands back to the next radium.yml run.
 # It never buys. Nothing is signed unless RADIUM_MODE=live.
 name: Rage Radium Bot bridge
 on:
@@ -16,6 +16,8 @@ jobs:
     timeout-minutes: 355
     env:
       DASH_KEY: ${{ secrets.DASH_KEY }}
+      # Key for Rage Radium Bot's own page (its data is sealed with it)
+      RADIUM_DASH_KEY: ${{ secrets.RADIUM_DASH_KEY }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
       LIVE_MODE: ${{ vars.LIVE_MODE }}

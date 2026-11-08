@@ -39,6 +39,15 @@ try:
     REMOVED_ERROR = None
 except Exception as _e:   # a broken file must not stop the scanner; the error is logged at start
     REMOVED_WALLETS = set(); REMOVED_ERROR = f"{type(_e).__name__}: {_e}"
+# Rage Radium Bot's own signal engine (radium.yml, Nov 8): the same scanner code run as a separate process with
+# RADIUM_ENGINE=1 and its own database. It reads the wallets' buys and sells itself, runs the main account's filters
+# and exits on one $20 position per signal, and skips everything that only exists for the paper tests (shadow and
+# comparison accounts, comparison lines, wallet-score and chain-info logging, and the GeckoTerminal wait that prices
+# simulated fills). It follows the same wallets as the paper main account: the list is written by radium_runner.py to
+# ENGINE_FOLLOW_FILE (removed wallets always left out). It never signs anything: Rage Radium Bot (radium.py) trades.
+ENGINE = os.environ.get("RADIUM_ENGINE", "") == "1"
+ENGINE_FOLLOW_FILE = os.environ.get("RADIUM_FOLLOW_FILE", "")
+ENGINE_SIZE_USD = 20.0
 BOARD_KEEP_DAYS = 3         # keep following a wallet for 3 days after it last appeared on the board
 BOARD_REFRESH_S = 6 * 3600  # re-read the leaderboard every 6 hours
 LOOP_S = 20

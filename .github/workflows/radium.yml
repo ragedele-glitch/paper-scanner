@@ -1,0 +1,116 @@
+# Rage Radium Bot: its own job, separate from the paper scanner (scan.yml). It runs its own signal engine (same
+# wallets, filters and exits as the paper main account) and the trader, which acts on the engine's signals directly.
+# Dry-run unless the repository variable RADIUM_MODE is "live" AND the RADIUM_WALLET_KEY secret matches the wallet.
+# Each run lasts about 4 hours in hourly steps; the engine's database is saved after each step. Near the end it starts
+# the bridge job (which guards open trades between runs) and queues the next run.
+name: Rage Radium Bot
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: rage-radium-bot
+  cancel-in-progress: false
+jobs:
+  radium:
+    runs-on: ubuntu-latest
+    timeout-minutes: 290
+    env:
+      DASH_KEY: ${{ secrets.DASH_KEY }}
+      # Key for Rage Radium Bot's own page (its data is sealed with it)
+      RADIUM_DASH_KEY: ${{ secrets.RADIUM_DASH_KEY }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+      LIVE_MODE: ${{ vars.LIVE_MODE }}
+      RADIUM_MODE: ${{ vars.RADIUM_MODE }}
+      RADIUM_WALLET_ADDRESS: ${{ secrets.RADIUM_WALLET_ADDRESS }}
+      RADIUM_MAX_LOSS_USD: ${{ vars.RADIUM_MAX_LOSS_USD }}
+      RADIUM_MAX_STAKE_USD: ${{ vars.RADIUM_MAX_STAKE_USD }}
+      RADIUM_MIN_STAKE_USD: ${{ vars.RADIUM_MIN_STAKE_USD }}
+      RADIUM_MAX_OPEN: ${{ vars.RADIUM_MAX_OPEN }}
+      RADIUM_DAILY_LOSS_USD: ${{ vars.RADIUM_DAILY_LOSS_USD }}
+      RADIUM_TOTAL_LOSS_USD: ${{ vars.RADIUM_TOTAL_LOSS_USD }}
+      RADIUM_BUY_SLIPPAGE_BPS: ${{ vars.RADIUM_BUY_SLIPPAGE_BPS }}
+      RADIUM_SELL_SLIPPAGE_BPS: ${{ vars.RADIUM_SELL_SLIPPAGE_BPS }}
+      RADIUM_MAX_IMPACT_PCT: ${{ vars.RADIUM_MAX_IMPACT_PCT }}
+      RADIUM_MAX_LAG_S: ${{ vars.RADIUM_MAX_LAG_S }}
+      RADIUM_PRIORITY_MAX_LAMPORTS: ${{ vars.RADIUM_PRIORITY_MAX_LAMPORTS }}
+      RADIUM_FEE_RESERVE_SOL: ${{ vars.RADIUM_FEE_RESERVE_SOL }}
+      RADIUM_SOURCE: engine
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install --quiet "cryptography==50.0.1" "websockets==17.4" "solders==0.29.0"
+      - name: Restore the engine's saved state
+        uses: actions/cache/restore@v4
+        with:
+          path: engine_state
+          key: radium-engine-${{ github.run_id }}-start
+          restore-keys: radium-engine-
+      - name: Read the paper main account's wallet list (read only)
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: radium-paper-wallets-${{ github.run_id }}
+          restore-keys: scanner-state-
+      - name: Prepare
+        run: python radium_runner.py prepare
+      - name: Run, hour 1
+        run: python radium_runner.py run 58
+        env:
+          RADIUM_WALLET_KEY: ${{ secrets.RADIUM_WALLET_KEY }}
+          RADIUM_RPC_URL: ${{ secrets.RADIUM_RPC_URL }}
+          JUP_API_KEY: ${{ secrets.JUP_API_KEY }}
+      - name: Save engine state 1
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: engine_state
+          key: radium-engine-${{ github.run_id }}-${{ github.run_attempt }}-1
+      - name: Run, hour 2
+        run: python radium_runner.py run 58
+        env:
+          RADIUM_WALLET_KEY: ${{ secrets.RADIUM_WALLET_KEY }}
+          RADIUM_RPC_URL: ${{ secrets.RADIUM_RPC_URL }}
+          JUP_API_KEY: ${{ secrets.JUP_API_KEY }}
+      - name: Save engine state 2
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: engine_state
+          key: radium-engine-${{ github.run_id }}-${{ github.run_attempt }}-2
+      - name: Run, hour 3
+        run: python radium_runner.py run 58
+        env:
+          RADIUM_WALLET_KEY: ${{ secrets.RADIUM_WALLET_KEY }}
+          RADIUM_RPC_URL: ${{ secrets.RADIUM_RPC_URL }}
+          JUP_API_KEY: ${{ secrets.JUP_API_KEY }}
+      - name: Save engine state 3
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: engine_state
+          key: radium-engine-${{ github.run_id }}-${{ github.run_attempt }}-3
+      - name: Run, hour 4 (queues the bridge and the next run near the end)
+        run: python radium_runner.py run 58 last
+        env:
+          RADIUM_WALLET_KEY: ${{ secrets.RADIUM_WALLET_KEY }}
+          RADIUM_RPC_URL: ${{ secrets.RADIUM_RPC_URL }}
+          JUP_API_KEY: ${{ secrets.JUP_API_KEY }}
+      - name: Save engine state 4
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: engine_state
+          key: radium-engine-${{ github.run_id }}-${{ github.run_attempt }}-4
+      - name: Hand Rage Radium Bot to the bridge (also if the run failed or was cancelled)
+        if: always()
+        run: python radium_runner.py radium-release

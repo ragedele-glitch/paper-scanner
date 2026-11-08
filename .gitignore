@@ -3,3 +3,4 @@ _publish/
 __pycache__/
 *.pyc
 radium_state/
+engine_state/
