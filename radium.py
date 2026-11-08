@@ -81,7 +81,7 @@ def settings():
         "mode": (os.environ.get("RADIUM_MODE", "").strip().lower() or "dry-run"),
         "max_loss": min(envf("RADIUM_MAX_LOSS_USD", 5), HARD["max_loss"]),
         "max_stake": min(envf("RADIUM_MAX_STAKE_USD", 20), HARD["max_stake"]),
-        "min_stake": envf("RADIUM_MIN_STAKE_USD", 8),
+        "min_stake": max(1.0, envf("RADIUM_MIN_STAKE_USD", 5)),   # below this, fees eat the trade: skip instead
         "stop_pct": C.MAX_LOSS_PCT * 100,
         "max_open": int(min(envf("RADIUM_MAX_OPEN", 3), HARD["max_open"])),
         "daily_loss": min(envf("RADIUM_DAILY_LOSS_USD", 15), HARD["daily_loss"]),
@@ -653,6 +653,34 @@ def stake_for(rt_pct, sol_px):
     return round(min(S["max_stake"], st), 2), fees
 
 
+TOKEN_ACCT_RENT_SOL = 0.00204     # deposit for the coin's token account; comes back when the trade closes
+
+
+def free_usd(bal_sol, sol_px):
+    """Dollars free for one more buy: the wallet's SOL minus the fee reserve, this trade's two network fees and the
+    token-account deposit. Open trades are already out of the SOL balance, so this adapts to whatever is deposited."""
+    per_trade = 2 * (BASE_FEE_LAMPORTS + S["priority_lamports"]) / LAMPORTS + TOKEN_ACCT_RENT_SOL
+    return (bal_sol - S["reserve_sol"] - per_trade) * sol_px
+
+
+def size_stake(rt_pct, sol_px, bal_sol):
+    """The stake for one buy. The $ max loss sets the full stake (never above the max stake); if the wallet's free
+    cash is less than that, a smaller stake that fits is used, down to the smallest stake. Returns (stake, fees, why):
+    why is set when the trade must be skipped."""
+    full, fees = stake_for(rt_pct, sol_px)
+    if full < S["min_stake"]:
+        return full, fees, f"costs too high: a ${S['max_loss']:.0f} max loss allows only ${full:.2f}"
+    if bal_sol is None:
+        return full, fees, "wallet balance unknown"
+    free = free_usd(bal_sol, sol_px)
+    if free >= full:
+        return full, fees, None
+    if free >= S["min_stake"]:
+        return round(free, 2), fees, None
+    return full, fees, (f"wallet has {bal_sol:.4f} SOL; after the {S['reserve_sol']:.3f} SOL fee reserve and fees, "
+                        f"${max(0, free):.2f} is free, below the ${S['min_stake']:.0f} smallest stake")
+
+
 def col(row, k):
     """A column of a scanner row, or None if that database doesn't have it (older copies lack floor_px)."""
     try:
@@ -661,7 +689,6 @@ def col(row, k):
         return None
 
 
-PAGE_START_USD = float(os.environ.get("RADIUM_PAGE_START_USD", "80") or 80)   # dry run: would-be balance starts at the planned funding
 try:
     from dashboard import FILTERS as DFILT
 except Exception:
@@ -889,9 +916,10 @@ class Bot:
         if S["mode"] == "live" and WALLET["address"]:
             bal, px = self.bal["sol"], _J["sol"][1]
             if bal is not None and px:
-                need = S["max_stake"] / px + S["reserve_sol"]
-                if bal < need:
-                    return f"wallet has {bal:.4f} SOL, below one trade plus fees ({need:.4f} SOL)"
+                free = free_usd(bal, px)
+                if free < S["min_stake"]:
+                    return (f"wallet has {bal:.4f} SOL; after the {S['reserve_sol']:.3f} SOL fee reserve and this trade's fees, "
+                            f"${max(0, free):.2f} is free, below the ${S['min_stake']:.0f} smallest stake")
         if len(self.open_trades()) >= S["max_open"]:
             return f"already {S['max_open']} open trades (max)"
         day = self.realised(lagos_day_start())
@@ -939,15 +967,20 @@ class Bot:
             return skip("the engine had already closed it")
         try:
             solpx = sol_usd()
-            stake, fees = stake_for(p.get("rt_pct"), solpx)
-            if stake < S["min_stake"]:
-                return skip(f"costs too high: a $ {S['max_loss']:.0f} max loss allows only ${stake:.2f}")
-            lam = int(stake / solpx * LAMPORTS)
             bal = self.balance()
-            need = stake / solpx + S["reserve_sol"]
-            low = bal is None or bal < need
-            if S["mode"] == "live" and low:
-                return skip(f"wallet balance {0 if bal is None else bal:.4f} SOL is below one trade plus fees ({need:.4f} SOL)")
+            full, fees = stake_for(p.get("rt_pct"), solpx)
+            stake, fees, low = size_stake(p.get("rt_pct"), solpx, bal)
+            if full < S["min_stake"]:
+                return skip(low)
+            if S["mode"] == "live":
+                if low:
+                    return skip(low)
+            else:
+                # dry run: size as live would with the wallet's real balance once it holds money; while it's empty,
+                # use the full stake so the dry run still shows every trade
+                if not bal or low:
+                    stake = full
+            lam = int(stake / solpx * LAMPORTS)
             q = quote(SOL, p["mint"], lam, S["buy_slip_bps"])
             imp = impact(q)
             if imp > S["max_impact"]:
@@ -968,7 +1001,9 @@ class Bot:
                 fee_in = (BASE_FEE_LAMPORTS + prio) / LAMPORTS * solpx
                 note.append(simulate(tx))
                 if low:
-                    note.append(f"live would refuse: wallet {'not set' if bal is None else f'{bal:.4f} SOL'}, needs {need:.4f} SOL")
+                    note.append(f"live would skip: {low}")
+                elif stake < full:
+                    note.append(f"smaller stake ${stake:.2f} to fit the wallet (full stake ${full:.2f})")
             usd_in = sol_in * solpx
             ui = out / 10 ** dec
             entry_px = usd_in / ui if ui else None
@@ -1315,7 +1350,7 @@ class Bot:
     def page_extras(self):
         """Read-only extras for the page so it can match the Rage Meme Bot dashboard: the engine's signals (with what
         Radium did about each), the wallets with their results, and the would-be value curve. Nothing here trades."""
-        out = {"start_usd": PAGE_START_USD, "fnames": DFILT}
+        out = {"fnames": DFILT}
         mode = S["mode"]
         cl = self.con.execute("""SELECT exit_ts, pnl_usd, stake_usd, symbol FROM trades WHERE status='closed' AND mode=?
                                  AND exit_ts IS NOT NULL ORDER BY exit_ts""", (mode,)).fetchall()
