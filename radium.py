@@ -48,7 +48,9 @@ CONTROL_FILE = "radium_control.json"
 SOL = "So11111111111111111111111111111111111111112"
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 LAMPORTS = 1_000_000_000
-TOKEN_PROGRAMS = ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "TokenzQdBNbLqP5VEhdkAS6EPFLC1PxnF2KT1bbbFTi"]
+# Nov 8: the Token-2022 id was mistyped (RPC answered "unrecognized Token program id"), so the startup wallet check and
+# closing empty accounts always failed. Fixed to the real id.
+TOKEN_PROGRAMS = ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"]
 LAGOS = 3600
 
 # hard ceilings: a setting above these is clamped down, whatever the repository variable says
@@ -189,6 +191,10 @@ def db():
     con = sqlite3.connect(RDB, timeout=30)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
+    try:   # Nov 8: per-trade timings (signal -> decision -> quote -> send -> confirm) for the page's speed card
+        con.execute("ALTER TABLE trades ADD COLUMN timing TEXT")
+    except sqlite3.OperationalError:
+        pass
     return con
 
 
@@ -384,6 +390,85 @@ def sol_balance(addr):
     return rpc("getBalance", [addr, {"commitment": "confirmed"}])["value"] / LAMPORTS
 
 
+WALLET_VIEW = {"ts": None, "err": None, "data": None, "busy": False}
+_TOKMETA = {}
+
+
+def wallet_view(bot_mints):
+    """Display only: every coin in the wallet with its amount and $ value, dust included. Reads only, never trades.
+    Runs in its own thread every 30 s so the trading loop never waits on it."""
+    addr = WALLET["address"]
+    lam = rpc("getBalance", [addr, {"commitment": "confirmed"}])["value"]
+    if _TOKMETA.get("_accts") is not None and time.time() - _TOKMETA.get("_accts_ts", 0) < 90 and not bot_mints:
+        accts = _TOKMETA["_accts"]          # token list re-read every 90 s (SOL every check) to spare RPC credits
+        return _wallet_view_finish(lam, accts, bot_mints, _TOKMETA.get("_accts_ts"))
+    accts = []
+    for prog in TOKEN_PROGRAMS:
+        res = rpc("getTokenAccountsByOwner", [addr, {"programId": prog}, {"encoding": "jsonParsed", "commitment": "confirmed"}])
+        for a in res["value"]:
+            info = a["account"]["data"]["parsed"]["info"]
+            ta = info["tokenAmount"]
+            accts.append({"mint": info["mint"], "raw": int(ta["amount"]), "dec": int(ta["decimals"]),
+                          "frozen": info.get("state") == "frozen", "rent": int(a["account"]["lamports"])})
+    _TOKMETA["_accts"] = accts; _TOKMETA["_accts_ts"] = time.time()
+    return _wallet_view_finish(lam, accts, bot_mints, time.time())
+
+
+def _wallet_view_finish(lam, accts, bot_mints, tok_ts):
+    mints = list(dict.fromkeys([SOL] + [a["mint"] for a in accts]))
+    need = [m for m in mints if m not in _TOKMETA]
+    if need:
+        try:
+            for x in http("https://lite-api.jup.ag/tokens/v2/search?query=" + ",".join(need[:50]), timeout=10, tries=1) or []:
+                _TOKMETA[x["id"]] = {"sym": x.get("symbol"), "name": x.get("name"), "verified": bool(x.get("isVerified"))}
+        except Exception:
+            pass
+    px, src = {}, {}
+    try:
+        j = http("https://lite-api.jup.ag/price/v3?ids=" + ",".join(mints[:50]), timeout=10, tries=2) or {}
+        for m in mints:
+            if j.get(m) and j[m].get("usdPrice"):
+                px[m] = float(j[m]["usdPrice"]); src[m] = "Jupiter"
+    except Exception:
+        pass
+    miss = [m for m in mints if m not in px and m != SOL]
+    if miss:
+        try:
+            best = {}
+            for p in http("https://api.dexscreener.com/tokens/v1/solana/" + ",".join(miss[:30]), timeout=10, tries=1) or []:
+                m = (p.get("baseToken") or {}).get("address")
+                liq = (p.get("liquidity") or {}).get("usd") or 0
+                if m in miss and p.get("priceUsd") and liq >= best.get(m, (-1, 0))[0]:
+                    best[m] = (liq, float(p["priceUsd"]))
+            for m, (_, v) in best.items():
+                px[m] = v; src[m] = "DexScreener"
+        except Exception:
+            pass
+    if SOL not in px:
+        px[SOL] = sol_usd(); src[SOL] = "Jupiter"
+    solpx = px[SOL]
+    toks, tot_tok = {}, 0.0
+    for a in accts:
+        d = toks.setdefault(a["mint"], {"raw": 0, "dec": a["dec"], "frozen": False, "rent": 0, "accounts": 0})
+        d["raw"] += a["raw"]; d["rent"] += a["rent"]; d["accounts"] += 1; d["frozen"] = d["frozen"] or a["frozen"]
+    out = []
+    for m, d in toks.items():
+        amt = d["raw"] / 10 ** d["dec"]
+        meta = _TOKMETA.get(m) or {}
+        usd = amt * px[m] if m in px else None
+        if usd is not None:
+            tot_tok += usd
+        out.append({"mint": short_addr(m), "sym": meta.get("sym") or short_addr(m), "name": meta.get("name"),
+                    "verified": meta.get("verified"), "amount": amt, "usd": usd, "px": px.get(m), "src": src.get(m),
+                    "frozen": d["frozen"], "bot": m in bot_mints, "rent_sol": d["rent"] / LAMPORTS, "accounts": d["accounts"]})
+    out.sort(key=lambda x: -(x["usd"] or 0))
+    sol = lam / LAMPORTS
+    rent = sum(a["rent"] for a in accts) / LAMPORTS
+    return {"sol": sol, "sol_usd": sol * solpx, "sol_px": solpx, "tokens": out, "tokens_usd": tot_tok,
+            "total_usd": sol * solpx + tot_tok, "rent_sol": rent, "rent_usd": rent * solpx,
+            "unpriced": sum(1 for x in out if x["usd"] is None), "tokens_ts": tok_ts}
+
+
 def token_balance(owner, mint):
     res = rpc("getTokenAccountsByOwner", [owner, {"mint": mint}, {"encoding": "jsonParsed", "commitment": "confirmed"}])
     return sum(int(a["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]) for a in res["value"])
@@ -433,28 +518,46 @@ def simulate(tx):
         return f"simulation not run: {str(e)[:60]}"
 
 
-def sign_send(tx):
-    """LIVE ONLY. Signs with the wallet key and sends. Returns the signature once confirmed; raises otherwise."""
+TXS = {"sent": 0, "ok": 0, "fail": 0, "rebroadcasts": 0, "last_fail": None}   # live transaction counts (page)
+
+
+def sign_send(tx, tm=None):
+    """LIVE ONLY. Signs with the wallet key and sends. Returns the signature once confirmed; raises otherwise.
+    tm (optional dict) gets the timings for the page: sent, confirmed, rebroadcasts, fail. Recording only."""
     if S["mode"] != "live" or WALLET["kp"] is None or not OWNER.get("ok"):
         raise RuntimeError("refusing to sign: not live, no key, or not the lock owner")
+    tm = tm if tm is not None else {}
     from solders.transaction import VersionedTransaction
     signed = VersionedTransaction(tx.message, [WALLET["kp"]])
     raw = base64.b64encode(bytes(signed)).decode()
-    sig = rpc("sendTransaction", [raw, {"encoding": "base64", "skipPreflight": True, "maxRetries": 0}])
+    tm["send"] = time.time()
+    try:
+        sig = rpc("sendTransaction", [raw, {"encoding": "base64", "skipPreflight": True, "maxRetries": 0}])
+    except Exception as e:
+        TXS["fail"] += 1; TXS["last_fail"] = [time.time(), str(e)[:100]]; tm["fail"] = str(e)[:100]
+        raise
+    TXS["sent"] += 1
     t0 = time.time(); last_send = t0
+    tm["sent"] = t0; tm["rebroadcasts"] = 0
     while time.time() - t0 < CONFIRM_TIMEOUT_S:
         time.sleep(1.5)
         st = rpc("getSignatureStatuses", [[sig]])["value"][0]
         if st and st.get("err"):
+            TXS["fail"] += 1; TXS["last_fail"] = [time.time(), f"failed on-chain: {str(st['err'])[:80]}"]
+            tm["fail"] = f"failed on-chain: {str(st['err'])[:80]}"; tm["failed"] = time.time()
             raise RuntimeError(f"failed on-chain: {str(st['err'])[:80]}")
         if st and st.get("confirmationStatus") in ("confirmed", "finalized"):
+            TXS["ok"] += 1; tm["confirmed"] = time.time()
             return sig
         if time.time() - last_send > 4:      # re-broadcast the same signed transaction until it lands or expires
             try:
                 rpc("sendTransaction", [raw, {"encoding": "base64", "skipPreflight": True, "maxRetries": 0}])
+                TXS["rebroadcasts"] += 1; tm["rebroadcasts"] += 1
             except Exception:
                 pass
             last_send = time.time()
+    TXS["fail"] += 1; TXS["last_fail"] = [time.time(), f"not confirmed after {CONFIRM_TIMEOUT_S}s"]
+    tm["fail"] = f"not confirmed after {CONFIRM_TIMEOUT_S}s"; tm["failed"] = time.time()
     raise RuntimeError(f"not confirmed after {CONFIRM_TIMEOUT_S}s")
 
 
@@ -476,8 +579,9 @@ def fill_of(sig, mint):
     raise RuntimeError("confirmed transaction could not be read back")
 
 
-def close_empty_accounts():
-    """LIVE ONLY. Closes the bot's empty token accounts so their ~0.002 SOL deposit comes back."""
+def close_empty_accounts(bot_mints=None):
+    """LIVE ONLY. Closes the bot's empty token accounts so their ~0.002 SOL deposit comes back. Only accounts for
+    coins the bot itself traded (bot_mints): anything else in the wallet is the owner's and is never touched."""
     if S["mode"] != "live" or WALLET["kp"] is None or not OWNER.get("ok"):
         return 0
     from solders.pubkey import Pubkey
@@ -486,7 +590,8 @@ def close_empty_accounts():
     from solders.transaction import VersionedTransaction
     from solders.hash import Hash
     owner = WALLET["kp"].pubkey()
-    empty = [(a, p) for a, m, amt, p in token_accounts(WALLET["address"]) if amt == 0 and m != SOL]
+    empty = [(a, p) for a, m, amt, p in token_accounts(WALLET["address"])
+             if amt == 0 and m != SOL and bot_mints is not None and m in bot_mints]
     if not empty:
         return 0
     ixs = [Instruction(Pubkey.from_string(p), bytes([9]),
@@ -896,6 +1001,22 @@ class Bot:
                 self.bal["err"] = str(e)[:80]
         return self.bal["sol"]
 
+    def refresh_wallet_view(self):
+        """Display only: re-reads the wallet every 30 s (token list every 90 s), in a background thread."""
+        if not WALLET["address"] or WALLET_VIEW["busy"] or time.time() - (WALLET_VIEW.get("tried") or 0) < 30:
+            return
+        WALLET_VIEW["busy"] = True; WALLET_VIEW["tried"] = time.time()
+        bot = {r[0] for r in self.con.execute("SELECT mint FROM trades WHERE status IN ('buying','open','closing') AND mode='live'")}
+
+        def go():
+            try:
+                WALLET_VIEW["data"] = wallet_view(bot); WALLET_VIEW["ts"] = time.time(); WALLET_VIEW["err"] = None
+            except Exception as e:
+                WALLET_VIEW["err"] = scrub(str(e)[:120])
+            finally:
+                WALLET_VIEW["busy"] = False
+        threading.Thread(target=go, name="wallet-view", daemon=True).start()
+
     def realised(self, since):
         r = self.con.execute("SELECT COALESCE(SUM(pnl_usd),0) FROM trades WHERE status='closed' AND exit_ts>=? AND mode=?",
                              (since, S["mode"])).fetchone()[0]
@@ -954,8 +1075,12 @@ class Bot:
         tid = cur.lastrowid; self.con.commit(); DIRTY[0] = True
         sym = p["symbol"] or p["mint"][:6]
 
+        tm = {"seen": t}     # timings for the page's speed card (recording only: time.time() calls, no extra lookups)
+
         def skip(why):
-            self.con.execute("UPDATE trades SET status='skipped', notes=? WHERE id=?", (why, tid)); self.con.commit()
+            tm["end"] = time.time()
+            self.con.execute("UPDATE trades SET status='skipped', notes=?, timing=? WHERE id=?", (why, json.dumps(tm), tid))
+            self.con.commit()
             event(self.con, "skip", f"{sym}: signal passed the filters, skipped: {why}")
 
         why = self.blocked(control())
@@ -965,6 +1090,7 @@ class Bot:
             return skip(f"seen {lag:.0f} s after the engine's buy signal (limit {S['max_lag']:.0f} s)")
         if p["status"] != "open":
             return skip("the engine had already closed it")
+        tm["decided"] = time.time()
         try:
             solpx = sol_usd()
             bal = self.balance()
@@ -981,25 +1107,35 @@ class Bot:
                 if not bal or low:
                     stake = full
             lam = int(stake / solpx * LAMPORTS)
+            tm["sized"] = time.time()
             q = quote(SOL, p["mint"], lam, S["buy_slip_bps"])
+            tm["quoted"] = time.time()
             imp = impact(q)
             if imp > S["max_impact"]:
                 return skip(f"price impact {imp:.1f}% over the {S['max_impact']:.0f}% limit")
             tx, prio = build_swap(q)
+            tm["built"] = time.time()
             dec = decimals(p["mint"])
             mid = prices([p["mint"]]).get(p["mint"])
             out = int(q["outAmount"])
+            tm["ready"] = time.time()          # the moment a live bot sends (dry run: would send)
+            tm["q_out"] = out; tm["q_in"] = lam; tm["prio"] = prio
             note = []
             if S["mode"] == "live":
-                sig = sign_send(tx)
+                try:
+                    sig = sign_send(tx, tm)
+                finally:
+                    tm["end"] = time.time()
                 dsol, dtok, netfee = fill_of(sig, p["mint"])
                 sol_in = -dsol; out = dtok
                 fee_in = netfee * solpx
+                tm["a_out"] = out; tm["a_in"] = int(round(sol_in * LAMPORTS))
             else:
                 sig = None
                 sol_in = lam / LAMPORTS
                 fee_in = (BASE_FEE_LAMPORTS + prio) / LAMPORTS * solpx
                 note.append(simulate(tx))
+                tm["end"] = time.time()
                 if low:
                     note.append(f"live would skip: {low}")
                 elif stake < full:
@@ -1009,9 +1145,10 @@ class Bot:
             entry_px = usd_in / ui if ui else None
             self.con.execute("""UPDATE trades SET status='open', stake_usd=?, sol_in=?, sol_px=?, tokens0=?, tokens=?,
                                 decimals=?, mid_px=?, entry_px=?, impact_pct=?, fee_in_usd=?, buy_sig=?, buy_note=?,
-                                peak=?, last_px=?, last_px_ts=? WHERE id=?""",
+                                peak=?, last_px=?, last_px_ts=?, timing=? WHERE id=?""",
                              (usd_in, sol_in, solpx, str(out), str(out), dec, mid, entry_px, imp, fee_in, sig,
-                              "; ".join(note) + f"; route {route_label(q)}", mid or entry_px, mid, time.time(), tid))
+                              "; ".join(note) + f"; route {route_label(q)}", mid or entry_px, mid, time.time(),
+                              json.dumps(tm), tid))
             self.con.commit(); DIRTY[0] = True
             event(self.con, "buy", f"{'BOUGHT' if S['mode'] == 'live' else 'would buy'} {sym}: ${usd_in:.2f} "
                                    f"({sol_in:.4f} SOL) at {entry_px:.3g}, {lag:.1f} s after the signal, "
@@ -1021,7 +1158,9 @@ class Bot:
             msg = str(e)[:160]
             if S["mode"] == "live":
                 # a buy that may have landed is kept as 'buying' and settled from the wallet's real balance
-                self.con.execute("UPDATE trades SET last_err=?, next_try=? WHERE id=?", (msg, time.time() + 5, tid))
+                tm.setdefault("end", time.time()); tm["err"] = msg
+                self.con.execute("UPDATE trades SET last_err=?, next_try=?, timing=? WHERE id=?",
+                                 (msg, time.time() + 5, json.dumps(tm), tid))
                 self.con.commit()
                 event(self.con, "bad", f"{sym}: buy problem, checking the wallet: {msg}")
                 self.settle_buying(tid)
@@ -1077,23 +1216,38 @@ class Bot:
             return True
         tries = t["sell_tries"] or 0
         slip = int(min(HARD["sell_slip_bps"], S["sell_slip_bps"] * SELL_LADDER[min(tries, len(SELL_LADDER) - 1)]))
+        # timings for the page (recording only). mid = the guard's latest price, already in hand (no extra lookup)
+        tm = {"start": time.time(), "mid": t.get("last_px"), "mid_ts": t.get("last_px_ts"), "tries": tries + 1,
+              "qty": amount, "frac": frac}
         try:
             solpx = sol_usd()
             q = quote(t["mint"], SOL, amount, slip)
+            tm["quoted"] = time.time()
             tx, prio = build_swap(q)
+            tm["ready"] = time.time()
+            tm["q_out"] = int(q["outAmount"]); tm["prio"] = prio
             if S["mode"] == "live":
-                sig = sign_send(tx)
+                try:
+                    sig = sign_send(tx, tm)
+                finally:
+                    tm["end"] = time.time()
                 dsol, dtok, netfee = fill_of(sig, t["mint"])
                 usd = dsol * solpx + netfee * solpx       # SOL received before the network fee
                 fee = netfee * solpx
                 sold = -dtok
+                tm["a_out"] = int(round((dsol + netfee) * LAMPORTS)); tm["qty"] = sold
             else:
                 sig = None
                 usd = int(q["outAmount"]) / LAMPORTS * solpx
                 fee = (BASE_FEE_LAMPORTS + prio) / LAMPORTS * solpx
                 sold = amount
+                tm["end"] = time.time()
         except Exception as e:
+            tm.setdefault("end", time.time()); tm["err"] = str(e)[:100]
+            self._timing(t["id"], "sell_fails", tm, append=True)
             return self.sell_failed(t, frac, reason, str(e))
+        tm["usd"] = usd; tm["sol_px"] = solpx
+        self._timing(t["id"], "exit" if frac >= 0.999 else "half", tm)
         if frac >= 0.999:
             self.finish(t, usd, fee, sig, reason)
         else:
@@ -1104,6 +1258,19 @@ class Bot:
             self.con.commit(); DIRTY[0] = True
             event(self.con, "sell", f"{'SOLD' if S['mode'] == 'live' else 'would sell'} half of {sym} for ${usd:.2f} ({reason})")
         return True
+
+    def _timing(self, tid, key, val, append=False):
+        """Adds one part (half / exit / a failed sell) to the trade's timing record. Never raises."""
+        try:
+            row = self.con.execute("SELECT timing FROM trades WHERE id=?", (tid,)).fetchone()
+            d = json.loads(row[0]) if row and row[0] else {}
+            if append:
+                d.setdefault(key, []).append(val); d[key] = d[key][-5:]
+            else:
+                d[key] = val
+            self.con.execute("UPDATE trades SET timing=? WHERE id=?", (json.dumps(d), tid))
+        except Exception as e:
+            log(f"timing record failed: {e}")
 
     def sell_failed(self, t, frac, reason, err):
         tries = (t["sell_tries"] or 0) + 1
@@ -1129,7 +1296,9 @@ class Bot:
                                 f"{'+' if pnl >= 0 else '-'}${abs(pnl):.2f} ({reason})")
         if S["mode"] == "live":
             try:
-                close_empty_accounts()
+                close_empty_accounts({r[0] for r in self.con.execute(
+                    "SELECT DISTINCT mint FROM trades WHERE mode='live' AND status='closed'")}
+                    - {r["mint"] for r in self.open_trades()})
             except Exception as e:
                 log(f"closing empty token accounts failed: {e}")
 
@@ -1308,6 +1477,140 @@ class Bot:
         except Exception as e:
             return {"err": type(e).__name__}
 
+    def speed(self):
+        """Read-only speed numbers for the page, from Radium's own engine and its own trades: live-feed uptime and
+        dropouts, how fast wallet buys are seen (live feed vs backup), and Radium's own steps per trade
+        (signal -> decision -> quote -> send -> confirm), failed or retried transactions and quote-vs-fill slippage."""
+        t = time.time()
+        since = meta_get(self.con, "since", t) or t
+        out = {"since": since}
+
+        def stats(v):
+            v = sorted(x for x in v if x is not None)
+            if not v:
+                return {"n": 0}
+            pk = lambda f: v[min(len(v) - 1, int(len(v) * f))]
+            return {"n": len(v), "median": v[len(v) // 2], "p75": pk(0.75), "p90": pk(0.9), "max": v[-1],
+                    "under2": round(100 * sum(1 for x in v if x <= 2) / len(v)),
+                    "under10": round(100 * sum(1 for x in v if x <= 10) / len(v))}
+        eng, sig = {}, {}
+        trades = [dict(r) for r in self.con.execute(
+            "SELECT * FROM trades WHERE mode NOT LIKE 'old-%' AND created_ts>=? ORDER BY id DESC LIMIT 300", (since,))]
+        if os.path.exists(SCANNER_DB):
+            sc = sqlite3.connect(f"file:{SCANNER_DB}?mode=ro", uri=True, timeout=5)
+            try:
+                rows = sc.execute("""SELECT detect_lag_s, COALESCE(detect_src,'poll'), detected_ts FROM signals
+                                     WHERE detect_lag_s IS NOT NULL AND status!='ignored' AND detected_ts>?""",
+                                  (min(since, t - 86400),)).fetchall()
+                d24 = [r for r in rows if r[2] > t - 86400]
+                dsn = [r for r in rows if r[2] >= since]
+                out["lag"] = {"feed_24h": stats([r[0] for r in d24 if r[1] == "stream"]),
+                              "backup_24h": stats([r[0] for r in d24 if r[1] != "stream"]),
+                              "all_24h": stats([r[0] for r in d24]),
+                              "feed_since": stats([r[0] for r in dsn if r[1] == "stream"]),
+                              "backup_since": stats([r[0] for r in dsn if r[1] != "stream"])}
+                n_f = sum(1 for r in d24 if r[1] == "stream")
+                out["src_24h"] = {"feed": n_f, "backup": len(d24) - n_f,
+                                  "feed_pct": round(100 * n_f / len(d24)) if d24 else None}
+                beats = [r[0] for r in sc.execute("SELECT ws FROM heartbeat WHERE ts>? AND ws IS NOT NULL ORDER BY ts", (t - 86400,))]
+                drops = sum(1 for a, b in zip(beats, beats[1:]) if a == 1 and b == 0)
+                try:
+                    fm = sc.execute("SELECT value FROM meta WHERE key='feed'").fetchone()
+                    fm = json.loads(fm[0]) if fm else {}
+                except Exception:
+                    fm = {}
+                fm = fm if isinstance(fm, dict) else {}
+                out["feed"] = {"connected": bool(fm.get("connected")) and t - (fm.get("ts") or 0) < 120,
+                               "helius": "helius" in str(fm.get("url") or ""),
+                               "share_24h": round(100 * sum(1 for b in beats if b == 1) / len(beats)) if beats else None,
+                               "checkins_24h": len(beats), "drops_24h": drops, "reconnects": fm.get("reconnects"),
+                               "connected_for_s": fm.get("uptime_s"), "ts": fm.get("ts")}
+                ids = [r["paper_id"] for r in trades if r["paper_id"] and r["paper_id"] > 0]
+                if ids:
+                    q = ",".join("?" * len(ids))
+                    for r in sc.execute(f"""SELECT id, signal_id, entry_ts, leader_px, seen_px FROM positions
+                                           WHERE account=? AND id IN ({q})""", (C.ACCT_REAL, *ids)):
+                        eng[r[0]] = {"sid": r[1], "entry_ts": r[2], "leader_px": r[3], "seen_px": r[4]}
+                    sids = [v["sid"] for v in eng.values() if v["sid"]]
+                    if sids:
+                        q = ",".join("?" * len(sids))
+                        for r in sc.execute(f"SELECT id, detected_ts, detect_lag_s, detect_src FROM signals WHERE id IN ({q})", sids):
+                            sig[r[0]] = {"det": r[1], "lag": r[2], "src": r[3]}
+            except Exception as e:
+                out["err"] = f"{type(e).__name__}: {str(e)[:100]}"
+            finally:
+                sc.close()
+        per, steps = {}, {k: [] for k in ("detect", "filters", "pickup", "decide", "quote", "build", "ready",
+                                          "wallet_to_ready", "confirm", "sell_quote", "sell_ready", "sell_confirm")}
+        slip_b, slip_s, fails, rebro, sent = [], [], 0, 0, 0
+        for r in trades:
+            try:
+                tm = json.loads(r["timing"]) if r.get("timing") else {}
+            except Exception:
+                tm = {}
+            e = eng.get(r["paper_id"]) or {}
+            s = sig.get(e.get("sid")) or {}
+            wallet_ts = (s["det"] - s["lag"]) if s.get("det") and s.get("lag") is not None else None
+            seen = tm.get("seen") or r["created_ts"]
+            d = lambda a, b: (b - a) if (a is not None and b is not None) else None
+            row = {"detect": s.get("lag"), "src": ({"stream": "live feed"}.get(s.get("src"), "backup") if s else None),
+                   "filters": d(s.get("det"), e.get("entry_ts") or r["paper_entry_ts"]), "pickup": r["lag_s"],
+                   "decide": d(seen, tm.get("decided")), "quote": d(tm.get("sized") or tm.get("decided"), tm.get("quoted")),
+                   "build": d(tm.get("quoted"), tm.get("built")), "ready": d(tm.get("decided"), tm.get("ready")),
+                   "wallet_to_ready": d(wallet_ts, tm.get("ready")), "confirm": d(tm.get("send"), tm.get("confirmed")),
+                   "rebroadcasts": tm.get("rebroadcasts"), "tx_fail": tm.get("fail"), "live": r["mode"] == "live"}
+            if r["status"] != "skipped":
+                for k in ("detect", "filters", "pickup", "decide", "quote", "build", "ready", "wallet_to_ready", "confirm"):
+                    if row[k] is not None:
+                        steps[k].append(row[k])
+            if r["mode"] == "live":
+                if tm.get("send"):
+                    sent += 1; rebro += tm.get("rebroadcasts") or 0; fails += 1 if tm.get("fail") else 0
+                if tm.get("q_out") and tm.get("a_out"):
+                    row["slip_buy"] = (tm["a_out"] / tm["q_out"] - 1) * 100; slip_b.append(row["slip_buy"])
+            sells = [x for x in (tm.get("half"), tm.get("exit")) if x]
+            for x in sells + (tm.get("sell_fails") or []):
+                if r["mode"] == "live" and x.get("send"):
+                    sent += 1; rebro += x.get("rebroadcasts") or 0; fails += 1 if x.get("fail") else 0
+            for x in sells:
+                steps["sell_quote"].append(d(x.get("start"), x.get("quoted")))
+                steps["sell_ready"].append(d(x.get("start"), x.get("ready")))
+                if x.get("confirmed"):
+                    steps["sell_confirm"].append(d(x.get("send"), x.get("confirmed")))
+                if r["mode"] == "live" and x.get("q_out") and x.get("a_out"):
+                    slip_s.append((x["a_out"] / x["q_out"] - 1) * 100)
+            row["sell_tries"] = sum(1 for _ in (tm.get("sell_fails") or []))
+            # money breakdown, like the Rage Meme Bot page: ideal (wallet's own price, no costs) - lost to delay
+            # - price impact + DEX fees - bot fee (none: Jupiter direct) - network = what Radium kept
+            if r["status"] == "closed" and r["stake_usd"] and r["mid_px"] and r["tokens0"] and r["decimals"] is not None:
+                dec = 10 ** r["decimals"]
+                q0 = int(r["tokens0"]) / dec
+                parts = [(x.get("qty"), x.get("mid")) for x in sells]
+                if q0 > 0 and parts and all(q and m for q, m in parts):
+                    vmid = sum(q / dec * m for q, m in parts)
+                    S_, M = r["stake_usd"], r["mid_px"]
+                    W = e.get("leader_px")
+                    vpt = vmid / q0
+                    P = (r["half_usd"] or 0) + (r["exit_usd"] or 0)
+                    net = (r["fee_in_usd"] or 0) + (r["fee_out_usd"] or 0)
+                    at_mid = S_ * vpt / M - S_
+                    ideal = (S_ * vpt / W - S_) if W else None
+                    row["fill"] = {"ideal": ideal, "delay": (ideal - at_mid) if ideal is not None else None,
+                                   "at_mid": at_mid, "impact": S_ * vpt / M - P, "botfee": 0.0, "netfee": net,
+                                   "kept": P - S_ - net, "move_pct": ((M / W - 1) * 100) if W else None}
+            per[r["id"]] = row
+        out["steps"] = {k: stats(v) for k, v in steps.items()}
+        out["tx"] = {"sent": sent, "failed": fails, "rebroadcasts": rebro, "slip_buy": stats(slip_b), "slip_sell": stats(slip_s),
+                     "live_counts": dict(TXS)}
+        fl = [v["fill"] for v in per.values() if v.get("fill")]
+        sm = lambda k: sum(f[k] for f in fl if f.get(k) is not None)
+        out["fill_total"] = {"n": len(fl), "ideal": sm("ideal"), "delay": sm("delay"), "impact": sm("impact"),
+                             "botfee": 0.0, "netfee": sm("netfee"), "kept": sm("kept"),
+                             "n_ideal": sum(1 for f in fl if f.get("ideal") is not None)} if fl else {"n": 0}
+        out["per"] = per
+        out["recorded_from"] = meta_get(self.con, "timing_since")
+        return out
+
     def publish_page(self):
         """Its own page (rage-radium-bot repo) reads radium.enc from the radium-data branch: the status sealed with
         RADIUM_DASH_KEY, so only someone with the page link's key can read it. Runs in a thread, never blocks."""
@@ -1458,6 +1761,13 @@ class Bot:
         except Exception as e:
             px_extra = {"err": str(e)[:160]}
         names = px_extra.get("names") or {}
+        try:
+            spd = self.speed()
+        except Exception as e:
+            spd = {"err": f"{type(e).__name__}: {str(e)[:160]}"}
+        per = spd.pop("per", {}) or {}
+        wv = WALLET_VIEW
+
         def tr(r):
             ui = int(r["tokens"] or 0) / 10 ** (r["decimals"] or 0) if r["decimals"] is not None else 0
             val = ui * (r["last_px"] or 0)
@@ -1473,7 +1783,8 @@ class Bot:
                     "qty": ui, "mid": r["mid_px"], "peak": r["peak"] or r["paper_peak"], "be": r["paper_be"],
                     "floor": r["paper_floor"], "fee_in": r["fee_in_usd"], "fee_out": r["fee_out_usd"], "half_ts": r["half_ts"],
                     "sol_in": r["sol_in"], "px_ts": r["last_px_ts"], "paper_entry_ts": r["paper_entry_ts"],
-                    "qty0": int(r["tokens0"] or 0) / 10 ** (r["decimals"] or 0) if r["decimals"] is not None and r["tokens0"] else None}
+                    "qty0": int(r["tokens0"] or 0) / 10 ** (r["decimals"] or 0) if r["decimals"] is not None and r["tokens0"] else None,
+                    "spd": per.get(r["id"])}
         closed = [r for r in rows if r["status"] == "closed"]
         allc = self.con.execute("SELECT COUNT(*), COALESCE(SUM(pnl_usd),0), COALESCE(SUM(paper_pnl),0), SUM(pnl_usd>0) FROM trades WHERE status='closed' AND mode=?", (S["mode"],)).fetchone()
         nskip = self.con.execute("SELECT COUNT(*) FROM trades WHERE status='skipped' AND mode NOT LIKE 'old-%'").fetchone()[0]
@@ -1495,6 +1806,9 @@ class Bot:
               "events": [dict(e) for e in self.con.execute("SELECT ts,kind,msg FROM events ORDER BY id DESC LIMIT 40")],
               "unmanaged_tokens": meta_get(self.con, "unmanaged_tokens", 0),
               "engine": self.engine_info(),
+              "speed": spd,
+              # every coin in the wallet, dust included (display only; the address itself is never written)
+              "wallet": {"ts": wv["ts"], "err": wv["err"], **(wv["data"] or {})} if WALLET["address"] else None,
               "page": {k: v for k, v in px_extra.items() if k != "names"}}
         tmp = STATUS + ".tmp"
         with open(tmp, "w") as f:
@@ -1516,6 +1830,8 @@ class Bot:
                 S["mode"] = "dry-run"
             else:
                 self.reconcile()
+        if meta_get(self.con, "timing_since") is None:
+            meta_set(self.con, "timing_since", time.time()); self.con.commit()
         self.balance()
         while True:
             now = time.time()
@@ -1559,8 +1875,9 @@ class Bot:
                         return
             if now - self.last_status > 10:
                 self.balance()
+                self.refresh_wallet_view()
                 self.write_status()
-                if now - getattr(self, "last_pub", 0) > 60:
+                if now - getattr(self, "last_pub", 0) > 30:     # 30 s so the page's wallet balance stays fresh
                     self.last_pub = now
                     self.publish_page()
             time.sleep(1)
