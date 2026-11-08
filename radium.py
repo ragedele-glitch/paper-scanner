@@ -1297,7 +1297,7 @@ class Bot:
             return
         self.last_status = time.time()
         ctl = control()
-        rows = [dict(r) for r in self.con.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 60")]
+        rows = [dict(r) for r in self.con.execute("SELECT * FROM trades WHERE mode NOT LIKE 'old-%' ORDER BY id DESC LIMIT 60")]
         def tr(r):
             ui = int(r["tokens"] or 0) / 10 ** (r["decimals"] or 0) if r["decimals"] is not None else 0
             val = ui * (r["last_px"] or 0)
@@ -1310,7 +1310,7 @@ class Bot:
                     "err": r["last_err"], "tries": r["sell_tries"], "stop": r["gstop"] or r["paper_stop"]}
         closed = [r for r in rows if r["status"] == "closed"]
         allc = self.con.execute("SELECT COUNT(*), COALESCE(SUM(pnl_usd),0), COALESCE(SUM(paper_pnl),0), SUM(pnl_usd>0) FROM trades WHERE status='closed' AND mode=?", (S["mode"],)).fetchone()
-        nskip = self.con.execute("SELECT COUNT(*) FROM trades WHERE status='skipped'").fetchone()[0]
+        nskip = self.con.execute("SELECT COUNT(*) FROM trades WHERE status='skipped' AND mode NOT LIKE 'old-%'").fetchone()[0]
         bal = self.bal["sol"]
         solpx = _J["sol"][1] or None
         st = {"v": 1, "ts": time.time(), "mode": S["mode"], "role": self.role, "run": RUN_ID, "state": self.mode_now,
