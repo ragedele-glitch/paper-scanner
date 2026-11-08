@@ -1044,9 +1044,43 @@ TICK_SAVED = {}     # mint -> (ts, px) last recorded, to skip repeats
 PEND = {}           # (position id, copy name) -> [trigger ts, stop level, reason]: a stop hit, sell at the next price
 
 
+SRC_SEEN = {}       # mint -> {source: [value, ts the value last changed, ts last seen]}: spots a frozen (cached) source
+
+
+def tick_pick(m, cand, t):
+    """Fix, Nov 8 1 AM: DexScreener's token prices are cached (the same value for ~30 s, and behind Jupiter on fresh
+    pump coins), so a source that still answers can be stale. Note when each source's value last changed; use the
+    freshest. A price frozen for more than TICK_STALE_S counts as no live price at all, so after TICK_FRESH_S the
+    trade falls back to candle checks instead of sitting on an old price."""
+    seen = SRC_SEEN.setdefault(m, {})
+    for src, v in cand.items():
+        s = seen.get(src)
+        if s is None or s[0] != v:
+            seen[src] = [v, t, t]
+        else:
+            s[2] = t
+    live = [(t - seen[src][1], 0 if src == "jupiter" else 1, src) for src in cand if t - seen[src][1] <= C.TICK_STALE_S]
+    if not live:
+        return None
+    src = min(live)[2]
+    return (t, cand[src], src)
+
+
 def tick_fetch(want):
     t = now(); got = {}
     mints = list(want)
+    jup = {}
+    # Jupiter first, every tick (it follows each swap; DexScreener is cached)
+    try:
+        d = fills._jup("/price/v3?ids=" + ",".join(mints[:50])) or {}
+        TICK_STATS["jup_last"] = now()
+        for m in mints[:50]:
+            v = (d.get(m) or {}).get("usdPrice")
+            if v and float(v) > 0:
+                jup[m] = float(v)
+    except Exception as e:
+        TICK_STATS["fail"] += 1; TICK_STATS["err"] = f"jupiter {type(e).__name__}"
+    dexp = {}
     for i in range(0, len(mints), 30):
         chunk = mints[i:i + 30]
         try:
@@ -1071,18 +1105,23 @@ def tick_fetch(want):
             except (TypeError, ValueError):
                 v = 0
             if v > 0:
-                got[m] = (t, v, "dexscreener")
-    rest = [m for m in mints if m not in got]
-    if rest and now() - TICK_STATS["jup_last"] >= C.TICK_JUP_S:   # backup, kept rare: Jupiter's keyless limit is shared
-        TICK_STATS["jup_last"] = now()
-        try:
-            d = fills._jup("/price/v3?ids=" + ",".join(rest[:50])) or {}
-            for m in rest[:50]:
-                v = (d.get(m) or {}).get("usdPrice")
-                if v and float(v) > 0:
-                    got[m] = (now(), float(v), "jupiter")
-        except Exception as e:
-            TICK_STATS["fail"] += 1; TICK_STATS["err"] = f"jupiter {type(e).__name__}"
+                dexp[m] = v
+    t = now()
+    for m in mints:
+        cand = {}
+        if m in jup:
+            cand["jupiter"] = jup[m]
+        if m in dexp:
+            cand["dexscreener"] = dexp[m]
+        if cand:
+            pk = tick_pick(m, cand, t)
+            if pk:
+                got[m] = pk
+            else:
+                TICK_STATS["stale"] = TICK_STATS.get("stale", 0) + 1
+    for m in list(SRC_SEEN):
+        if m not in want:
+            SRC_SEEN.pop(m, None)
     if got:
         TICK_STATS["ok"] += 1; TICK_STATS["last_ok"] = now()
         with TICK_LOCK:

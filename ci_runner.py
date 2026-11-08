@@ -29,7 +29,7 @@ _RADIUM_KEY = os.environ.pop("RADIUM_WALLET_KEY", "")
 RADIUM_ON = (os.environ.get("RADIUM_MODE", "").strip().lower() or "dry-run") != "off"
 REPO = os.environ.get("GITHUB_REPOSITORY", "")
 TOKEN = os.environ.get("GITHUB_TOKEN", "")
-PUBLISH_EVERY = 120
+PUBLISH_EVERY = 60   # dashboard data every minute (was 2 min; Nov 8)
 
 
 def key():

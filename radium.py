@@ -322,12 +322,21 @@ def decimals(mint):
 
 
 def prices(mints, pools=None):
-    """{mint: usd price} from DexScreener (the trade's own pool, else the most liquid pair), Jupiter for the rest."""
+    """{mint: usd price} from Jupiter first (live), DexScreener only for coins Jupiter does not price.
+    Nov 8 fix: DexScreener's prices are cached for ~30 s and lag fresh pump coins, so they are the backup now."""
     pools = pools or {}
     out = {}
     mints = list(dict.fromkeys(mints))
-    for i in range(0, len(mints), 30):
-        part = mints[i:i + 30]
+    try:
+        j = http("https://lite-api.jup.ag/price/v3?ids=" + ",".join(mints[:50]), timeout=10, tries=1) or {}
+        for m in mints[:50]:
+            if j.get(m) and j[m].get("usdPrice"):
+                out[m] = float(j[m]["usdPrice"])
+    except Exception:
+        pass
+    rest = [m for m in mints if m not in out]
+    for i in range(0, len(rest), 30):
+        part = rest[i:i + 30]
         try:
             pairs = http("https://api.dexscreener.com/tokens/v1/solana/" + ",".join(part), timeout=10, tries=1)
             best = {}
@@ -340,15 +349,6 @@ def prices(mints, pools=None):
                     if m not in best or liq > best[m][0]:
                         best[m] = (liq, float(p["priceUsd"]))
             out.update({m: v[1] for m, v in best.items()})
-        except Exception:
-            pass
-    miss = [m for m in mints if m not in out]
-    if miss:
-        try:
-            j = http("https://lite-api.jup.ag/price/v3?ids=" + ",".join(miss[:50]), timeout=10, tries=1)
-            for m in miss:
-                if j.get(m) and j[m].get("usdPrice"):
-                    out[m] = float(j[m]["usdPrice"])
         except Exception:
             pass
     return out
