@@ -1511,8 +1511,8 @@ class Bot:
                     ms = range(h * 60, min((h + 1) * 60, int(t // 60) + 1))
                     cells.append({"h": h * 3600, "pct": round(100 * sum(1 for m in ms if cov(m)) / max(1, len(ms))),
                                   "before": (h + 1) * 3600 <= first})
-                def share(sec):
-                    ms = range(int((t - sec) // 60), int(t // 60) + 1)
+                def share(sec):     # counted from the engine's first check-in when it started inside the window
+                    ms = range(int(max(t - sec, first) // 60), int(t // 60) + 1)
                     return round(100 * sum(1 for m in ms if cov(m)) / len(ms), 1)
                 out["uptime"] = {"h24": share(86400), "h48": share(48 * 3600), "cells": cells, "first": first}
                 for ts, st in sc.execute("SELECT detected_ts, status FROM signals WHERE detected_ts>?",
