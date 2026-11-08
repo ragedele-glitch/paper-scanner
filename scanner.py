@@ -917,6 +917,8 @@ def manual_close(con):
     mints = list(M["mints"])
     rows = con.execute(f"SELECT * FROM positions WHERE status='open' AND entry_ts<? AND mint IN ({','.join('?' * len(mints))}) "
                        "ORDER BY account", [M["requested_ts"]] + mints).fetchall()
+    if M.get("accounts") is not None:   # only these accounts (e.g. the main $200 account)
+        rows = [r for r in rows if r["account"] in M["accounts"]]
     quotes = live_quotes([r["mint"] for r in rows]) if rows else {}
     pending = 0
     for r in rows:

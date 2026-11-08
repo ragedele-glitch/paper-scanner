@@ -88,10 +88,12 @@ PAPER_RESET = {"id": "2026-11-07-200", "accounts": [ACCT_REAL, ACCT_5S]}   # rea
 # sold at the live market price (Jupiter, DexScreener backup) with the bot's normal paper costs, reason "closed manually
 # by Rage". only_if_loss: a trade that has moved into profit by then is left open and logged. A trade with no live price
 # is never closed on a made-up one: it is retried at the next start until expires_ts, then dropped.
-MANUAL_CLOSE = {"id": "2026-11-07-rage-close-losers", "requested_ts": 1794047160.0,   # Sat Nov 7, 10:26 UTC
-                "expires_ts": 1794047160.0 + 12 * 3600, "only_if_loss": True,
-                "mints": {"BSe1q3SL6KQPLeZHFG9nNw5VFbDL3ZXvBmtjBVpYpump": "SMOOVE",
-                          "CFYhdWXsYfS7swnJgHRwb5toTHMEQD7Ljd5gGwKLpump": "KILROY"}}
+# Earlier one-time close (done): "2026-11-07-rage-close-losers" (SMOOVE, KILROY, losers only).
+# Rage, Sun Nov 8 12:58 AM Lagos: "Close the trade while you fix that" -> close the open "invest" trade on the main
+# $200 account only, at the live Jupiter price, with the normal paper sell costs. Other accounts keep theirs.
+MANUAL_CLOSE = {"id": "2026-11-08-rage-close-invest", "requested_ts": 1794096120.0,   # Sun Nov 8, 00:02 UTC (1:02 AM Lagos)
+                "expires_ts": 1794096120.0 + 3 * 3600, "only_if_loss": False, "accounts": [11],
+                "mints": {"5shzBFRCpn5H8fJcWyCpd1s7avjgY1gMbPBU6nFvukij": "invest"}}
 HF_TOP10_MAX = 22.0
 HF_RT_MAX = 20.0
 # Pool-band shadow test (Rage, Nov 7 evening). LOGGED ONLY: it never skips, blocks or sells anything. For every new
