@@ -325,22 +325,28 @@ def decimals(mint):
     return _J["dec"][mint]
 
 
+PX_SEEN = {}       # mint -> {source: [value, ts the value last changed]}: spots a frozen (cached) price source
+PX_STALE_S = 15    # same rule as the paper scanner's live checks (Nov 8 fix): a price unchanged this long is stale
+
+
 def prices(mints, pools=None):
-    """{mint: usd price} from Jupiter first (live), DexScreener only for coins Jupiter does not price.
-    Nov 8 fix: DexScreener's prices are cached for ~30 s and lag fresh pump coins, so they are the backup now."""
+    """{mint: usd price}. Asks Jupiter and DexScreener every time and uses the freshest: the source whose value
+    changed most recently, Jupiter on a tie. Nov 8 fix (same as the paper scanner's live checks): DexScreener caches
+    prices for ~30 s and lagged the 'invest' trade, so a source whose price has not changed for more than 15 s is
+    treated as stale and the other one is used. If both are stale, the most recently changed one is still used,
+    so the stops keep working on a quiet coin, and the guard notes it."""
     pools = pools or {}
-    out = {}
     mints = list(dict.fromkeys(mints))
+    jup, dex = {}, {}
     try:
         j = http("https://lite-api.jup.ag/price/v3?ids=" + ",".join(mints[:50]), timeout=10, tries=1) or {}
         for m in mints[:50]:
-            if j.get(m) and j[m].get("usdPrice"):
-                out[m] = float(j[m]["usdPrice"])
+            if j.get(m) and j[m].get("usdPrice") and float(j[m]["usdPrice"]) > 0:
+                jup[m] = float(j[m]["usdPrice"])
     except Exception:
         pass
-    rest = [m for m in mints if m not in out]
-    for i in range(0, len(rest), 30):
-        part = rest[i:i + 30]
+    for i in range(0, len(mints), 30):
+        part = mints[i:i + 30]
         try:
             pairs = http("https://api.dexscreener.com/tokens/v1/solana/" + ",".join(part), timeout=10, tries=1)
             best = {}
@@ -352,9 +358,25 @@ def prices(mints, pools=None):
                         liq = 1e18
                     if m not in best or liq > best[m][0]:
                         best[m] = (liq, float(p["priceUsd"]))
-            out.update({m: v[1] for m, v in best.items()})
+            dex.update({m: v[1] for m, v in best.items() if v[1] > 0})
         except Exception:
             pass
+    t = time.time()
+    out = {}
+    for m in mints:
+        cand = {k: v for k, v in (("jupiter", jup.get(m)), ("dexscreener", dex.get(m))) if v}
+        if not cand:
+            continue
+        seen = PX_SEEN.setdefault(m, {})
+        for src, v in cand.items():
+            if src not in seen or seen[src][0] != v:
+                seen[src] = [v, t]
+        ranked = sorted((t - seen[src][1], 0 if src == "jupiter" else 1, src) for src in cand)
+        out[m] = cand[ranked[0][2]]
+        PX_SEEN[m]["_pick"] = [ranked[0][2], ranked[0][0] > PX_STALE_S]
+    for m in list(PX_SEEN):
+        if m not in mints and len(PX_SEEN) > 200:
+            PX_SEEN.pop(m, None)
     return out
 
 
