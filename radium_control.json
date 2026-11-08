@@ -1,7 +1,7 @@
 {
- "pause": false,
+ "pause": true,
  "sell_all_and_stop": false,
- "set": "resume",
- "by": "setup",
- "at": "2026-11-07 23:00:00 UTC"
+ "set": "pause",
+ "by": "assistant for Rage (wallet funded, fix in progress)",
+ "at": "2026-11-08 07:58:28 UTC"
 }
