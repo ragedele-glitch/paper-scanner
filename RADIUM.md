@@ -17,10 +17,10 @@ Page data: `radium.enc` on the `radium-data` branch, sealed with the `RADIUM_DAS
 the `ragedele-glitch/rage-radium-bot` repo. The wallet address is never written to it.
 
 ## Modes (repository variable `RADIUM_MODE`)
-- `dry-run` (now): real Jupiter quotes and real swap transactions built for the bot's wallet, then thrown away.
+- `dry-run`: real Jupiter quotes and real swap transactions built for the bot's wallet, then thrown away.
   Nothing is signed or sent.
-- `live`: signs and sends. Only after the wallet is funded, the key secret is added, the limits are confirmed and
-  Rage says go.
+- `live` (now, since Nov 14 at Rage's request): signs and sends real trades. Set while the phone switch is on Pause,
+  so nothing buys until Rage resumes it himself.
 - `off`: Radium doesn't run.
 
 ## Wallet
@@ -39,9 +39,9 @@ the `ragedele-glitch/rage-radium-bot` repo. The wallet address is never written 
 ## Settings (repository variables, Settings > Secrets and variables > Actions > Variables)
 | Variable | Default | Meaning |
 |---|---|---|
-| RADIUM_MAX_LOSS_USD | 5 | stake sized so the −25% stop loses about this, costs included |
-| RADIUM_MAX_STAKE_USD | 20 | never stake more than this |
-| RADIUM_MIN_STAKE_USD | 8 | skip if costs would push the stake below this |
+| RADIUM_MAX_LOSS_USD | 5 | Radium's own max-loss line: sells everything at this loss; a coin whose costs would make the −25% stop lose more is skipped (now $2) |
+| RADIUM_MAX_STAKE_USD | 20 | buy size per trade, never more than this (now $4) |
+| RADIUM_MIN_STAKE_USD | 5 | no buy below this; equal to the max stake for a fixed buy size (now $4) |
 | RADIUM_MAX_OPEN | 3 | max open trades |
 | RADIUM_DAILY_LOSS_USD | 15 | no new buys after this much lost today (Lagos day) |
 | RADIUM_TOTAL_LOSS_USD | 30 | no new buys after this much lost in total |
