@@ -1023,7 +1023,7 @@ class Bot:
                 if wts - last >= 300:
                     self.con.execute("INSERT OR REPLACE INTO wallet_hist VALUES (?,?,?,?)",
                                      (wts, wd.get("total_usd"), wd.get("sol"), wd.get("sol_px")))
-                    self.con.execute("DELETE FROM wallet_hist WHERE ts<?", (wts - 7 * 86400,))
+                    self.con.execute("DELETE FROM wallet_hist WHERE ts<?", (wts - 90 * 86400,))
                     self.con.commit(); DIRTY[0] = True
             except Exception as e:
                 log(f"wallet history: {e}")
@@ -1546,6 +1546,10 @@ class Bot:
         out["hours"] = [cnt[h] for h in hours]
         out["balance"] = [[r[0], r[1]] for r in self.con.execute(
             "SELECT ts, total_usd FROM wallet_hist WHERE ts>? AND total_usd IS NOT NULL ORDER BY ts", (t - 48 * 3600,))]
+        allb = [[r[0], r[1]] for r in self.con.execute(
+            "SELECT ts, total_usd FROM wallet_hist WHERE total_usd IS NOT NULL ORDER BY ts")]
+        step = max(1, -(-len(allb) // 400))      # the whole kept history for the balance chart, at most ~400 points
+        out["balance_all"] = allb[::step] + ([allb[-1]] if allb and (len(allb) - 1) % step else [])
         return out
 
     def speed(self):
