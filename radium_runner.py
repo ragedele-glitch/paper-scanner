@@ -20,6 +20,7 @@ ESTATE = os.path.join(HERE, "engine_state")
 EDB = os.path.join(ESTATE, "scanner.db")
 ELOG = os.path.join(ESTATE, "scanner.log")
 FOLLOW = os.path.join(ESTATE, "follow.json")
+PAPER_WALLETS = os.path.join(ESTATE, "paper_wallets.json")   # main bot's wallet ranking and scorecard, for the page only
 PAPER_DB = os.path.join(HERE, "state", "scanner.db")     # paper scanner's saved state, read only, for the wallet list
 RSTATE = os.environ.get("RADIUM_STATE_DIR", os.path.join(HERE, "radium_state"))
 RADIUM_PID = os.path.join(RSTATE, "daemon.pid")
@@ -93,6 +94,34 @@ def follow_from_data_branch():
     return write_follow(d.get("wallets") or [], "paper live list")
 
 
+def wallets_view_from_data_branch():
+    """The main bot's wallet ranking (Kolscan rank, profit, wins/losses), its wallet scorecard and its per-wallet
+    results, from state.enc on the data branch, for Radium's page only. Trading never reads this file."""
+    if not REPO:
+        return False
+    try:
+        req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/contents/state.enc?ref=data&t={int(time.time())}",
+                                     headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github.raw",
+                                              "User-Agent": "rage-radium-bot"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = base64.b64decode(r.read().strip())
+        d = json.loads(gzip.decompress(aes().decrypt(raw[:12], raw[12:], None)))
+        b = d.get("wallet_board") if isinstance(d.get("wallet_board"), dict) else None
+        out = {"ts": d.get("now") or time.time(), "read": time.time(),
+               "wallets": [{k: w.get(k) for k in ("name", "addr", "rank", "pnl_usd", "wins", "losses")}
+                           for w in (d.get("wallets") or []) if isinstance(w, dict)],
+               "card": d.get("wallet_card"),
+               "board": ({k: b.get(k) for k in ("min_trades", "quick_dump_min", "real", "real_since", "error")} if b else None)}
+        tmp = PAPER_WALLETS + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(out, f)
+        os.replace(tmp, PAPER_WALLETS)
+        return True
+    except Exception as e:
+        log("wallet ranking not read:", type(e).__name__)
+        return False
+
+
 def prepare():
     os.makedirs(ESTATE, exist_ok=True)
     os.makedirs(RSTATE, exist_ok=True)
@@ -104,6 +133,7 @@ def prepare():
     log("engine state restored" if os.path.exists(EDB) else "engine starts with a fresh database")
     if not follow_from_data_branch():
         follow_from_paper_db()
+    wallets_view_from_data_branch()
     if not os.path.exists(FOLLOW):
         log("WARNING: no wallet list yet: the engine follows nobody (no buys) until one arrives")
 
@@ -202,6 +232,7 @@ def run(minutes, last):
         radium_start()
         if time.time() >= next_follow:
             follow_from_data_branch()
+            wallets_view_from_data_branch()
             next_follow = time.time() + 300
         if last and RADIUM_ON and not bridged and end - time.time() < 420:
             if dispatch("radium-bridge.yml"):

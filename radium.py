@@ -802,6 +802,16 @@ except Exception:
     DFILT = {}
 
 
+def paper_wallets_view():
+    """Main bot's wallet ranking, scorecard and per-wallet results (radium_runner.py copies them every 5 minutes). Page only."""
+    try:
+        with open(os.path.join(os.path.dirname(SCANNER_DB), "paper_wallets.json")) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
 def short_addr(a):
     return (a[:4] + "…" + a[-4:]) if a and len(a) > 10 else (a or "")
 
@@ -1806,6 +1816,17 @@ class Bot:
                            "k_pnl": r.get("pnl_usd"), "k_wins": r.get("wins"), "k_losses": r.get("losses"),
                            "every_s": r.get("poll_s"), "last_check": r.get("last_poll"),
                            "sig_7d": sn[0], "pass_7d": sn[1], "kill_7d": sn[2], **d})
+            pw = paper_wallets_view()
+            if pw:
+                pr = {w.get("addr"): w for w in pw.get("wallets") or []}
+                for w in ws:      # the engine doesn't fetch the Kolscan board; show the main bot's ranking for the same wallet
+                    m = pr.get(w["addr"])
+                    if m:
+                        for k, mk in (("rank", "rank"), ("k_pnl", "pnl_usd"), ("k_wins", "wins"), ("k_losses", "losses")):
+                            if m.get(mk) is not None:
+                                w[k] = m[mk]
+                ws.sort(key=lambda w: (w["rank"] if w["rank"] is not None else 999, w["name"]))
+                out["main_wallets"] = {"ts": pw.get("ts"), "read": pw.get("read"), "card": pw.get("card"), "board": pw.get("board")}
             out["wallets"] = ws
         finally:
             sc.close()
