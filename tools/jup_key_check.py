@@ -13,6 +13,12 @@ print("non-alphanumeric characters used (and counts):", {c: key.count(c) for c i
 print("looks like a JWT/session token (eyJ... with 2 dots):", key.startswith("eyJ") and key.count(".") == 2)
 print("looks like a URL:", key.lower().startswith(("http:", "https:")))
 print("dot-separated part lengths:", [len(p) for p in key.split(".")])
+if key.lower().startswith(("http:", "https:")):
+    from urllib.parse import urlsplit, parse_qsl
+    u = urlsplit(key)
+    print("URL host:", u.netloc, "| path segments:", [len(s) for s in u.path.split("/") if s],
+          "| query parameter names:", [k for k, _ in parse_qsl(u.query, keep_blank_values=True)],
+          "| query value lengths:", [len(v) for _, v in parse_qsl(u.query, keep_blank_values=True)])
 
 SOL = "So11111111111111111111111111111111111111112"
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
