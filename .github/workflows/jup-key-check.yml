@@ -1,0 +1,20 @@
+# Checks the JUP_API_KEY secret against Jupiter and prints only status codes, Jupiter's error text and the key's
+# shape (length, stray spaces/quotes/newlines). The key itself is never printed. Touches no bot, wallet or setting.
+name: Jupiter key check
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check the key
+        env:
+          JUP_API_KEY: ${{ secrets.JUP_API_KEY }}
+        run: python tools/jup_key_check.py
