@@ -270,6 +270,28 @@ def refresh_board(con):
     log.info("board refreshed: %d rows parsed, %d wallets followed", len(rows), len(cand))
 
 
+def follow_only_rows(con, t):
+    """Make sure every wallet on Rage's approved list (follow_list.json) has a row, so it can be followed."""
+    for a, n in C.FOLLOW_ONLY.items():
+        con.execute("""INSERT INTO wallets(address,name,first_seen,last_seen,last_rank,poll_s,last_poll)
+            VALUES(?,?,?,?,99,60,0) ON CONFLICT(address) DO NOTHING""", (a, n, t, t))
+    return list(C.FOLLOW_ONLY)
+
+
+def apply_follow_only(con):
+    """Rage's approved list (Nov 14): follow exactly these wallets now, at start, instead of waiting for the next
+    leaderboard refresh. Nothing else changes: scores, history and benched/removed lists stay as they are."""
+    if C.ENGINE or not C.FOLLOW_ONLY:
+        return False
+    keep = follow_only_rows(con, now())
+    con.execute("UPDATE wallets SET active=0")
+    for a in keep:
+        con.execute("UPDATE wallets SET active=1 WHERE address=?", (a,))
+    con.commit()
+    log.info("following Rage's approved list only (%d wallets): %s", len(keep), ", ".join(C.FOLLOW_ONLY.values()))
+    return True
+
+
 def follow_set(con, t):
     """Wallets to follow, from Rage's checklist scorecard (walletcard.py).
     Pinned (Stigman, Fox) always; then wallets that made the bot money (seen on the board in the last 14 days);
@@ -316,9 +338,14 @@ def follow_set(con, t):
         rest = sorted((a for a, c in cards.items() if c["status"] in ("keep", "new") and a not in pinned and a not in proven
                        and seen.get(a, 0) > t - C.BOARD_KEEP_DAYS * 86400 and pos.get(a, 0) > 0),
                       key=lambda a: (cards[a]["status"] != "keep", -cards[a]["total"]))
+        if C.FOLLOW_ONLY:   # Rage's approved list: scores above are kept for review, but they don't pick wallets
+            return follow_only_rows(con, t)
         out = [a for a in pinned if a in seen] + proven + rest
         return out[:C.MAX_WALLETS + len(pinned)]
     except Exception as e:
+        if C.FOLLOW_ONLY:
+            log.warning("wallet scorecard failed (%s), still following Rage's approved list", e)
+            return follow_only_rows(con, t)
         log.warning("wallet scorecard failed (%s), following the board as before", e)
         return old[:C.MAX_WALLETS]
 
@@ -2438,6 +2465,10 @@ def main():
     if C.ENGINE:
         engine_wallets(con, force=True)
     else:
+        try:
+            apply_follow_only(con)
+        except Exception as e:   # never let it stop the scanner; the board refresh applies the list too
+            log.warning("approved wallet list error %s", e); con.rollback()
         try:   # wallet-score shadow test (logged only, never blocks): GMGN read in a background thread, new trades only
             wscore.start(con)
         except Exception as e:
@@ -2471,6 +2502,8 @@ def main():
              "scanner start (PAPER MODE ONLY - no wallet, no keys, nothing signed)")
     if C.REMOVED_ERROR:
         log.warning("removed_wallets.json could not be read (%s): no wallets removed this run", C.REMOVED_ERROR)
+    if C.FOLLOW_ONLY_ERROR:
+        log.warning("follow_list.json could not be read (%s): wallets picked automatically this run", C.FOLLOW_ONLY_ERROR)
     STREAM = streammod.WalletStream(C.WS_URLS, noisy=(meta_get(con, "feed") or {}).get("noisy") or [], keepalive=C.ENGINE)
     STREAM.set_wallets([r[0] for r in con.execute("SELECT address FROM wallets WHERE active=1")])
     if not STREAM.start():

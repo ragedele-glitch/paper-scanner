@@ -39,6 +39,21 @@ try:
     REMOVED_ERROR = None
 except Exception as _e:   # a broken file must not stop the scanner; the error is logged at start
     REMOVED_WALLETS = set(); REMOVED_ERROR = f"{type(_e).__name__}: {_e}"
+# Rage's approved wallet list (follow_list.json, Nov 14): while it is on, the paper bot follows exactly these wallets
+# (removed wallets still left out) and the leaderboard refresh only scores wallets, it never adds, swaps or benches
+# a followed one. Radium copies the paper bot's list. Empty dict = automatic picking as before.
+FOLLOW_ONLY = {}
+FOLLOW_ONLY_ERROR = None
+try:
+    _fl = _json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "follow_list.json")))
+    if _fl.get("on"):
+        for _w in _fl.get("wallets") or []:
+            if _w.get("address") and _w["address"] not in REMOVED_WALLETS:
+                FOLLOW_ONLY[_w["address"]] = (_w.get("name") or "")[:40]
+except FileNotFoundError:
+    pass
+except Exception as _e:   # a broken file must not stop the scanner; it falls back to automatic picking and logs it
+    FOLLOW_ONLY = {}; FOLLOW_ONLY_ERROR = f"{type(_e).__name__}: {_e}"
 # Rage Radium Bot's own signal engine (radium.yml, Nov 8): the same scanner code run as a separate process with
 # RADIUM_ENGINE=1 and its own database. It reads the wallets' buys and sells itself, runs the main account's filters
 # and exits on one $20 position per signal, and skips everything that only exists for the paper tests (shadow and

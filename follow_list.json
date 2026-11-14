@@ -1,0 +1,19 @@
+{
+ "about": "Rage's approved wallet list (Nov 14, 2026). While 'on' is true, the paper bot (Rage Meme Bot) follows exactly these wallets and nothing else, and Rage Radium Bot copies the paper bot's list, so it follows the same ones. The leaderboard refresh still scores every wallet for the scorecard, but it no longer adds, swaps or benches followed wallets: the list only changes when Rage changes this file. Removed wallets (removed_wallets.json) are never followed even if listed here. To go back to automatic picking, set 'on' to false.",
+ "on": true,
+ "set": "2026-11-14",
+ "wallets": [
+  {"address": "8fsKLLtvKNanL4ginCaiRS6UfeemY11rSf8U8fN1dJw4", "name": "Stigman"},
+  {"address": "DAEdBmTPEKM6xkwfzC3d411QUe6coKpkND6UURa4CvHC", "name": "Fox"},
+  {"address": "DrJ6SnDXkEsPeGdmSs93v5rwWumv5QMvAGSZjAyWSd5o", "name": "Iced"},
+  {"address": "BQVz7fQ1WsQmSTMY3umdPEPPTm1sdcBcX9sP7o6kPRmB", "name": "Limfork.eth"},
+  {"address": "5hAgYC8TJCcEZV7LTXAzkTrm7YL29YXyQQJPCNrG84zM", "name": "Schoen"},
+  {"address": "6FWhUybWmnjsQ933v2r6o7bhEG5yH9g9XsV7NVWKj5EW", "name": "WheresLodo"},
+  {"address": "5o3kAZLwEzNF1kfVv8JSEqv6sSB88pZbHxF1oYTxgXzG", "name": "neo."}
+ ],
+ "not_followed": [
+  {"address": "CEUA7zVoDRqRYoeHTP58UHU6TR8yvtVbeLrX1dppqoXJ", "name": "Tom", "note": "benched Nov 14 (not on Rage's list); history kept, still scored"},
+  {"address": "Be24Gbf5KisDk1LcWWZsBn8dvB816By7YzYF5zWZnRR6", "name": "Chairman ²", "note": "benched Nov 14 (not on Rage's list); history kept, still scored"},
+  {"address": "CXnf4Tt7qFz3KZNwn3Yve5MKaRyxGoAy2eDX3QT8e99m", "name": "trav", "note": "benched Nov 14 (not on Rage's list); history kept, still scored"}
+ ]
+}
