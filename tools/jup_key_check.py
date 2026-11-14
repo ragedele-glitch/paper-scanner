@@ -9,6 +9,10 @@ print("char classes:", {"lower": any(c in string.ascii_lowercase for c in key), 
                         "digit": any(c.isdigit() for c in key), "dash": "-" in key, "underscore": "_" in key,
                         "other": any(not (c.isalnum() or c in "-_") for c in key)})
 print("looks like UUID (8-4-4-4-12):", [len(p) for p in key.split("-")] == [8, 4, 4, 4, 12])
+print("non-alphanumeric characters used (and counts):", {c: key.count(c) for c in sorted({c for c in key if not c.isalnum()})})
+print("looks like a JWT/session token (eyJ... with 2 dots):", key.startswith("eyJ") and key.count(".") == 2)
+print("looks like a URL:", key.lower().startswith(("http:", "https:")))
+print("dot-separated part lengths:", [len(p) for p in key.split(".")])
 
 SOL = "So11111111111111111111111111111111111111112"
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
