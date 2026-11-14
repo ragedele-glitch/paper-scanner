@@ -83,7 +83,10 @@ QUICKNODE_WSS_URL = _qn if _qn.startswith(("wss://", "ws://")) else ""
 # order = which endpoints carry the wallets at once (first ENGINE_FEED_MAINS); the rest are spares to rotate to.
 # publicnode before the Solana public node: in a test on Nov 14 it delivered the same transactions ~1.5 s sooner.
 ENGINE_WS_URLS = (WS_URLS[:1] if HELIUS_API_KEY else []) + ([QUICKNODE_WSS_URL] if QUICKNODE_WSS_URL else []) + \
-    [u for u in WS_URLS if "publicnode" in u] + [u for u in WS_URLS if "mainnet-beta" in u]
+    ["wss://solana.publicnode.com"] + [u for u in WS_URLS if "mainnet-beta" in u] + \
+    [u for u in WS_URLS if "publicnode" in u]
+# (Nov 14, 10 PM: solana-rpc.publicnode.com timed out on every connect from Radium while solana.publicnode.com
+# answered in 0.2 s, so Radium uses the latter as its third feed and keeps the former as a spare. Paper unchanged.)
 ENGINE_FEED_MAINS = 3        # endpoints carrying the followed wallets at the same time (paper: 2)
 # Backup while every live feed is down: each followed wallet's newest transactions are listed every 5 s
 # (getSignaturesForAddress, one small call per wallet) and any the feed missed are read exactly like feed ones;
