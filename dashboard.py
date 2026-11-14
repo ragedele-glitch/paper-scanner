@@ -365,7 +365,7 @@ def build_state():
                "win_rate": (len(wins) / len(hist) * 100) if hist else None, "total_pnl": sum(h["pnl"] for h in hist),
                "reset_ts": sess or None}
         js = meta.get("jup_pricing_since")
-        if js:   # Nov 14 2026: entries priced from real Jupiter quotes from here on; results before it kept apart
+        if js and acct != C.ACCT_5S:   # Nov 14 2026: Jupiter-priced entries from here on (not the 5 s test); before kept apart
             aft = [h for h in hist if h["entry_ts"] >= js]; bef = [h for h in hist if h["entry_ts"] < js]
             acc["jup"] = {"since": js, "closed": len(aft), "wins": sum(1 for h in aft if h["pnl"] > 0),
                           "pnl": sum(h["pnl"] for h in aft), "before_closed": len(bef),
