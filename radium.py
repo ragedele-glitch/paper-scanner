@@ -1957,6 +1957,34 @@ class Bot:
                                "share_24h": round(100 * sum(1 for b in beats if b == 1) / len(beats)) if beats else None,
                                "checkins_24h": len(beats), "drops_24h": drops, "reconnects": fm.get("reconnects"),
                                "connected_for_s": fm.get("uptime_s"), "ts": fm.get("ts")}
+                try:   # Nov 14: each feed (Helius / QuickNode / public node), which caught buys first, and the backup
+                    def _m(k):
+                        r = sc.execute("SELECT value FROM meta WHERE key=?", (k,)).fetchone()
+                        return json.loads(r[0]) if r else None
+                    fe = _m("feed_eps") or {}
+                    fb = _m("feed_backup") or {}
+                    fo = [o for o in (_m("feed_outages") or []) if (o.get("start") or 0) > t - 86400]
+                    eps = {}
+                    for k, e in (fe.get("eps") or {}).items():
+                        eps[k] = {"up_pct": round(100 * e["up_s"] / e["run_s"], 1) if e.get("run_s") else None,
+                                  "up": bool(e.get("up")) and t - (e.get("ts") or 0) < 120, "drops": int(e.get("drops") or 0),
+                                  "first": int(e.get("first") or 0), "second": int(e.get("second") or 0),
+                                  "late_ms": round(1000 * e["late_sum"] / e["late_n"]) if e.get("late_n") else None}
+                    firsts = {}
+                    for r in sc.execute("SELECT COALESCE(detect_ep,'?') FROM signals WHERE detect_ep IS NOT NULL AND detected_ts>?",
+                                        (t - 86400,)):
+                        firsts[r[0]] = firsts.get(r[0], 0) + 1
+                    kick = sorted(o["first_s"] for o in fo if o.get("first_s") is not None)
+                    out["feed"].update(
+                        eps=eps, eps_since=fe.get("since"), first_buys_24h=firsts, mains=fb.get("mains"),
+                        urls=fb.get("urls"), all_down_24h=len(fo),
+                        all_down_s_24h=round(sum((o.get("end") or t) - o["start"] for o in fo)),
+                        backup_kick_s={"n": len(kick), "median": kick[len(kick) // 2] if kick else None,
+                                       "max": kick[-1] if kick else None},
+                        backup_found_24h=sum(o.get("found") or 0 for o in fo), backup_down_now=fb.get("down_since"),
+                        quicknode="quicknode" in (fb.get("urls") or []))
+                except Exception as e:
+                    out["feed"]["eps_err"] = str(e)[:120]
                 ids = [r["paper_id"] for r in trades if r["paper_id"] and r["paper_id"] > 0]
                 if ids:
                     q = ",".join("?" * len(ids))

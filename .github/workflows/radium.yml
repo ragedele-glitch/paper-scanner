@@ -24,6 +24,7 @@ jobs:
       RADIUM_DASH_KEY: ${{ secrets.RADIUM_DASH_KEY }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+      QUICKNODE_WSS_URL: ${{ secrets.QUICKNODE_WSS_URL }}   # optional second live feed (empty = not used)
       LIVE_MODE: ${{ vars.LIVE_MODE }}
       RADIUM_MODE: ${{ vars.RADIUM_MODE }}
       RADIUM_WALLET_ADDRESS: ${{ secrets.RADIUM_WALLET_ADDRESS }}

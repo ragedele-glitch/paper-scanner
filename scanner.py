@@ -217,10 +217,13 @@ def migrate(con):
         except sqlite3.OperationalError:
             pass
     if C.ENGINE:   # Radium (Nov 14): how long each check took, JSON, for the page's speed card only
-        try:
-            con.execute("ALTER TABLE signals ADD COLUMN check_timing TEXT")
-        except sqlite3.OperationalError:
-            pass
+        for m in ("ALTER TABLE signals ADD COLUMN check_timing TEXT",
+                  "ALTER TABLE signals ADD COLUMN detect_ep TEXT",     # which feed delivered the buy first (or 'backup')
+                  "ALTER TABLE heartbeat ADD COLUMN ws_eps TEXT"):     # each feed up/down at this check-in
+            try:
+                con.execute(m)
+            except sqlite3.OperationalError:
+                pass
     con.commit()
 
 
@@ -693,6 +696,10 @@ def _handle_candidate(con, c, pairs):
     src_det = c.get("src", "poll"); txi = c.get("tx")
     tp = top_pair(pairs)
     base = dict(detected_ts=det, wallet=wallet, wallet_name=c["name"], mint=mint, ata=c["ata"], detect_src=src_det)
+    if C.ENGINE and txi:   # Radium: which feed saw it first (recording only)
+        ep = c.get("ep") or (STREAM.first_ep.get(txi.get("sig")) if STREAM is not None else None)
+        if ep:
+            base["detect_ep"] = ep
     if mint in C.EXCLUDE_MINTS:
         return
     if not tp:
@@ -2400,7 +2407,12 @@ def drain_stream(con, wait_s=0.0):
             if not tx or (tx.get("meta") or {}).get("err") is not None:
                 continue
             try:
-                cands += parse_wallet_tx(con, tx, w, names.get(w, ""), t_recv, sg, open_map)
+                got = parse_wallet_tx(con, tx, w, names.get(w, ""), t_recv, sg, open_map)
+                if C.ENGINE and sg in BACKUP["sigs"]:   # found by the backup listing, not the live feed
+                    for c in got:
+                        c["src"] = "backup"; c["ep"] = "backup"
+                    BACKUP["read"] += 1
+                cands += got
             except Exception as e:
                 log.warning("feed tx parse failed %s %s", sg[:12], e)
         con.commit()
@@ -2418,6 +2430,81 @@ def drain_stream(con, wait_s=0.0):
 
 
 FEED_THREAD = [None]
+# Radium (Nov 14): backup listing while every live feed is down (see config ENGINE_SIG_BACKUP_S)
+BACKUP = {"sigs": set(), "dq": deque(maxlen=5000), "sweeps": 0, "calls": 0, "found": 0, "read": 0, "err": None,
+          "events": deque(maxlen=100), "cur": None}
+
+
+def _sig_sweep(con, since_ts):
+    """List each followed wallet's newest transactions (one small call each, leaders of open trades first) and queue
+    the ones the live feed hasn't delivered since since_ts. Returns how many were queued."""
+    ws = [r[0] for r in con.execute("SELECT address FROM wallets WHERE active=1")]
+    lead = set(STREAM.watch_all) if STREAM is not None else set()
+    ws.sort(key=lambda w: 0 if w in lead else 1)
+    n = 0
+    for w in ws:
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "getSignaturesForAddress",
+                           "params": [w, {"limit": 25, "commitment": "confirmed"}]}).encode()
+        j = http(C.RPC_URL, body, kind="rpc", headers={"Content-Type": "application/json"}, timeout=6, tries=1)
+        BACKUP["calls"] += 1
+        if not j or "result" not in j:
+            BACKUP["err"] = f"{now():.0f} {str(j and j.get('error'))[:80]}"
+            continue
+        for x in j["result"] or []:
+            bt = x.get("blockTime") or 0
+            if bt and bt < since_ts:
+                break                     # newest first: the rest are older than the gap
+            if x.get("err") is not None:
+                continue
+            sg = x.get("signature")
+            if not sg or sg in BACKUP["sigs"] or sg in SEEN_SIG_SET or (STREAM is not None and sg in STREAM._recent_set):
+                continue
+            if len(BACKUP["dq"]) == BACKUP["dq"].maxlen:
+                BACKUP["sigs"].discard(BACKUP["dq"][0])
+            BACKUP["dq"].append(sg); BACKUP["sigs"].add(sg)
+            try:
+                STREAM.q.put_nowait((now(), w, sg, x.get("slot")))
+                n += 1
+            except queue.Full:
+                pass
+    BACKUP["sweeps"] += 1; BACKUP["found"] += n
+    return n
+
+
+def sig_backup_worker():
+    """Radium: while every live feed is down, list the wallets' newest transactions every ENGINE_SIG_BACKUP_S
+    seconds; when a feed is back, list the whole gap once more. Records how fast it kicked in, for the page."""
+    con = db(); last = 0.0; done = 0
+    while True:
+        try:
+            time.sleep(1)
+            if STREAM is None:
+                continue
+            ds = STREAM.down_since
+            cur = BACKUP["cur"]
+            if ds is not None:
+                if cur is None or cur["start"] != ds:
+                    cur = BACKUP["cur"] = {"start": ds, "first_s": None, "sweeps": 0, "found": 0}
+                if now() - last >= C.ENGINE_SIG_BACKUP_S:
+                    k = _sig_sweep(con, ds - C.ENGINE_SIG_LOOKBACK_S); last = now()
+                    cur["sweeps"] += 1; cur["found"] += k
+                    if cur["first_s"] is None:
+                        cur["first_s"] = round(last - ds, 1)
+            outs = list(STREAM.outages)
+            if len(outs) > done or (done and outs and outs[-1] != BACKUP.get("_last_out")):
+                new = [o for o in outs if o[1] > (BACKUP.get("_last_out") or (0, 0))[1]]
+                for st, en in new:   # a feed is back: list the whole gap once more
+                    k = _sig_sweep(con, st - C.ENGINE_SIG_LOOKBACK_S)
+                    ev = cur if (cur is not None and cur["start"] == st) else {"start": st, "first_s": None, "sweeps": 0, "found": 0}
+                    ev["sweeps"] += 1; ev["found"] += k; ev["end"] = en; ev["catchup_s"] = round(now() - en, 1)
+                    if ev["first_s"] is None:
+                        ev["first_s"] = round(now() - st, 1)
+                    BACKUP["events"].append(ev); BACKUP["cur"] = None; cur = None
+                    BACKUP["_last_out"] = (st, en)
+                done = len(outs)
+        except Exception as e:
+            BACKUP["err"] = f"{now():.0f} {type(e).__name__}: {str(e)[:80]}"
+            time.sleep(2)
 
 
 def feed_worker():
@@ -2503,6 +2590,40 @@ def poll_wallets(con):
     return cands, polled
 
 
+# ----------------------------------------------------------------------------- Radium feed numbers (recording only)
+_EP_LAST = {}
+
+
+def feed_record(con, ws_ok):
+    """Radium: per-feed numbers kept across restarts (meta 'feed_eps'), each check-in's per-feed state (heartbeat
+    ws_eps) and the dropouts with how fast the backup listing kicked in (meta 'feed_outages'). Recording only."""
+    eps = STREAM.ep_status()
+    con.execute("UPDATE heartbeat SET ws_eps=? WHERE ts=(SELECT MAX(ts) FROM heartbeat)",
+                (",".join(f"{k}:{1 if e.get('up') else 0}" for k, e in sorted(eps.items())),))
+    tot = meta_get(con, "feed_eps") or {}
+    if not isinstance(tot, dict) or "since" not in tot:
+        tot = {"since": now(), "eps": {}}
+    for k, e in eps.items():
+        prev = _EP_LAST.get(k, {})
+        acc = tot["eps"].setdefault(k, {})
+        for f in ("up_s", "run_s", "drops", "connects", "first", "second", "late_sum", "late_n"):
+            acc[f] = round((acc.get(f) or 0) + (e.get(f) or 0) - (prev.get(f) or 0), 3)
+        acc["up"] = bool(e.get("up")); acc["ts"] = now()
+        _EP_LAST[k] = dict(e)
+    meta_set(con, "feed_eps", tot)
+    hist = meta_get(con, "feed_outages") or []
+    have = {round(h.get("start", 0), 1) for h in hist}
+    for ev in list(BACKUP["events"]):
+        if round(ev["start"], 1) not in have:
+            hist.append({k: (round(v, 2) if isinstance(v, float) else v) for k, v in ev.items()})
+    cur = BACKUP["cur"]
+    meta_set(con, "feed_outages", hist[-300:])
+    meta_set(con, "feed_backup", {"down_since": STREAM.down_since, "cur": cur, "sweeps": BACKUP["sweeps"],
+                                  "calls": BACKUP["calls"], "found": BACKUP["found"], "read": BACKUP["read"],
+                                  "err": BACKUP["err"], "urls": [streammod.ep_label(u) for u in STREAM.urls],
+                                  "mains": STREAM.n_main, "ts": now()})
+
+
 # ----------------------------------------------------------------------------- main loop
 def main():
     global STREAM
@@ -2564,7 +2685,9 @@ def main():
         log.warning("removed_wallets.json could not be read (%s): no wallets removed this run", C.REMOVED_ERROR)
     if C.FOLLOW_ONLY_ERROR:
         log.warning("follow_list.json could not be read (%s): wallets picked automatically this run", C.FOLLOW_ONLY_ERROR)
-    STREAM = streammod.WalletStream(C.WS_URLS, noisy=(meta_get(con, "feed") or {}).get("noisy") or [], keepalive=C.ENGINE)
+    STREAM = streammod.WalletStream(C.ENGINE_WS_URLS if C.ENGINE else C.WS_URLS,
+                                    noisy=(meta_get(con, "feed") or {}).get("noisy") or [], keepalive=C.ENGINE,
+                                    n_main=C.ENGINE_FEED_MAINS if C.ENGINE else 2)
     STREAM.set_wallets([r[0] for r in con.execute("SELECT address FROM wallets WHERE active=1")])
     if not STREAM.start():
         STREAM = None
@@ -2574,6 +2697,10 @@ def main():
         con.commit(); con.isolation_level = None; con.execute("PRAGMA synchronous=NORMAL")
         FEED_THREAD[0] = threading.Thread(target=feed_worker, name="engine-feed", daemon=True)
         FEED_THREAD[0].start()
+        if STREAM is not None:
+            threading.Thread(target=sig_backup_worker, name="engine-backup", daemon=True).start()
+            log.info("live feeds: %s (%d at once); backup listing every %ds while all are down",
+                     ", ".join(streammod.ep_label(u) for u in STREAM.urls), STREAM.n_main, C.ENGINE_SIG_BACKUP_S)
     last_eq = 0; kept0 = 0
     while True:
         loop_t = now()
@@ -2640,6 +2767,11 @@ def main():
             con.execute("INSERT OR REPLACE INTO heartbeat(ts,polled,rpc_mb,note,ws,stream_n) VALUES(?,?,?,?,?,?)",
                         (now(), polled, (STATS["rpc_bytes"] - b0) / 1e6, f"{len(cands)} new buys (re-read)" if cands else None,
                          ws_ok, kept - kept0))
+            if C.ENGINE and STREAM is not None:
+                try:
+                    feed_record(con, ws_ok)
+                except Exception as e:
+                    log.warning("feed record error %s", e)
             kept0 = kept
             con.commit()
         except Exception as e:

@@ -21,16 +21,43 @@ NOISY_PER_MIN = 200          # a wallet mentioned in more than this many transac
 NOISY_GROUP = 3
 
 
+def ep_label(url):
+    """Short name of an endpoint, for the page and the logs. Never the key (Helius' key is in the query, QuickNode's
+    token is in the path)."""
+    u = str(url or "")
+    if "helius" in u:
+        return "helius"
+    if "quiknode" in u or "quicknode" in u:
+        return "quicknode"
+    if "publicnode" in u:
+        return "publicnode"
+    if "mainnet-beta" in u:
+        return "solana"
+    return u.split("//")[-1].split("/")[0].split("?")[0][:40] or "?"
+
+
+def safe_url(url):
+    """The url as shown on the page and in the logs: Helius' key (query) dropped as before; a QuickNode url shows
+    its host only, because its token is part of the path."""
+    u = str(url or "")
+    if "quiknode" in u or "quicknode" in u:
+        return u.split("//")[0] + "//" + u.split("//")[-1].split("/")[0] + "/(token hidden)"
+    return u.split("?")[0]
+
+
 class _Group:
     def __init__(self, wallets, main, url_i):
         self.wallets = wallets; self.main = main; self.url_i = url_i
         self.connected = False; self.subscribed = 0; self.url = None; self.err = None
         self.up_since = None; self.last_msg = 0.0; self.last_note = 0.0
+        self.cur_i = url_i; self.label = None
 
 
 class WalletStream:
-    def __init__(self, urls, user_agent="memecoin-paper-scanner/1.1 (read-only)", noisy=(), keepalive=False):
+    def __init__(self, urls, user_agent="memecoin-paper-scanner/1.1 (read-only)", noisy=(), keepalive=False, n_main=2):
         self.urls = [u for u in urls if u]
+        # how many endpoints carry the main wallets at the same time (paper: 2; Radium with QuickNode: 3)
+        self.n_main = max(1, int(n_main or 2))
         # keepalive (Radium only): a quiet connection is proven alive with a websocket ping instead of being torn down
         # after 3 quiet minutes and counted as 'down' after 90 s, so the backup re-read is needed far less
         self.keepalive = keepalive
@@ -47,6 +74,26 @@ class WalletStream:
         self.n_skipped = 0          # token transactions that opened no new token account and weren't from a watched wallet
         self._thread = None
         self._recent = deque(maxlen=20000); self._recent_set = set()   # same transaction from two endpoints: keep the first
+        # Radium (Nov 14): per-endpoint numbers, recording only. ep[label] = seconds up, drops, first/second copies.
+        self.ep = {}
+        self.first_ep = {}          # signature -> endpoint that delivered it first (bounded like _recent)
+        self._first_t = {}          # signature -> when the first copy arrived
+        self.down_since = None      # Radium: when the last main connection went down (None while one is up)
+        self.outages = deque(maxlen=200)   # (start, end) of each time every main connection was down
+
+    def _ep(self, label):
+        e = self.ep.get(label)
+        if e is None:
+            e = self.ep[label] = {"up_s": 0.0, "run_s": 0.0, "drops": 0, "connects": 0, "first": 0, "second": 0,
+                                  "late_sum": 0.0, "late_n": 0, "up": False}
+        return e
+
+    def ep_status(self):
+        """Per endpoint (main connections only): up now, seconds up, seconds watched, drops, first/second copies."""
+        out = {}
+        for k, e in list(self.ep.items()):
+            out[k] = dict(e)
+        return out
 
     # --- read from the scanner's main thread
     def set_wallets(self, wallets):
@@ -114,7 +161,7 @@ class WalletStream:
         quiet = tuple(sorted(want - set(noisy)))
         # the quiet wallets ride one connection per endpoint at the same time (first copy of a transaction wins),
         # so a drop on one endpoint loses nothing; noisy wallets get one connection each group of 3
-        out = [((quiet, i), True, i) for i in range(min(2, len(self.urls)))] if quiet else []
+        out = [((quiet, i), True, i) for i in range(min(self.n_main, len(self.urls)))] if quiet else []
         for i in range(0, len(noisy), NOISY_GROUP):
             out.append(((tuple(noisy[i:i + NOISY_GROUP]), -1), False, 0))
         return out
@@ -125,6 +172,20 @@ class WalletStream:
             t = time.time()
             if self.connected:
                 self.up_s += t - last       # feed time = time at least one main connection was up
+            if self.keepalive:
+                dt = t - last
+                for g in list(self.groups.values()):
+                    if g.main and g.label:
+                        e = self._ep(g.label); e["run_s"] += dt; e["up"] = bool(g.connected)
+                        if g.connected:
+                            e["up_s"] += dt
+                if self.connected:
+                    self._ever_up = True
+                if self.groups and getattr(self, "_ever_up", False):   # startup's first connect is not an outage
+                    if not self.connected and self.down_since is None and any(g.main for g in self.groups.values()):
+                        self.down_since = t
+                    elif self.connected and self.down_since is not None:
+                        self.outages.append((self.down_since, t)); self.down_since = None
             last = t
             layout = self._layout()
             keys = {k for k, _, _ in layout}
@@ -139,6 +200,8 @@ class WalletStream:
             await asyncio.sleep(1)
 
     def _down(self, g):
+        if self.keepalive and g.main and g.connected and g.label:
+            self._ep(g.label)["drops"] += 1
         g.up_since = None; g.connected = False; g.subscribed = 0
 
     async def _runner(self, g):
@@ -146,15 +209,24 @@ class WalletStream:
         try:
             while True:
                 url = self.urls[i % len(self.urls)]
+                g.cur_i = i % len(self.urls)
+                if self.keepalive and g.main:
+                    g.label = ep_label(url); self._ep(g.label)
                 t0 = time.time()
                 try:
                     await self._session(g, url)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    g.err = f"{type(e).__name__}: {str(e)[:120]}"
+                    msg = str(e)
+                    if "quiknode" in url or "quicknode" in url:   # never let the QuickNode token reach the page or logs
+                        msg = msg.replace(url, safe_url(url)).replace(url.split("//")[-1], safe_url(url))
+                        tok = [p for p in url.split("//")[-1].split("?")[0].split("/")[1:] if p]
+                        for p in tok:
+                            msg = msg.replace(p, "(token hidden)")
+                    g.err = f"{type(e).__name__}: {msg[:120]}"
                     if g.main and time.time() - t0 < 60:
-                        log.warning("live feed connection failed (%s): %s", url.split("?")[0], g.err)
+                        log.warning("live feed connection failed (%s): %s", safe_url(url), g.err)
                 self._down(g)
                 self.reconnects += 1
                 if time.time() - t0 > 60:
@@ -163,6 +235,13 @@ class WalletStream:
                     quick += 1
                     if not g.main or (self.keepalive and quick >= 2):
                         i += 1             # failed quickly (Radium: main feed too, after 2 quick failures): next endpoint
+                        if self.keepalive and g.main and len(self.urls) > 1:
+                            # Radium: skip endpoints another main connection is already on (no two on the same one)
+                            busy = {x.cur_i for x in list(self.groups.values()) if x.main and x is not g}
+                            for _ in range(len(self.urls)):
+                                if i % len(self.urls) not in busy:
+                                    break
+                                i += 1
                     # Radium waits at most 10 s between tries, so the feed is back fast and the backup is rarely needed
                     backoff = min(10 if self.keepalive else 60, backoff * 2)
                 await asyncio.sleep(backoff)
@@ -172,14 +251,16 @@ class WalletStream:
     async def _session(self, g, url):
         import websockets
         want = g.wallets
-        kw = dict(max_size=2 ** 24, ping_interval=20, ping_timeout=20 if self.keepalive else 60, open_timeout=20,
-                  close_timeout=5)
+        # Radium (Nov 14): ping every 10 s and drop a link that doesn't answer within 10 s, so a dead connection is
+        # noticed in at most about 20 s (was about 40 s). Paper: unchanged (20 s / 60 s).
+        kw = dict(max_size=2 ** 24, ping_interval=10 if self.keepalive else 20, ping_timeout=10 if self.keepalive else 60,
+                  open_timeout=20 if not self.keepalive else 15, close_timeout=5)
         try:
             conn = websockets.connect(url, user_agent_header=self.ua, **kw)
         except TypeError:
             conn = websockets.connect(url, **kw)
         async with conn as ws:
-            g.url = url.split("?")[0]
+            g.url = safe_url(url)
             for k, w in enumerate(want):
                 await asyncio.sleep(0.05)
                 await ws.send(json.dumps({"jsonrpc": "2.0", "id": k + 1, "method": "logsSubscribe",
@@ -192,10 +273,17 @@ class WalletStream:
                     raw = await asyncio.wait_for(ws.recv(), timeout=20 if self.keepalive else 30)
                 except asyncio.TimeoutError:
                     if self.keepalive:
-                        # the websocket library pings every 20 s and drops the link if no answer comes within 20 s,
+                        # the websocket library pings every 10 s and drops the link if no answer comes within 10 s,
                         # so an open, quiet connection is a live one: it stays 'up' instead of being torn down
                         g.last_msg = time.time()
-                        if time.time() - g.last_note > 1200:   # 20 quiet minutes even with pings: refresh the subscriptions
+                        # 20+ quiet minutes even with pings: refresh the subscriptions. Nov 14: staggered per endpoint
+                        # (+4 min each) and only while another main connection is up, so the feeds never all
+                        # refresh at the same moment (they used to, leaving no feed for a few seconds every time).
+                        if g.main and time.time() - g.last_note > 1200 + 240 * (g.cur_i or 0):
+                            others = [x for x in list(self.groups.values()) if x.main and x is not g and x.connected]
+                            if others or time.time() - g.last_note > 3600:
+                                raise RuntimeError("no wallet activity for 20 minutes: refreshing the subscriptions")
+                        elif not g.main and time.time() - g.last_note > 1200:
                             raise RuntimeError("no wallet activity for 20 minutes: refreshing the subscriptions")
                         continue
                     if time.time() - g.last_msg > 180:
@@ -214,6 +302,8 @@ class WalletStream:
                         g.subscribed = len(subs)
                         if not g.connected and len(subs) >= max(1, int(len(want) * 0.8)):
                             g.connected = True; g.up_since = t; g.err = None
+                            if self.keepalive and g.main and g.label:
+                                self._ep(g.label)["connects"] += 1
                             if g.main and self.reconnects < 10:
                                 log.info("live feed connected to %s: %d wallets (+%d noisy on side connections)",
                                          g.url, len(want), len(self.noisy & set(self._want)))
@@ -250,10 +340,20 @@ class WalletStream:
                     continue
                 sg = v["signature"]
                 if sg in self._recent_set:
+                    if self.keepalive and g.main and g.label:   # a later copy from another endpoint: how much later
+                        e = self._ep(g.label); e["second"] += 1
+                        t1 = self._first_t.get(sg)
+                        if t1 is not None:
+                            e["late_sum"] += t - t1; e["late_n"] += 1
                     continue
                 if len(self._recent) == self._recent.maxlen:
-                    self._recent_set.discard(self._recent[0])
+                    old = self._recent[0]
+                    self._recent_set.discard(old); self.first_ep.pop(old, None); self._first_t.pop(old, None)
                 self._recent.append(sg); self._recent_set.add(sg)
+                if self.keepalive and g.label:
+                    self.first_ep[sg] = g.label if g.main else "side"; self._first_t[sg] = t
+                    if g.main:
+                        self._ep(g.label)["first"] += 1
                 self.n_kept += 1
                 try:
                     self.q.put_nowait((t, w, v["signature"], res.get("context", {}).get("slot")))

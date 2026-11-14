@@ -71,6 +71,25 @@ ENGINE_CHECKS_MAX_S = 10.0   # all safety checks must finish within 10 s of seei
 ENGINE_POLL_UP_S = 60        # backup re-read of the wallets: every 60 s while the live feed is up (paper: 10 min)
 ENGINE_POLL_DOWN_S = 30      # ...and every 30 s while the live feed is down
 ENGINE_LOOP_S = 10
+# Radium live feed (Nov 14): a QuickNode websocket, if Rage adds the QUICKNODE_WSS_URL secret, runs as one more feed
+# alongside Helius and the public node; whichever sees a wallet's transaction first is used (copies are dropped).
+# Without the secret nothing changes except that a third free endpoint (publicnode) also runs in parallel.
+_qn = (os.environ.get("QUICKNODE_WSS_URL") or "").strip()
+if _qn.startswith("https://"):
+    _qn = "wss://" + _qn[len("https://"):]
+elif _qn.startswith("http://"):
+    _qn = "ws://" + _qn[len("http://"):]
+QUICKNODE_WSS_URL = _qn if _qn.startswith(("wss://", "ws://")) else ""
+# order = which endpoints carry the wallets at once (first ENGINE_FEED_MAINS); the rest are spares to rotate to.
+# publicnode before the Solana public node: in a test on Nov 14 it delivered the same transactions ~1.5 s sooner.
+ENGINE_WS_URLS = (WS_URLS[:1] if HELIUS_API_KEY else []) + ([QUICKNODE_WSS_URL] if QUICKNODE_WSS_URL else []) + \
+    [u for u in WS_URLS if "publicnode" in u] + [u for u in WS_URLS if "mainnet-beta" in u]
+ENGINE_FEED_MAINS = 3        # endpoints carrying the followed wallets at the same time (paper: 2)
+# Backup while every live feed is down: each followed wallet's newest transactions are listed every 5 s
+# (getSignaturesForAddress, one small call per wallet) and any the feed missed are read exactly like feed ones;
+# when a feed comes back, the whole gap is listed once more. The holdings re-read above stays as the deeper net.
+ENGINE_SIG_BACKUP_S = 5
+ENGINE_SIG_LOOKBACK_S = 40   # a dead link is noticed up to ~20 s late, so the listing reaches back 40 s before that
 BOARD_KEEP_DAYS = 3         # keep following a wallet for 3 days after it last appeared on the board
 BOARD_REFRESH_S = 6 * 3600  # re-read the leaderboard every 6 hours
 LOOP_S = 20
