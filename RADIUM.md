@@ -66,6 +66,19 @@ the `ragedele-glitch/rage-radium-bot` repo. The wallet address is never written 
   noticed within 40 s; reconnects wait at most 10 s and move to the next endpoint after 2 quick failures. Backup re-read of
   the wallets: every 60 s with the feed up, 30 s with it down.
 - The paper bot's trading is unchanged: all of this only runs with RADIUM_ENGINE=1.
+
+## Jupiter API key (optional, Nov 14)
+- Secret `JUP_API_KEY` (already passed to radium.yml and radium-bridge.yml). Empty: keyless, exactly as before
+  (lite-api.jup.ag, Radium's own Jupiter requests 1.1 s apart).
+- Set: radium.py sends quote, swap build and SOL price to api.jup.ag with the `x-api-key` header. The free key allows 60
+  requests per rolling 60 s for the account, so instead of a 1.1 s gap the requests are counted in a rolling window:
+  sells may use 54, buys 48, background lookups 36, at most 5 a second, and a waiting sell goes first. A 429 waits for
+  Jupiter's `x-ratelimit-reset` and retries (a sell up to 8 times, then the normal sell retry every 6 s). The SOL price
+  is refreshed every 30 s in the background so a sell never waits on it.
+- A key Jupiter refuses (401/403) is dropped for the rest of the run and the bot goes back to keyless: a wrong key can't
+  stop trading. The key is never logged. The engine (scanner.py) and the exit-watch price reads stay keyless, so the key's
+  budget is kept for buys and sells. No trading rule, filter, guard, size or exit changes with the key.
+- Takes effect when radium.yml next starts (scheduled restart), or after the key is added and a new run starts.
 | RADIUM_PRIORITY_MAX_LAMPORTS | 1000000 | priority fee cap, 0.001 SOL |
 | RADIUM_FEE_RESERVE_SOL | 0.03 | SOL always kept for fees |
 

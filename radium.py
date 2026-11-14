@@ -113,6 +113,8 @@ def settings():
 S = settings()
 WALLET = {"address": None, "kp": None, "placeholder": None}
 REDACT = []          # strings that must never reach the log or the dashboard
+if S["jup_key"]:
+    REDACT.append(S["jup_key"])
 
 
 def load_wallet():
@@ -285,15 +287,160 @@ def http(url, body=None, headers=None, timeout=25, tries=3):
             raise RuntimeError(f"network error {type(e).__name__} from {url.split('?')[0]}") from None
 
 
-def jup(path, params=None, body=None):
-    gap = 1.05 if S["jup_key"] else 1.1
-    w = _J["last"] + gap - time.time()
+# Jupiter API key (optional, Nov 14). Repository secret JUP_API_KEY. Empty: keyless, exactly as before (lite-api,
+# requests 1.1 s apart). Set: api.jup.ag with the x-api-key header (Jupiter's docs, dev.jup.ag/docs/api-rate-limit:
+# the free key allows 60 requests in any rolling 60 s for the account, keyless 30). Swap, price and token requests
+# share that one budget, so the bot's own requests are counted in a rolling 60 s window instead of being spaced
+# 1.1 s apart: a quote and the swap build go out back to back. Sells come first: a sell may use 54 of the 60, a buy
+# 48, background lookups (the SOL price) 36, and while a sell is waiting nothing else takes a slot. A 429 (too many
+# requests) waits until Jupiter's x-ratelimit-reset and tries again; a sell tries up to 8 times here and is then
+# retried by the normal sell retry, so it is never dropped. A key Jupiter refuses (401/403) is dropped for the rest
+# of the run and the bot goes back to keyless access, so a wrong key can't stop trading. The key is never logged.
+# Trading rules, filters, guards, sizes and exits don't change with the key: only how fast the requests go out.
+JUP_KEY_WINDOW_S = 60.0
+JUP_KEY_CAP = {2: 54, 1: 48, 0: 36}        # 2 = sell, 1 = buy, 0 = background lookups
+JUP_KEY_MIN_GAP_S = 0.2                    # never more than 5 requests a second, even in a burst
+JUP_KEY_429_TRIES = {2: 8, 1: 3, 0: 2}
+JUP_KEY_429_MAX_WAIT_S = 4.0
+SOL_PREFETCH_S = 30                        # with a key: SOL price refreshed in the background, so a sell never waits on it
+_JK = {"lock": threading.Lock(), "ts": [], "sells_waiting": 0, "hold_until": 0.0, "refused": False,
+       "n": 0, "n429": 0, "last429": None}
+_PRIO = threading.local()                  # which kind of trade step the current thread is doing
+
+
+def jup_mode():
+    """'key' when the bot is using the Jupiter API key, 'keyless' when none is set, 'key refused' after a 401/403."""
+    if not S["jup_key"]:
+        return "keyless"
+    return "key refused" if _JK["refused"] else "key"
+
+
+def with_jup_priority(fn, level):
+    """Wraps a Bot method so its Jupiter requests carry this priority (2 sell, 1 buy). Changes nothing else."""
+    def w(*a, **k):
+        old = getattr(_PRIO, "p", 0)
+        _PRIO.p = max(old, level)
+        try:
+            return fn(*a, **k)
+        finally:
+            _PRIO.p = old
+    w.__name__, w.__doc__ = fn.__name__, fn.__doc__
+    return w
+
+
+def _jup_slot(level):
+    """Keyed only: waits for a free slot in the rolling 60 s budget for this priority, then takes it."""
+    cap = JUP_KEY_CAP[level]
+    while True:
+        with _JK["lock"]:
+            now = time.time()
+            q = _JK["ts"]
+            while q and now - q[0] >= JUP_KEY_WINDOW_S:
+                q.pop(0)
+            waits = []
+            if now < _JK["hold_until"]:
+                waits.append(_JK["hold_until"] - now)
+            if q and now - q[-1] < JUP_KEY_MIN_GAP_S:
+                waits.append(JUP_KEY_MIN_GAP_S - (now - q[-1]))
+            if len(q) >= cap:
+                waits.append(q[len(q) - cap] + JUP_KEY_WINDOW_S - now)
+            if level < 2 and _JK["sells_waiting"]:
+                waits.append(0.05)
+            if not waits:
+                q.append(now); _JK["n"] += 1
+                return
+            w = max(waits)
+        time.sleep(min(max(w, 0.01), 0.25))
+
+
+def _jup_keyed(path, params=None, body=None):
+    level = getattr(_PRIO, "p", 0)
+    url = "https://api.jup.ag" + path + ("?" + "&".join(f"{k}={v}" for k, v in params.items()) if params else "")
+    h = {"User-Agent": UA, "Accept": "application/json", "x-api-key": S["jup_key"]}
+    if body is not None:
+        h["Content-Type"] = "application/json"
+    data = json.dumps(body).encode() if body is not None else None
+    n429 = nerr = 0
+    if level == 2:
+        with _JK["lock"]:
+            _JK["sells_waiting"] += 1
+    try:
+        while True:
+            _jup_slot(level)
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=h), timeout=25) as r:
+                    return json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    n429 += 1
+                    try:
+                        reset = float(e.headers.get("x-ratelimit-reset") or 0)
+                    except (TypeError, ValueError):
+                        reset = 0
+                    wait = min(max(reset - time.time(), 0.3), JUP_KEY_429_MAX_WAIT_S) if reset else min(1.0 * n429, 3.0)
+                    with _JK["lock"]:
+                        _JK["n429"] += 1; _JK["last429"] = time.time()
+                        _JK["hold_until"] = max(_JK["hold_until"], time.time() + wait)
+                    if n429 < JUP_KEY_429_TRIES[level]:
+                        continue                      # _jup_slot waits out hold_until
+                    raise RuntimeError(f"HTTP 429 from {url.split('?')[0]}: Jupiter rate limit, {n429} tries") from None
+                if e.code in (401, 403):
+                    if not _JK["refused"]:
+                        _JK["refused"] = True
+                        log(f"Jupiter refused the API key (HTTP {e.code}): using keyless access for the rest of this run")
+                    return _jup_keyless(path, params, body)    # this same request again, keyless: nothing is lost
+                if e.code in (500, 502, 503, 504) and nerr < 2:
+                    nerr += 1; time.sleep(1.5 * nerr); continue
+                detail = ""
+                try:
+                    detail = e.read().decode("utf-8", "ignore")[:160]
+                except Exception:
+                    pass
+                raise RuntimeError(scrub(f"HTTP {e.code} from {url.split('?')[0]} {detail}")) from None
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                if nerr < 2:
+                    nerr += 1; time.sleep(1.0 * nerr); continue
+                raise RuntimeError(f"network error {type(e).__name__} from {url.split('?')[0]}") from None
+    finally:
+        if level == 2:
+            with _JK["lock"]:
+                _JK["sells_waiting"] -= 1
+
+
+def _jup_keyless(path, params=None, body=None):
+    """No key: exactly the old behaviour (lite-api, requests 1.1 s apart)."""
+    w = _J["last"] + 1.1 - time.time()
     if w > 0:
         time.sleep(w)
     _J["last"] = time.time()
-    base = "https://api.jup.ag" if S["jup_key"] else "https://lite-api.jup.ag"
-    url = base + path + ("?" + "&".join(f"{k}={v}" for k, v in params.items()) if params else "")
-    return http(url, body, {"x-api-key": S["jup_key"]} if S["jup_key"] else None)
+    url = "https://lite-api.jup.ag" + path + ("?" + "&".join(f"{k}={v}" for k, v in params.items()) if params else "")
+    return http(url, body)
+
+
+def jup(path, params=None, body=None):
+    if jup_mode() == "key":
+        return _jup_keyed(path, params, body)
+    return _jup_keyless(path, params, body)
+
+
+def start_sol_prefetch():
+    """With a key only: keeps the SOL price under 60 s old in the background (2 requests a minute, lowest priority),
+    so buys, sells and the main loop take it from memory instead of waiting on Jupiter. Keyless: does nothing."""
+    if jup_mode() != "key":
+        return
+
+    def go():
+        while jup_mode() == "key":
+            try:
+                _PRIO.p = 0
+                j = jup("/price/v3", {"ids": SOL})
+                px = float(j[SOL]["usdPrice"])
+                if px > 0:
+                    _J["sol"] = (time.time(), px)
+            except Exception as e:
+                log(f"SOL price prefetch: {str(e)[:100]}")
+            time.sleep(SOL_PREFETCH_S)
+    threading.Thread(target=go, name="sol-prefetch", daemon=True).start()
 
 
 def rpc(method, params):
@@ -2101,6 +2248,7 @@ class Bot:
               "balance_err": self.bal["err"], "sol_px": solpx,
               "control": {"pause": bool(ctl.get("pause")), "sell_all_and_stop": bool(ctl.get("sell_all_and_stop")), "stale": ctl.get("stale")},
               "be_lock": be_lock(),
+              "jupiter": {"mode": jup_mode(), "requests": _JK["n"], "rate_limited": _JK["n429"], "last_429": _JK["last429"]},
               "blocked": self.blocked(ctl),
               "limits": {k: S[k] for k in ("max_loss", "max_stake", "min_stake", "stop_pct", "max_open", "daily_loss", "total_loss",
                                            "buy_slip_bps", "sell_slip_bps", "max_impact", "max_lag", "max_chase_pct", "max_wallet_age", "priority_lamports", "reserve_sol")},
@@ -2127,6 +2275,7 @@ class Bot:
             log("RADIUM_MODE=off: not starting"); return
         if not self.acquire():
             return
+        start_sol_prefetch()
         if S["mode"] == "live" and os.environ.get("LIVE_MODE", "").strip().lower() == "live":
             event(self.con, "bad", "the older live executor (LIVE_MODE) is also set to live: refusing to trade live, staying in dry-run")
             S["mode"] = "dry-run"; WALLET["kp"] = None
@@ -2200,6 +2349,11 @@ def already_running():
         return False
 
 
+# Jupiter request priority (only matters with the API key): sells first, then buys, then background lookups
+Bot.buy = with_jup_priority(Bot.buy, 1)
+Bot.sell = with_jup_priority(Bot.sell, 2)
+
+
 def main():
     role = "primary"
     if "--role" in sys.argv:
@@ -2211,7 +2365,7 @@ def main():
         f.write(str(os.getpid()))
     load_wallet()
     log(f"start: role {role}, mode {S['mode']}, run {RUN_ID}, wallet {'set' if WALLET['address'] else 'not set'}, "
-        f"key {'set' if WALLET['key_present'] else 'not set'}")
+        f"key {'set' if WALLET['key_present'] else 'not set'}, Jupiter {jup_mode()}")
     signal.signal(signal.SIGTERM, lambda *a: (_ for _ in ()).throw(KeyboardInterrupt()))
     bot = Bot(role)
     try:
