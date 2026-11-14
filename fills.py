@@ -25,7 +25,8 @@ import config as C
 SOL = "So11111111111111111111111111111111111111112"
 UA = "memecoin-paper-scanner/1.0 (read-only quotes, python-urllib)"
 _lock = threading.Lock()
-_state = {"jup_last": 0.0, "jup_prio_last": 0.0, "sol": (0.0, 0.0), "dec": {}, "prio": {}, "exitq": {}}
+_state = {"jup_last": 0.0, "jup_prio_last": 0.0, "sol": (0.0, 0.0), "dec": {}, "prio": {}, "exitq": {},
+          "dec_ok": {}, "sellq": {}}
 # Radium pre-buy lane (Nov 14): quotes for a coin about to be bought go ahead of the background price checks instead of
 # queueing behind them 2.2 s apiece. Only Radium's engine turns this on (thread by thread); the paper bot never does.
 PRIO = threading.local()
@@ -163,6 +164,7 @@ def entry_quote(mint, pool, size_usd, liq_usd):
         lam = size_usd / sp * 1e9
         b = quote(SOL, mint, lam)
         if b:
+            out.update(b_out=b[0], lam=lam, sol_usd=sp)   # the real buy quote, kept for the paper bot's entry price
             s = quote(mint, SOL, b[0])
             out["route"] = b[1]
             if s:
@@ -212,6 +214,57 @@ def exit_quote(mint, qty, liq_usd, sellable_before=True):
             out["r_sell"] = amm_ratios(liq_usd or C.LIQ_MIN_USD, 20)[1]
     _state["exitq"][key] = (time.time(), qty, dict(out))
     return out
+
+
+def decimals_strict(mint):
+    """Token decimals from Jupiter, or None when Jupiter doesn't answer (never a guessed default)."""
+    d = _state["dec_ok"].get(mint)
+    if d is not None:
+        return d
+    try:
+        j = _jup(f"/price/v3?ids={mint}") or {}
+        d = int(j[mint]["decimals"])
+        usd = float(j[mint].get("usdPrice") or 0)
+    except Exception:
+        return None
+    _state["dec_ok"][mint] = d; _state["dec"][mint] = d
+    _state.setdefault("usd", {})[mint] = (time.time(), usd)
+    return d
+
+
+def jup_buy_px(mint, q):
+    """Paper bot, from Nov 14 2026: the real price a buy of this size gets, in dollars per token, from the Jupiter buy
+    quote entry_quote just made (before the bot fee). Returns (price, None) or (None, why it couldn't)."""
+    if not q.get("b_out") or not q.get("lam") or not q.get("sol_usd"):
+        return None, f"no Jupiter buy quote ({q.get('src')}{', ' + q['err'] if q.get('err') else ''})"
+    dec = decimals_strict(mint)
+    if dec is None:
+        return None, "Jupiter didn't give the token's decimals"
+    px = (q["lam"] / 1e9 * q["sol_usd"]) / (q["b_out"] / 10 ** dec)
+    ref = (_state.get("usd") or {}).get(mint)
+    if ref and ref[1] > 0 and time.time() - ref[0] < 120 and not (1 / 3 < px / ref[1] < 3):   # a wrong decimals value would be off by 1000x
+        return None, f"quote price {px:.6g} doesn't fit Jupiter's own price {ref[1]:.6g}"
+    return px, None
+
+
+def jup_sell_usd(mint, qty):
+    """Paper bot, from Nov 14 2026: dollars Jupiter would pay right now for exactly qty tokens (before the bot fee
+    and the network fee), from a real sell quote. Returns (usd, None) or (None, why it couldn't). Cached 15 s."""
+    e = _state["sellq"].get(mint)
+    if e and time.time() - e[0] < 15 and abs(qty / max(e[1], 1e-18) - 1) < 0.01:
+        return e[2], None
+    dec = decimals_strict(mint)
+    if dec is None:
+        return None, "Jupiter didn't give the token's decimals"
+    try:
+        s = quote(mint, SOL, qty * 10 ** dec)
+    except Exception as ex:
+        return None, f"Jupiter sell quote error {type(ex).__name__}"
+    if not s:
+        return None, "Jupiter found no sell route"
+    usd = s[0] / 1e9 * sol_usd()
+    _state["sellq"][mint] = (time.time(), qty, usd)
+    return usd, None
 
 
 def buy_qty(size_usd, mid, r_buy):

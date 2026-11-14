@@ -326,6 +326,8 @@ def build_state():
                 # for the page's live market prices (display only): full mint, the bot's pool, cost terms
                 "mint_full": p["mint"], "pool": p["pool"], "mtm": mtm_terms(p),
                 "last_candle_ts": p["last_candle_ts"],
+                "basis": p["px_basis"] if "px_basis" in p.keys() else None,
+                "old_px": p["old_px"] if "old_px" in p.keys() else None,
             })
         equity = cash + open_val
         curve = [(t0, C.START_EQUITY)] + [(r["ts"], r["equity"]) for r in q(f"SELECT ts,equity FROM {eq_table} WHERE ts>=? ORDER BY ts", (t0 or 0,))]
@@ -352,7 +354,9 @@ def build_state():
                                    "botfee": c["gap_botfee"], "netfee": c["gap_netfee"], "rt_pct": c["rt_pct"],
                                    "liq_in": c["liq_in"], "liq_out": c["liq_out"], "src_in": c["q_src_in"],
                                    "src_out": c["q_src_out"], "sellable": c["sellable"]}
-                                  if c["fill_model"] == "live" else None)})
+                                  if c["fill_model"] == "live" else None),
+                         "basis": c["px_basis"] if "px_basis" in c.keys() else None,
+                         "old_px": c["old_px"] if "old_px" in c.keys() else None})
         wins = [h for h in hist if h["pnl"] > 0]
         acc = {"start": C.START_EQUITY, "equity": equity, "cash": cash, "open_value": open_val, "since": t0,
                "change_pct": (equity / C.START_EQUITY - 1) * 100, "change_usd": equity - C.START_EQUITY,
@@ -360,6 +364,12 @@ def build_state():
                "max_open": C.MAX_OPEN, "closed": len(hist), "wins": len(wins),
                "win_rate": (len(wins) / len(hist) * 100) if hist else None, "total_pnl": sum(h["pnl"] for h in hist),
                "reset_ts": sess or None}
+        js = meta.get("jup_pricing_since")
+        if js:   # Nov 14 2026: entries priced from real Jupiter quotes from here on; results before it kept apart
+            aft = [h for h in hist if h["entry_ts"] >= js]; bef = [h for h in hist if h["entry_ts"] < js]
+            acc["jup"] = {"since": js, "closed": len(aft), "wins": sum(1 for h in aft if h["pnl"] > 0),
+                          "pnl": sum(h["pnl"] for h in aft), "before_closed": len(bef),
+                          "before_wins": sum(1 for h in bef if h["pnl"] > 0), "before_pnl": sum(h["pnl"] for h in bef)}
         return acc, open_rows, hist
 
     if real_start:

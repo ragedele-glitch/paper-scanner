@@ -190,7 +190,11 @@ MIGRATIONS = [
     "floor_px REAL",      # +$5 floor (Nov 7 night, main account): price where the whole bag sells for +$5 after costs
     "floor_on INT",       # 1 = the +$5 floor is on for this trade
     "live_chk INT",       # 1 = stops are checked on live prices every few seconds (not 1-minute candles)
-    "live_ts REAL")       # newest live price (or candle end) the trade's exits have been checked up to
+    "live_ts REAL",       # newest live price (or candle end) the trade's exits have been checked up to
+    "px_basis TEXT",      # Nov 14 2026: 'jupiter' = entry priced from the real Jupiter $20 buy quote (exits from real
+                          # sell quotes); 'fallback' = Jupiter quote failed, old price used; NULL = before the change
+    "old_px REAL",        # the price the old method would have used for this entry (for before/after comparison)
+    "jup_px REAL")        # dollars per token on the real Jupiter buy quote (what $20 actually buys at)
 ] + [f"ALTER TABLE signals ADD COLUMN {c}" for c in (
     "holders INT", "transfer_fee_pct REAL", "lp_locked_pct REAL", "token_program TEXT",
     "rt_pct REAL", "fill_note TEXT",
@@ -855,7 +859,7 @@ def _handle_candidate(con, c, pairs):
         px_seen, src_r = price, "dexscreener_live"; note.append("no trade data at detection time, used DexScreener price")
     if not px_5:
         px_5, src_5 = price, "dexscreener_live"
-    fill = None
+    fill = None; src_px = None
     if not killed:
         # live-like fill for the realistic accounts: lands EXEC_DELAY_S later, priced with real quotes and fees
         px_r = px_fill or px_seen
@@ -864,16 +868,34 @@ def _handle_candidate(con, c, pairs):
         fill = dict(fill_model="live", leader_px=px_lead, seen_px=px_seen, r_buy=q["r_buy"], r_sell_est=q["r_sell"],
                     rt_pct=q["rt_pct"], q_src_in=q["src"], route=q.get("route"), fee_in=fee_in, liq_in=liq,
                     sellable=1 if q["sellable"] else 0)
+        # Nov 14 2026: price the entry from the real Jupiter buy quote for $20, as Rage Radium Bot does, instead of
+        # the trade-data / DexScreener price. The mid is the quote's price less half the round trip (the same split
+        # the costs always used), so the tokens bought are exactly what Jupiter quoted for $20. Rules are unchanged.
+        old_px = px_r
+        jpx, jwhy = fills.jup_buy_px(mint, q)
+        if jpx and q.get("r_buy"):
+            px_r = jpx / q["r_buy"]
+            fill.update(px_basis="jupiter", old_px=old_px, jup_px=jpx); src_px = "jupiter_quote"
+            log.info("JUPITER ENTRY PRICE %s: $20 buys at %.6g per token, %+.1f%% vs the old price %.6g",
+                     sym, jpx, (jpx / old_px - 1) * 100 if old_px else 0, old_px)
+        else:
+            fill.update(px_basis="fallback", old_px=old_px)
+            log.warning("JUPITER ENTRY PRICE FAILED %s: %s; used the old price %.6g", sym, jwhy, old_px)
         sig["rt_pct"] = q["rt_pct"]
         if q["rt_pct"] is not None and q["rt_pct"] >= C.HF_RT_MAX:
             rug_why.append(f"round trip {q['rt_pct']:.1f}% (limit {C.HF_RT_MAX:.0f}%)")
         hf_takes = not rug_why
         sig["hf_block"] = 1 if rug_why else 0
-        fn = [f"live-like fill: lands {C.EXEC_DELAY_S}s after seen at {px_r:.6g} (seen {px_seen:.6g})",
+        fn = [f"live-like fill: lands {C.EXEC_DELAY_S}s after seen at {old_px:.6g} (seen {px_seen:.6g})",
               f"round trip {q['rt_pct']:.1f}% via {q['src']}", f"network ${fee_in:.3f}/tx"]
+        if jpx:
+            fn.append(f"priced from Jupiter's real $20 buy quote: {jpx:.6g} per token "
+                      f"({(jpx / old_px - 1) * 100 if old_px else 0:+.1f}% vs the old price {old_px:.6g})")
+        else:
+            fn.append(f"Jupiter price failed ({jwhy}): old price used")
         if not q["sellable"]:
             fn.append("Jupiter could buy but not sell it back (honeypot or sell tax)")
-        jump = px_r / px_seen - 1 if px_seen else 0
+        jump = old_px / px_seen - 1 if px_seen else 0   # unchanged: the same failed-buy check as before
         if jump > C.COPY_SLIPPAGE_TOL:
             # a live bot's buy fails on its slippage limit; the failed transaction's fee is still paid
             fail_fee = fills.tx_fee_usd(pool, landed=False)
@@ -894,13 +916,13 @@ def _handle_candidate(con, c, pairs):
         else:
             sid = insert_signal(con, **sig, status="survivor", notes="; ".join(note) or None)
             # shadow position: every survivor, flat $20, no slot limit (measures the filters themselves)
-            open_position(con, sid, C.ACCT_REAL_SHADOW, mint, sym, pool, wallet, fill_ts, px_r, src_f or src_r, 20.0, fill)
-            open_main(con, sid, C.ACCT_REAL, mint, sym, pool, wallet, fill_ts, px_r, src_f or src_r, c["name"], "", fill)
+            open_position(con, sid, C.ACCT_REAL_SHADOW, mint, sym, pool, wallet, fill_ts, px_r, src_px or src_f or src_r, 20.0, fill)
+            open_main(con, sid, C.ACCT_REAL, mint, sym, pool, wallet, fill_ts, px_r, src_px or src_f or src_r, c["name"], "", fill)
             # shadow test: the same trade with the rug filter (the current rules above are unchanged)
             if not hf_started(con):
                 pass
             elif hf_takes:
-                open_main(con, sid, C.ACCT_HF, mint, sym, pool, wallet, fill_ts, px_r, src_f or src_r, c["name"],
+                open_main(con, sid, C.ACCT_HF, mint, sym, pool, wallet, fill_ts, px_r, src_px or src_f or src_r, c["name"],
                           "rug-filter test: ", fill)
             else:
                 con.execute("UPDATE signals SET notes=COALESCE(notes||'; ','')||? WHERE id=?",
@@ -1770,11 +1792,33 @@ def is_live(p):
     return "fill_model" in p.keys() and p["fill_model"] == "live"
 
 
+def jup_priced(p):
+    """Nov 14 2026: paper trades priced from real Jupiter quotes (entry and exits). Never Radium's engine."""
+    return not C.ENGINE and "px_basis" in p.keys() and p["px_basis"] == "jupiter"
+
+
+JUP_EXIT_MAX_AGE = 120   # a sell is re-quoted on Jupiter only while it is this fresh (older catch-up exits can't be)
+
+
+def jup_exit(p, qty, ts, t_now, what):
+    """Dollars Jupiter pays now for qty tokens, for a Jupiter-priced paper trade's sell; None (logged) -> old method."""
+    if not jup_priced(p) or t_now - ts > JUP_EXIT_MAX_AGE or qty <= 0:
+        return None
+    usd, why = fills.jup_sell_usd(p["mint"], qty)
+    if usd is None:
+        log.warning("JUPITER EXIT PRICE FAILED %s (%s): %s; used the old method", p["symbol"], what, why)
+    return usd
+
+
 def sell_leg(p, qty, px, ts, t_now):
     """Proceeds of selling qty at px. Live-like: re-quote now if the sell is recent, else the entry-time estimate."""
     if not is_live(p):
         return sell_proceeds(qty, px), None, C.NETWORK_FEE_USD
     r = p["r_sell_est"] or 0
+    usd = jup_exit(p, qty, ts, t_now, "sell leg")
+    if usd is not None:   # real Jupiter sell quote for exactly this amount
+        fee = fills.tx_fee_usd(p["pool"])
+        return max(0.0, usd * (1 - C.BOT_FEE) - fee), (usd / (qty * px) if qty and px else r), fee
     if t_now - ts < 600:
         try:
             pr = dex_pairs([p["mint"]]).get(p["mint"]) or []
@@ -1942,7 +1986,7 @@ def take_half(con, p, t, px, stop, slog, t_now):
 
 def close_position(con, p, ts, px, reason, stop=None, peak=None, slog=None):
     if "fill_model" in p.keys() and p["fill_model"] == "live":
-        proceeds, pnl = close_live(con, p, px)
+        proceeds, pnl, px = close_live(con, p, px, ts)
     else:
         proceeds = sell_proceeds(p["qty"], px)
         pnl = proceeds + ((p["part_proceeds"] if "part_proceeds" in p.keys() else 0) or 0) - p["size_usd"] - C.NETWORK_FEE_USD
@@ -1958,9 +2002,11 @@ def close_position(con, p, ts, px, reason, stop=None, peak=None, slog=None):
         live_hook(live.on_paper_close, con, p["signal_id"], p["mint"], reason)
 
 
-def close_live(con, p, px):
+def close_live(con, p, px, ts=None):
     """Exit of a live-like position: re-quote the sell for exactly this token amount now, pay this moment's network
-    fee, and split the gap from the 'ideal' trade (wallet's own entry, no costs) into its causes."""
+    fee, and split the gap from the 'ideal' trade (wallet's own entry, no costs) into its causes.
+    Nov 14 2026: a Jupiter-priced paper trade sells at the real Jupiter quote for its tokens; the exit price
+    recorded is that quote's mid (quote price over the sell cost), so the trigger price no longer sets the fill."""
     try:
         pr = dex_pairs([p["mint"]]).get(p["mint"]) or []
         # pump.fun bonding-curve pairs carry no liquidity figure: 0 there means unknown, not empty
@@ -1969,6 +2015,18 @@ def close_live(con, p, px):
         liq_out = None
     q = fills.exit_quote(p["mint"], p["qty"], liq_out if liq_out is not None else (p["liq_in"] or 0), bool(p["sellable"]))
     r_sell = q["r_sell"]
+    q_src = q["src"]
+    usd = jup_exit(p, p["qty"], ts if ts is not None else now(), now(), "close")
+    if usd is not None and p["qty"]:
+        if r_sell <= 0:
+            r_sell = 1.0
+        trig = px
+        px = usd / (p["qty"] * r_sell)
+        q_src = f"jupiter real sell quote (trigger {trig:.6g}, Jupiter {usd / p['qty']:.6g}/token)"
+        log.info("JUPITER EXIT PRICE %s: %.6g per token on the real quote vs trigger price %.6g (%+.1f%%)",
+                 p["symbol"], usd / p["qty"], trig, (usd / p["qty"] / trig - 1) * 100 if trig else 0)
+    elif jup_priced(p):
+        q_src = q_src + " (old method: no fresh Jupiter sell quote)"
     fee_out = fills.tx_fee_usd(p["pool"]) if r_sell > 0 else 0.0
     size, mid, rb = p["size_usd"], p["entry_price"], p["r_buy"] or 1.0
     proceeds = fills.sell_value(p["qty"], px, r_sell, fee_out)
@@ -1986,8 +2044,8 @@ def close_live(con, p, px):
     netfee = (p["fee_in"] or 0) + fee_out + (((p["part_fee"] if "part_fee" in p.keys() else 0) or 0) if part else 0)
     con.execute("""UPDATE positions SET r_sell=?, q_src_out=?, fee_out=?, liq_out=?, ideal_pnl=?, gap_delay=?,
                    gap_impact=?, gap_botfee=?, gap_netfee=? WHERE id=?""",
-                (r_sell, q["src"], fee_out, liq_out, ideal, ideal - a, a - b, b - c, netfee, p["id"]))
-    return proceeds, pnl
+                (r_sell, q_src, fee_out, liq_out, ideal, ideal - a, a - b, b - c, netfee, p["id"]))
+    return proceeds, pnl, px
 
 
 QUOTES = {}   # mint -> (fetched_ts, usd_price, source), shared by every account holding the coin
@@ -2474,6 +2532,8 @@ def main():
         except Exception as e:
             log.warning("wallet-score shadow test could not start %s", e)
         paper_reset(con)
+        if not C.ENGINE and meta_get(con, "jup_pricing_since") is None:   # Nov 14 2026: Jupiter-quote pricing starts
+            meta_set(con, "jup_pricing_since", now()); con.commit()
         try:
             manual_close(con)
         except Exception as e:   # never let it stop the scanner; it is retried at the next start
