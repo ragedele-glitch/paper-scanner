@@ -560,6 +560,8 @@ def build_state():
         "realism": realism,
         "activity": activity,
         "be15": be15,
+        # break-even lock switch (Rage, Nov 14): what the bot last read from be_lock.json ("paper" entry)
+        "be_lock": meta.get("be_lock"),
         "rules": {"size": f"{int(C.POS_FRACTION*100)}% of the account per trade, max {C.MAX_OPEN} open",
                   "stop": (f"$5 max-loss stop: {int(C.MAX_LOSS_PCT*100)}% under entry (a dump can fill worse; the real fill is recorded). "
                            f"From +{int(C.BE2_TRIGGER*100)}% the stop never sits below breakeven after all costs"),

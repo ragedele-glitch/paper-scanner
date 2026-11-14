@@ -1186,6 +1186,83 @@ def floor_switch(con):
     con.commit()
 
 
+# ----------------------------------------------------------------------------- break-even lock (Rage, Nov 14)
+# Switched from the page / GitHub Actions ("Break-even lock switch" writes be_lock.json on main). The paper scanner
+# reads the "paper" entry, Radium's engine (RADIUM_ENGINE=1) the "radium" one. Read every BE_LOCK_READ_S seconds in a
+# background thread, so a slow GitHub answer never holds up the exits. If it can't be read, the last value it read
+# stays (OFF until the first good read). See config.py for what it does.
+BE_LOCK = {"on": False, "by": None, "at": None, "ok_t": 0.0, "err": None, "since": None, "key": None}
+
+
+def be_lock_key():
+    return "radium" if C.ENGINE else "paper"
+
+
+def be_lock_fetch():
+    repo, token = os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_TOKEN")
+    if repo and token and not os.environ.get("BE_LOCK_LOCAL"):
+        req = urllib.request.Request(f"https://api.github.com/repos/{repo}/contents/{C.BE_LOCK_FILE}?ref=main",
+                                     headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.raw+json",
+                                              "User-Agent": "rage-meme-bot"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            j = json.loads(r.read())
+    else:
+        with open(os.environ.get("BE_LOCK_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), C.BE_LOCK_FILE)) as f:
+            j = json.load(f)
+    v = (j or {}).get(be_lock_key()) or {}
+    return {"on": v.get("on") is True, "by": v.get("by"), "at": v.get("at")}
+
+
+def be_lock_poll():
+    try:
+        v = be_lock_fetch()
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            BE_LOCK["err"] = f"HTTP {e.code}"; return
+        v = {"on": False, "by": None, "at": None}   # no switch file on main: off
+    except Exception as e:
+        BE_LOCK["err"] = type(e).__name__; return
+    if v["on"] != BE_LOCK["on"] or not BE_LOCK["ok_t"]:
+        log.info("BREAK-EVEN LOCK %s for the %s bot (switch set by %s at %s)", "ON" if v["on"] else "OFF",
+                 "Radium" if C.ENGINE else "main paper", v["by"] or "-", v["at"] or "-")
+        BE_LOCK["since"] = now()
+    BE_LOCK.update(v, ok_t=now(), err=None, key=be_lock_key())
+
+
+def be_lock_thread():
+    def run():
+        while True:
+            time.sleep(C.BE_LOCK_READ_S)
+            try:
+                be_lock_poll()
+            except Exception:
+                pass
+    threading.Thread(target=run, name="be-lock", daemon=True).start()
+
+
+def be_lock_on(p):
+    """True while the lock is on and this trade is a main-account trade on the current exits (the +$5 floor ones)."""
+    return bool(BE_LOCK["on"]) and "floor_on" in p.keys() and bool(p["floor_on"])
+
+
+def be_lock_sweep(con):
+    """While the lock is on: every open main-account trade whose last price is at or above its breakeven-after-costs
+    price gets its stop moved up to that price now (a trade under it keeps its stop). Stops never move down."""
+    if not BE_LOCK["on"]:
+        return
+    for r in con.execute("SELECT * FROM positions WHERE status='open' AND floor_on=1 AND be_px IS NOT NULL").fetchall():
+        p = dict(r)
+        be, px = p["be_px"], p["last_price"]
+        if not be or not px or px < be or (p["stop"] or 0) >= be:
+            continue
+        slog = json.loads(p["stop_log"] or "[]")
+        slog.append([now(), be, "breakeven (break-even lock)"])
+        con.execute("UPDATE positions SET stop=?, stop_log=? WHERE id=? AND status='open'", (be, json.dumps(slog[-30:]), p["id"]))
+        log.info("BREAK-EVEN LOCK [acct %d] %s at %+.1f%%: stop moved up to breakeven %.10g (was %.10g)", p["account"],
+                 p["symbol"], (px / p["entry_price"] - 1) * 100, be, p["stop"] or 0)
+    con.commit()
+
+
 # ----------------------------------------------------------------------------- live prices (main account, Nov 7 night)
 TICKS = {}          # mint -> [(ts, usd_price, source)], last 30 minutes, filled by the ticker thread
 TICK_LOCK = threading.Lock()
@@ -1342,6 +1419,8 @@ def tick_walk(st, spec, entry, be, fl, ticks, mirror_ts, entry_ts, why_stop, key
             continue
         if spec.get("half_at") and not st["half"] and px >= entry * spec["half_at"]:
             ev.append(("half", t, px)); st["half"] = True
+        if spec.get("be_lock") and be and px >= be and (st["stop"] or 0) < be:   # break-even lock: armed at this price
+            ev.append(("stop", t, be)); st["stop"] = be
         if px > st["peak"]:
             st["peak"] = px
             ns = stop_for(spec, entry, px, st["stop"], be, fl)
@@ -1492,6 +1571,9 @@ ALTS["floor_candle"] = FLOOR_SPEC
 # checked on live prices every few seconds, like the real main-account trade: live checks without the floor
 LIVE_ALTS = {"live_nofloor": REAL_SPEC}
 ALL_ALTS = dict(ALTS, **LIVE_ALTS)
+# break-even lock (Rage, Nov 14): the current exits (the +$5 floor included), with breakeven armed as soon as the price
+# is at or above the breakeven-after-costs price (not a comparison copy: the real trade's rules while the lock is on)
+LOCK_SPEC = dict(FLOOR_SPEC, be_lock=True)
 MAIN_ALTS = {"cur_exits", "floor_candle", "live_nofloor"}   # only main-account trades carry these
 
 
@@ -1509,6 +1591,8 @@ def stop_for(spec, entry, peak, old, be_px, floor_px=None):
             s = max(s, b)
     if spec.get("floor") and floor_px and peak >= floor_px:   # has been above +$5 after costs: floor at +$5
         s = max(s, floor_px)
+    if spec.get("be_lock") and be_px and peak >= be_px:   # break-even lock: called on a new peak, i.e. the price now
+        s = max(s, be_px)
     return max(old, s)
 
 
@@ -1525,7 +1609,7 @@ def floor_price(be_px, size, fee):
 
 def spec_of(p):
     if "floor_on" in p.keys() and p["floor_on"]:
-        return FLOOR_SPEC
+        return LOCK_SPEC if be_lock_on(p) else FLOOR_SPEC
     return REAL_SPEC if ("be15" in p.keys() and p["be15"]) else PREV_SPEC
 
 
@@ -1534,6 +1618,8 @@ def stop_label(p, ns, peak):
     if fpx(p) and abs(ns - fpx(p)) < 1e-9 * ns:
         return "+$5 floor"
     if p["be_px"] and abs(ns - p["be_px"]) < 1e-9 * ns:
+        if be_lock_on(p) and peak / entry - 1 + 1e-9 < C.BE15_TRIGGER:
+            return "breakeven (break-even lock)"
         return "breakeven (+15% rule)" if peak / entry - 1 + 1e-9 < C.BE2_TRIGGER else "breakeven"
     return f"peak +{(peak/entry-1)*100:.0f}%"
 
@@ -1557,6 +1643,8 @@ def stop_reason(p, stop, gapped, peak=None):
             r = "+$5 floor stop"
         elif p["be_px"] and abs(stop - p["be_px"]) <= 1e-9 * stop:
             r = "breakeven stop"
+            if peak is not None and be_lock_on(p) and peak / entry - 1 + 1e-9 < C.BE15_TRIGGER:
+                return r + " (break-even lock)" + (" (gapped)" if gapped else "")
             if peak is not None and spec_of(p) is not PREV_SPEC and peak / entry - 1 + 1e-9 < C.BE2_TRIGGER:
                 return r + " (+15% rule)" + (" (gapped)" if gapped else "")
         else:
@@ -1941,6 +2029,8 @@ def update_position(con, p, pool_now=None):
             if ns > stop:
                 lab = stop_label(p, ns, peak) if v3 else f"peak +{(peak/entry-1)*100:.0f}%"
                 slog.append([t, ns, lab]); stop = ns
+        if v3 and be_lock_on(p) and p["be_px"] and c >= p["be_px"] and stop < p["be_px"]:   # break-even lock
+            stop = p["be_px"]; slog.append([t, stop, "breakeven (break-even lock)"])
         last_ts, last_px = t, c
     price_src, price_ts = "candle", ((last_ts or p["entry_ts"]) + 60)
     # Stale-candle guard: no new candle for a while (GeckoTerminal may not chart this pool at all), so check the
@@ -1978,6 +2068,8 @@ def update_position(con, p, pool_now=None):
             if ns > stop:
                 lab = (stop_label(p, ns, peak) if v3 else f"peak +{(peak/entry-1)*100:.0f}%") + " (live price)"
                 slog.append([qt, ns, lab]); stop = ns
+        if v3 and be_lock_on(p) and p["be_px"] and qpx >= p["be_px"] and stop < p["be_px"]:   # break-even lock
+            stop = p["be_px"]; slog.append([qt, stop, "breakeven (break-even lock) (live price)"])
         last_px, price_src, price_ts = qpx, qsrc, qt
     # no candle (no trades) for a long time and no live price either -> time stop at last known price
     elif t_now >= p["entry_ts"] + C.TIME_STOP_S and (not cs or cs[-1][0] < p["entry_ts"] + C.TIME_STOP_S):
@@ -2320,6 +2412,11 @@ def main():
         con.execute("DELETE FROM price_ticks WHERE ts < ?", (now() - C.TICK_KEEP_DAYS * 86400,)); con.commit()
     except Exception as e:   # never let it stop the scanner; it is retried at the next start
         log.warning("+$5 floor switch error %s", e); con.rollback()
+    try:   # break-even lock switch: first read now, then every BE_LOCK_READ_S seconds in the background
+        be_lock_poll()
+    except Exception as e:
+        log.warning("break-even lock read error %s", e)
+    be_lock_thread()
     start_ticker()
     log.info("scanner start (RADIUM ENGINE - signals only, no wallet, no keys, nothing signed)" if C.ENGINE else
              "scanner start (PAPER MODE ONLY - no wallet, no keys, nothing signed)")
@@ -2357,6 +2454,11 @@ def main():
                 t1 = now(); r = fn(*a); tm[name] = now() - t1; return r
             if not C.ENGINE:
                 _t("feed", drain_stream, con)
+            try:
+                meta_set(con, "be_lock", {k: BE_LOCK[k] for k in ("on", "by", "at", "ok_t", "err", "since", "key")})
+                be_lock_sweep(con)
+            except Exception as e:
+                log.warning("break-even lock error %s", e); con.rollback()
             _t("live0", live_guard, con)
             cands, polled = _t("poll", poll_wallets, con)
             _t("filters", process_new_buys, con, cands)
@@ -2411,6 +2513,8 @@ def main():
                     time.sleep(1)   # the feed thread handles new buys
                 else:
                     drain_stream(con, wait_s=1.0) if STREAM is not None else time.sleep(1)
+                if BE_LOCK["on"]:
+                    be_lock_sweep(con)
                 live_guard(con)   # main-account exits on live prices, every second between full loops
             except Exception as e:
                 log.error("feed loop error %s\n%s", e, traceback.format_exc())

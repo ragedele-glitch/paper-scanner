@@ -1,0 +1,65 @@
+# Break-even lock switch (Rage, Nov 14). On your phone: GitHub > paper-scanner > Actions > "Break-even lock switch" >
+# Run workflow > pick the bot and on/off > Run workflow. Both bots read it within about 15 seconds.
+#   on   while on, a trade's stop moves to break-even (after fees) as soon as the price clears its fees, without
+#        waiting for +15%. Trading carries on: buys, the -25% stop, the +$5 floor, the trail, the 2x half sell and
+#        the copied-wallet sell are unchanged. A trade still in the red keeps its normal stop. Gaps can still fill lower.
+#   off  back to the normal rules (break-even from +15%). A stop already moved up stays.
+name: Break-even lock switch
+on:
+  workflow_dispatch:
+    inputs:
+      bot:
+        description: "Which bot?"
+        required: true
+        type: choice
+        options:
+          - both bots
+          - main paper bot
+          - Rage Radium Bot
+      action:
+        description: "Break-even lock on or off?"
+        required: true
+        type: choice
+        options:
+          - "on"
+          - "off"
+permissions:
+  contents: write
+concurrency:
+  group: be-lock-control
+  cancel-in-progress: false
+jobs:
+  switch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Set the switch
+        env:
+          BOT: ${{ inputs.bot }}
+          ACTION: ${{ inputs.action }}
+          WHO: ${{ github.actor }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, time
+          try:
+              v = json.load(open("be_lock.json"))
+          except Exception:
+              v = {}
+          bot, on = os.environ["BOT"], os.environ["ACTION"] == "on"
+          keys = ["paper", "radium"] if bot.startswith("both") else ["radium"] if "Radium" in bot else ["paper"]
+          at = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+          for k in ["paper", "radium"]:
+              if not isinstance(v.get(k), dict):
+                  v[k] = {"on": False, "by": None, "at": None}
+          for k in keys:
+              v[k] = {"on": on, "by": os.environ["WHO"], "at": at}
+          open("be_lock.json", "w").write(json.dumps(v, indent=1) + "\n")
+          print("Break-even lock:", ", ".join(keys), "->", "ON" if on else "OFF")
+          EOF
+          git config user.name "rage-be-lock-switch"
+          git config user.email "rage-be-lock-switch@users.noreply.github.com"
+          git add be_lock.json
+          git commit -m "Break-even lock switch: $BOT $ACTION" || echo "no change"
+          for i in 1 2 3 4 5; do git pull -q --rebase origin main && git push -q origin HEAD:main && break; sleep 3; done

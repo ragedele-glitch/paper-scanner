@@ -733,6 +733,53 @@ def control():
     return v
 
 
+# ----------------------------------------------------------------------------- break-even lock (Rage, Nov 14)
+# be_lock.json on main, "radium" entry, written by the "Break-even lock switch" workflow (the blue button on the page
+# links to it). Re-read every 15 s; if it can't be read the last value stays (OFF until the first good read).
+# While ON: a trade's stop moves up to Radium's own breakeven price (what it paid,
+# both network fees and the sell-side cost) as soon as Radium's own live price is at or above it. A trade still under
+# it keeps its normal stop. The engine (scanner.py, same switch) does the same on the paper side, and its breakeven
+# stop also closes Radium's trade. Buys, the -25% stop, the $ max-loss line, the trail, the 2x half sell and the
+# copied-wallet sell are unchanged. Stops never move down. Switching it on sells nothing by itself.
+BE_LOCK_FILE = "be_lock.json"
+_BEL = {"t": 0.0, "ok_t": 0.0, "v": {"on": False, "by": None, "at": None}}
+
+
+def be_lock():
+    if time.time() - _BEL["t"] >= 15:
+        _BEL["t"] = time.time()
+        try:
+            if REPO and TOKEN and not os.environ.get("RADIUM_TEST_RUNS") and not os.environ.get("BE_LOCK_LOCAL"):
+                j = http(f"https://api.github.com/repos/{REPO}/contents/{BE_LOCK_FILE}?ref=main",
+                         headers={"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github.raw+json"},
+                         timeout=5, tries=1)
+            else:
+                with open(os.environ.get("BE_LOCK_PATH") or os.path.join(HERE, BE_LOCK_FILE)) as f:
+                    j = json.load(f)
+            v = (j or {}).get("radium") or {}
+            v = {"on": v.get("on") is True, "by": v.get("by"), "at": v.get("at")}
+            if v["on"] != _BEL["v"]["on"]:
+                log(f"BREAK-EVEN LOCK {'ON' if v['on'] else 'OFF'} (switch set by {v['by'] or '-'} at {v['at'] or '-'})")
+            _BEL["v"] = v; _BEL["ok_t"] = time.time()
+        except Exception as e:
+            if "404" in str(e):
+                _BEL["v"] = {"on": False, "by": None, "at": None}; _BEL["ok_t"] = time.time()
+    return dict(_BEL["v"], ok_t=_BEL["ok_t"])
+
+
+def own_be_px(t):
+    """Radium's own breakeven price for this trade: the live price at which selling what's left (minus about half
+    the round-trip cost for the sell side) plus any half already sold gets back the stake and both network fees."""
+    try:
+        ui = int(t["tokens"] or 0) / 10 ** (t["decimals"] or 0)
+        if ui <= 0 or not t["stake_usd"]:
+            return None
+        need = (t["stake_usd"] or 0) + 2 * (t["fee_in_usd"] or 0) - (t["half_usd"] or 0)
+        return max(0.0, need) / (ui * (1 - (t["rt_pct"] or 3.0) / 200))
+    except Exception:
+        return None
+
+
 # ----------------------------------------------------------------------------- exits (same rules as the main account)
 FLOOR_SPEC = dict(max_loss=C.MAX_LOSS_PCT, be=C.BE2_TRIGGER, half_at=C.HALF_AT, trail=C.TRAIL_V3,
                   be15=C.BE15_TRIGGER, floor=True)
@@ -1434,11 +1481,24 @@ class Bot:
             if not entry:
                 continue
             pk = max(t["paper_peak"] or 0, t["peak"] or 0)
-            stop = stop_for(FLOOR_SPEC, entry, pk, max(t["paper_stop"] or 0, t["gstop"] or 0), t["paper_be"], t["paper_floor"])
+            lock = be_lock()["on"]
+            stop = stop_for(FLOOR_SPEC, entry, pk, max(t["paper_stop"] or 0, t["gstop"] or 0),
+                            t["paper_be"], t["paper_floor"])
+            locked = False
+            if lock:   # break-even lock: Radium's own breakeven, armed once its own live price is at or above it
+                obe = own_be_px(t) or t["paper_be"]
+                if obe and t["last_px"] >= obe and stop < obe:
+                    stop = obe; locked = True
+                    event(self.con, "info", f"{t['symbol'] or t['mint'][:6]}: break-even lock moved the stop up to "
+                                            f"Radium's own breakeven ({obe / entry - 1:+.1%} vs paper entry)")
             self.con.execute("UPDATE trades SET gstop=? WHERE id=?", (stop, t["id"]))
             hit = None
-            if t["last_px"] <= stop:
+            if locked:
+                pass   # just armed at this price: it sells when the price falls back to it
+            elif t["last_px"] <= stop:
                 hit = f"stop hit on live price ({t['last_px'] / entry - 1:+.0%} vs paper entry)"
+                if lock and (own_be_px(t) or 0) and abs(stop - own_be_px(t)) < 1e-9 * stop:
+                    hit = "break-even lock stop hit on live price"
             elif not t["half_ts"] and t["last_px"] >= entry * C.HALF_AT:
                 hit = "half"
             elif now - (t["paper_entry_ts"] or now) > C.TIME_STOP_S:
@@ -1919,6 +1979,7 @@ class Bot:
               "key_matches": WALLET.get("key_ok"), "balance_sol": bal, "balance_usd": (bal * solpx) if (bal is not None and solpx) else None,
               "balance_err": self.bal["err"], "sol_px": solpx,
               "control": {"pause": bool(ctl.get("pause")), "sell_all_and_stop": bool(ctl.get("sell_all_and_stop")), "stale": ctl.get("stale")},
+              "be_lock": be_lock(),
               "blocked": self.blocked(ctl),
               "limits": {k: S[k] for k in ("max_loss", "max_stake", "min_stake", "stop_pct", "max_open", "daily_loss", "total_loss",
                                            "buy_slip_bps", "sell_slip_bps", "max_impact", "max_lag", "max_chase_pct", "max_wallet_age", "priority_lamports", "reserve_sol")},

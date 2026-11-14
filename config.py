@@ -192,6 +192,19 @@ TICK_STALE_S = 15           # a live source whose price has not changed for this
 TICK_FRESH_S = 30           # live checks are used while the newest live price is no older than this
 TICK_JUP_S = 12             # (unused since the Nov 8 fix: Jupiter is now asked every tick)
 TICK_KEEP_DAYS = 14         # recorded live prices kept this long
+# Break-even lock (Rage, Sat Nov 14 2026, 3:20 AM Lagos: "make every trade break even" on a bad day or to protect
+# profit, without switching the bot off; option B "early lock", for both the main paper bot and Rage Radium Bot).
+# Switched from the page / GitHub Actions ("Break-even lock switch", be_lock.json on main: {"paper": {"on": ..},
+# "radium": {"on": ..}}), re-read every 15 s. OFF by default. While ON, on the main account (FLOOR_ACCTS) only:
+#  - a trade's stop moves up to its breakeven-after-costs price as soon as the price is at or above it (no waiting
+#    for +15%), on open trades and new ones. A trade still under its breakeven price keeps its normal stop.
+#  - everything else is unchanged: the +$5 floor still arms once a trade has been $5 up (it only ever sits above
+#    breakeven), and the trail, the 2x half-sell, the -25% stop, the copied-wallet sell, the 24 h close and every buy
+#    filter carry on as before. Stops never move down.
+# Switching it OFF goes back to breakeven from +15% for what happens next; a stop it already moved up stays.
+# Nothing is sold at the moment it is switched on. Not a guarantee: gaps, slippage and fees can still fill below it.
+BE_LOCK_FILE = "be_lock.json"
+BE_LOCK_READ_S = 15
 
 EXCLUDE_MINTS = {
     "So11111111111111111111111111111111111111112",  # wSOL
