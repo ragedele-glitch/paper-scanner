@@ -34,6 +34,7 @@ SEEN_BUYS = {}         # (wallet, mint) -> time a first buy was taken from the f
 PENDING_LOCK = threading.Lock()
 PF = ThreadPoolExecutor(max_workers=8, thread_name_prefix="engine-checks")   # Radium: checks run side by side
 RUG_PF = {}            # Radium: mint -> RugCheck answer being fetched since the buy was first seen
+CHK = threading.local()  # Radium: the candidate being checked on this thread, for its check timings (page only)
 PENDING = []           # feed buys of coins DexScreener hasn't listed yet, retried for up to DEX_RETRY_S
 CANDLES = {}           # (pool, mint) -> (fetched_at, since, candles): one GeckoTerminal call serves every account
 
@@ -209,6 +210,11 @@ def migrate(con):
     for m in MIGRATIONS + wscore.MIGRATIONS:
         try:
             con.execute(m)
+        except sqlite3.OperationalError:
+            pass
+    if C.ENGINE:   # Radium (Nov 14): how long each check took, JSON, for the page's speed card only
+        try:
+            con.execute("ALTER TABLE signals ADD COLUMN check_timing TEXT")
         except sqlite3.OperationalError:
             pass
     con.commit()
@@ -599,7 +605,14 @@ def _process_new_buys(con, cands):
                 RUG_PF[c["mint"]] = (now(), PF.submit(rugcheck_engine, c["mint"]))
         for m in [m for m, (t0, _) in list(RUG_PF.items()) if now() - t0 > 600]:
             RUG_PF.pop(m, None)
+    t_dx = now()
     pairs = dex_pairs({c["mint"] for c in cands})
+    if C.ENGINE:   # Radium: timings for the page's speed card (recording only, no extra lookups)
+        dx = now() - t_dx
+        for c in cands:
+            tm = c.setdefault("_tm", {})
+            tm["tries"] = tm.get("tries", 0) + 1
+            tm["dex_call"] = round(dx, 3)
     for c in cands:
         try:
             if handle_candidate(con, c, pairs.get(c["mint"]) or []) == "retry":
@@ -612,12 +625,39 @@ def _process_new_buys(con, cands):
 
 
 def insert_signal(con, **kw):
+    c = getattr(CHK, "c", None) if C.ENGINE else None
+    if c is not None and kw.get("mint") == c.get("mint") and kw.get("detected_ts") == c.get("det_ts"):
+        try:   # Radium: how long each check took, for the page's speed card (recording only)
+            tm = dict(c.get("_tm") or {})
+            tm["total"] = round(now() - c["det_ts"], 3)
+            kw["check_timing"] = json.dumps(tm)
+        except Exception:
+            pass
     cols = ",".join(kw.keys()); q = ",".join("?" * len(kw))
     cur = con.execute(f"INSERT INTO signals({cols}) VALUES({q})", tuple(kw.values()))
     return cur.lastrowid
 
 
 def handle_candidate(con, c, pairs):
+    if not C.ENGINE:
+        return _handle_candidate(con, c, pairs)
+    CHK.c = c   # Radium: lets insert_signal store this coin's check timings (page only)
+    try:
+        return _handle_candidate(con, c, pairs)
+    finally:
+        CHK.c = None
+
+
+def _ck(c, k, t0):
+    """Radium: records how long one check took, for the page's speed card. Recording only; never raises."""
+    if C.ENGINE:
+        try:
+            c.setdefault("_tm", {})[k] = round(now() - t0, 3)
+        except Exception:
+            pass
+
+
+def _handle_candidate(con, c, pairs):
     mint, wallet, det = c["mint"], c["wallet"], c["det_ts"]
     src_det = c.get("src", "poll"); txi = c.get("tx")
     tp = top_pair(pairs)
@@ -633,6 +673,7 @@ def handle_candidate(con, c, pairs):
             insert_signal(con, **base, status="ignored", notes=f"not on DexScreener within {C.ENGINE_DEX_WAIT_S:.0f} s "
                           "of the wallet's buy: skipped instead of buying late"); return
         insert_signal(con, **base, status="ignored", notes="no DEX market (airdrop/spam/unlisted)"); return
+    _ck(c, "listed", det)   # seen -> DexScreener lists the coin (includes the 1 s re-checks)
     price = float(tp.get("priceUsd") or 0)
     sym = tp["baseToken"].get("symbol"); nm = tp["baseToken"].get("name")
     dec_guess = None
@@ -644,6 +685,7 @@ def handle_candidate(con, c, pairs):
             return
         buy_ts, buy_sig, post_amt, dec_guess = txi["block_ts"], txi["sig"], txi["post"], txi["dec"]
     else:
+        t_ck = now()
         try:
             hist = ata_history(c["ata"], c["prev_ts"])
             for s in hist[:4]:
@@ -659,6 +701,7 @@ def handle_candidate(con, c, pairs):
                     break
         except Exception as e:
             note.append(f"buy tx lookup failed: {e}")
+        _ck(c, "buy_tx", t_ck)
     if buy_ts is None:
         buy_ts = (c["prev_ts"] + det) / 2; note.append("buy time estimated")
     dec = dec_guess if dec_guess is not None else 6
@@ -689,6 +732,7 @@ def handle_candidate(con, c, pairs):
     # --- cheap filters
     # smart wallet sold before we could copy (only sells before our entry time count: no look-ahead)
     sold_real = sold_5s = False; sold_chk_fail = False
+    t_ck = now()
     try:
         hist2 = ata_history(c["ata"], buy_ts, fast=C.ENGINE)
         horizon = max(entry_real, entry_5s)
@@ -709,6 +753,7 @@ def handle_candidate(con, c, pairs):
         note.append(f"sold-early check failed: {e}")
         if C.ENGINE:   # Radium: a check that can't finish in time means skip, never buy without it
             sold_chk_fail = True
+    _ck(c, "sold_early", t_ck)
     other = ["sold_early_check_unavailable"] if (C.ENGINE and sold_chk_fail) else []
     if h1 is not None and h1 > C.PUMP_1H_MAX_PCT:
         other.append("up_100pct_1h")
@@ -722,7 +767,9 @@ def handle_candidate(con, c, pairs):
         sig["killed_by"] = ",".join(killed)
         insert_signal(con, **sig, status="killed", notes="; ".join(note + ["holder checks not run"])); return
     if C.ENGINE:
+        t_ck = now()
         r = engine_rug(mint, det)
+        _ck(c, "rugcheck", t_ck)
     else:
         r = rugcheck(mint)
         if r is None:
@@ -848,6 +895,7 @@ def engine_enter(con, c, sig, note, killed, tp, price, liq):
         insert_signal(con, **sig, status="killed", notes="; ".join(note) or None); return
     mint, wallet, pool = c["mint"], c["wallet"], tp["pairAddress"]
     q = fee_in = None
+    t_ck = now()
     pf = c.get("_pf")
     if pf:
         try:
@@ -860,6 +908,7 @@ def engine_enter(con, c, sig, note, killed, tp, price, liq):
         q = fills.entry_quote(mint, pool, C.ENGINE_SIZE_USD, liq)
     if fee_in is None:
         fee_in = fills.tx_fee_usd(pool)
+    _ck(c, "quote_fee", t_ck)
     took = now() - c["det_ts"]
     if took > C.ENGINE_CHECKS_MAX_S:
         sig["killed_by"] = "checks_too_slow"

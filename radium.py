@@ -42,6 +42,7 @@ RLOG = os.path.join(RSTATE, "radium.log")
 STATUS = os.path.join(RSTATE, "status.json")
 PIDFILE = os.path.join(RSTATE, "daemon.pid")
 RELEASE = os.path.join(RSTATE, "release")
+SPEED_FIX_TS = 1794619625.0   # Nov 14 2026 2:27 AM Lagos: first run with the speed fix (page's speed card only)
 SCANNER_DB = os.environ.get("SCANNER_DB", os.path.join(HERE, "state", "scanner.db"))
 CONTROL_FILE = "radium_control.json"
 
@@ -1645,6 +1646,122 @@ class Bot:
         out["balance_all"] = allb[::step] + ([allb[-1]] if allb and (len(allb) - 1) % step else [])
         return out
 
+    def decisions(self, sc, since, t):
+        """Read-only, for the page's speed card (Nov 14): every coin that reached Radium's checks, before and after
+        the speed fix, with how long the checks took, whether it passed, and what Radium then did (bought, or
+        skipped and why). Counts coins that passed but weren't bought, unlike the per-trade medians."""
+        def stats(v):
+            v = sorted(x for x in v if x is not None)
+            if not v:
+                return {"n": 0}
+            return {"n": len(v), "median": v[len(v) // 2], "p90": v[min(len(v) - 1, int(len(v) * 0.9))], "max": v[-1]}
+
+        def short(why):
+            w = (why or "").lower()
+            for k, lab in (("checks took", "checks took over 10 s"), ("after the copied wallet's buy", "over 10 s after the wallet's buy"),
+                           ("above the copied wallet's own price", "price ran over 15% above the wallet's"),
+                           ("price impact", "price impact over 5%"), ("paused", "paused"), ("stopped", "stopped"),
+                           ("bot is off", "bot off"), ("phone switch", "switch unreadable"), ("open trades", "max open trades"),
+                           ("loss cap", "loss cap hit"), ("fee reserve", "wallet too low"), ("sol;", "wallet too low"),
+                           ("max loss", "costs too high for the $2 max loss"), ("engine's buy signal", "picked up late"),
+                           ("already closed", "engine had already closed it"), ("minimum", "stake under minimum")):
+                if k in w:
+                    return lab
+            return (why or "unknown")[:40]
+        has_ct = any(c[1] == "check_timing" for c in sc.execute("PRAGMA table_info(signals)"))
+        rows = [dict(zip(("id", "det", "sym", "wname", "status", "killed", "notes", "lag", "src", "ct"), r)) for r in sc.execute(
+            f"""SELECT id, detected_ts, symbol, wallet_name, status, killed_by, notes, detect_lag_s, detect_src,
+               {'check_timing' if has_ct else 'NULL'} FROM signals WHERE detected_ts>=? AND (status IN ('survivor','killed')
+               OR (status='ignored' AND notes LIKE 'not on DexScreener within%')) ORDER BY detected_ts""", (since,))]
+        pos = {}
+        sids = [r["id"] for r in rows if r["status"] == "survivor"]
+        for i in range(0, len(sids), 400):
+            ch = sids[i:i + 400]
+            for p in sc.execute(f"SELECT id, signal_id, entry_ts FROM positions WHERE account=? AND signal_id IN ({','.join('?' * len(ch))})",
+                                (C.ACCT_REAL, *ch)):
+                pos.setdefault(p[1], (p[0], p[2]))
+        rt = {}
+        if pos:
+            pids = [v[0] for v in pos.values()]
+            for i in range(0, len(pids), 400):
+                ch = pids[i:i + 400]
+                for r in self.con.execute(f"SELECT paper_id, status, notes, mode, timing FROM trades WHERE paper_id IN ({','.join('?' * len(ch))})", ch):
+                    rt[r[0]] = r
+        eras = {e: {"checked": 0, "passed": 0, "bought": 0, "practice": 0, "skipped": 0, "waiting": 0, "unlisted": 0,
+                    "reasons": {}, "w2s": [], "chk_pass": [], "chk_all": [], "w2r": []} for e in ("pre", "post")}
+        steps = {k: [] for k in ("listed", "dex_call", "buy_tx", "sold_early", "rugcheck", "quote_fee", "total")}
+        tries, recent = [], []
+        for r in rows:
+            E = eras["post" if r["det"] >= SPEED_FIX_TS else "pre"]
+            try:
+                ct = json.loads(r["ct"]) if r["ct"] else None
+            except Exception:
+                ct = None
+            if ct and r["det"] >= SPEED_FIX_TS:
+                for k in steps:
+                    if isinstance(ct.get(k), (int, float)):
+                        steps[k].append(ct[k])
+                if ct.get("tries"):
+                    tries.append(ct["tries"])
+            if r["status"] == "ignored":
+                E["unlisted"] += 1
+                continue
+            E["checked"] += 1
+            if ct and ct.get("total") is not None:
+                E["chk_all"].append(ct["total"])
+            passed = r["status"] == "survivor" or r["killed"] == "checks_too_slow"
+            if not passed:
+                continue
+            E["passed"] += 1
+            E["w2s"].append(r["lag"])
+            wallet_ts = r["det"] - r["lag"] if r["lag"] is not None else None
+            item = {"ts": r["det"], "sym": r["sym"], "wallet": r["wname"], "seen": r["lag"],
+                    "src": "live feed" if r["src"] == "stream" else "backup", "era": "post" if r["det"] >= SPEED_FIX_TS else "pre"}
+            if r["killed"] == "checks_too_slow":
+                chk = ct.get("total") if ct else None
+                why = "checks took over 10 s"
+                item.update(checks=chk, outcome="skipped", why=why)
+            else:
+                pid, entry_ts = pos.get(r["id"], (None, None))
+                chk = (entry_ts - r["det"]) if entry_ts else (ct.get("total") if ct else None)
+                item["checks"] = chk
+                tr = rt.get(pid)
+                if not tr:
+                    item.update(outcome="waiting", why="not picked up by Radium (yet)")
+                    why = None; E["waiting"] += 1
+                else:
+                    try:
+                        tm = json.loads(tr[4]) if tr[4] else {}
+                    except Exception:
+                        tm = {}
+                    if tr[1] == "skipped":
+                        why = short(tr[2])
+                        item.update(outcome="skipped", why=why)
+                        if wallet_ts and tm.get("end"):
+                            item["w2end"] = tm["end"] - wallet_ts
+                    else:
+                        why = None
+                        practice = tr[3] != "live"
+                        item["outcome"] = "practice" if practice else "bought"
+                        E["practice" if practice else "bought"] += 1
+                        if wallet_ts and tm.get("ready"):
+                            item["w2end"] = tm["ready"] - wallet_ts
+                            E["w2r"].append(item["w2end"])
+            if chk is not None:
+                E["chk_pass"].append(chk)
+            if why:
+                E["skipped"] += 1
+                E["reasons"][why] = E["reasons"].get(why, 0) + 1
+            recent.append(item)
+        logged_from = (sc.execute("SELECT MIN(detected_ts) FROM signals WHERE check_timing IS NOT NULL").fetchone()[0]
+                       if has_ct else None)   # None: the engine hasn't restarted with the timing column yet
+        out = {"fix_ts": SPEED_FIX_TS, "since": since, "logged_from": logged_from,
+               "steps": {k: stats(v) for k, v in steps.items()}, "tries": stats(tries), "recent": recent[::-1][:10]}
+        for e, E in eras.items():
+            out[e] = {k: E[k] for k in ("checked", "passed", "bought", "practice", "skipped", "waiting", "unlisted", "reasons")}
+            out[e].update(w2s=stats(E["w2s"]), chk_pass=stats(E["chk_pass"]), chk_all=stats(E["chk_all"]), w2r=stats(E["w2r"]))
+        return out
+
     def speed(self):
         """Read-only speed numbers for the page, from Radium's own engine and its own trades: live-feed uptime and
         dropouts, how fast wallet buys are seen (live feed vs backup), and Radium's own steps per trade
@@ -1704,6 +1821,10 @@ class Bot:
                         q = ",".join("?" * len(sids))
                         for r in sc.execute(f"SELECT id, detected_ts, detect_lag_s, detect_src FROM signals WHERE id IN ({q})", sids):
                             sig[r[0]] = {"det": r[1], "lag": r[2], "src": r[3]}
+                try:   # Nov 14: every coin that reached the checks, before/after the speed fix (page only)
+                    out["decisions"] = self.decisions(sc, since, t)
+                except Exception as e:
+                    out["decisions"] = {"err": f"{type(e).__name__}: {str(e)[:100]}"}
             except Exception as e:
                 out["err"] = f"{type(e).__name__}: {str(e)[:100]}"
             finally:
