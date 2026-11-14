@@ -64,6 +64,7 @@ LOCK_BRANCH = os.environ.get("RADIUM_LOCK_BRANCH", "radium-lock")
 STANDBY_MAX_S = 45 * 60          # a bridge that never gets the lock gives up after this
 BRIDGE_MAX_S = 340 * 60          # a bridge that owns the lock dispatches a fresh bridge after this
 SCANNER_FRESH_S = 120            # scanner heartbeat newer than this = mirror mode, else guard mode
+EXIT_PX_EVERY_S = 2              # Radium's own exit watch: fresh prices (Jupiter + DexScreener, freshest) every 2 s
 MIRROR_GRACE_S = 15              # in mirror mode the guard only acts if the paper account hasn't within this
 PRICE_EVERY_S = 4
 LEADER_EVERY_S = 10
@@ -92,6 +93,10 @@ def settings():
         "sell_slip_bps": int(min(envf("RADIUM_SELL_SLIPPAGE_BPS", 1500), HARD["sell_slip_bps"])),
         "max_impact": envf("RADIUM_MAX_IMPACT_PCT", 5),
         "max_lag": envf("RADIUM_MAX_LAG_S", 30),
+        # no chasing (Nov 14): skip a buy quoted more than this % above the copied wallet's own price, or ready to
+        # send more than this many seconds after the wallet's buy
+        "max_chase_pct": envf("RADIUM_MAX_CHASE_PCT", 15),
+        "max_wallet_age": envf("RADIUM_MAX_WALLET_AGE_S", 10),
         "priority_lamports": int(min(envf("RADIUM_PRIORITY_MAX_LAMPORTS", 1_000_000), HARD["priority_lamports"])),
         "reserve_sol": envf("RADIUM_FEE_RESERVE_SOL", 0.03),
         "jup_key": os.environ.get("JUP_API_KEY", "").strip(),
@@ -1078,7 +1083,8 @@ class Bot:
     # ---- buying
     def mirror_buys(self, sc):
         since = meta_get(self.con, "since", time.time())
-        rows = sc.execute("""SELECT * FROM positions WHERE account=? AND entry_ts>=? ORDER BY entry_ts""",
+        rows = sc.execute("""SELECT p.*, s.leader_buy_ts AS w_buy_ts, s.detected_ts AS w_seen_ts FROM positions p
+                             LEFT JOIN signals s ON s.id=p.signal_id WHERE p.account=? AND p.entry_ts>=? ORDER BY p.entry_ts""",
                           (C.ACCT_REAL, since)).fetchall()
         done = {r[0] for r in self.con.execute("SELECT paper_id FROM trades")}
         for p in rows:
@@ -1114,6 +1120,11 @@ class Bot:
             return skip(f"seen {lag:.0f} s after the engine's buy signal (limit {S['max_lag']:.0f} s)")
         if p["status"] != "open":
             return skip("the engine had already closed it")
+        w_ts = p.get("w_buy_ts")
+        if w_ts:
+            tm["wallet"] = w_ts
+            if t - w_ts > S["max_wallet_age"]:
+                return skip(f"{t - w_ts:.0f} s after the copied wallet's buy (limit {S['max_wallet_age']:.0f} s): not chasing")
         tm["decided"] = time.time()
         try:
             solpx = sol_usd()
@@ -1137,10 +1148,33 @@ class Bot:
             imp = impact(q)
             if imp > S["max_impact"]:
                 return skip(f"price impact {imp:.1f}% over the {S['max_impact']:.0f}% limit")
+            dec = decimals(p["mint"])
+            q_ui = int(q["outAmount"]) / 10 ** dec
+            q_px = (lam / LAMPORTS * solpx) / q_ui if q_ui else None
+            tm["q_px"] = q_px
+            lpx = p.get("leader_px")
+            if lpx and q_px:
+                chase = (q_px / lpx - 1) * 100
+                tm["chase_pct"] = chase
+                if chase > S["max_chase_pct"]:
+                    return skip(f"quote {chase:+.0f}% above the copied wallet's own price (limit +{S['max_chase_pct']:.0f}%): not chasing")
+            # stake from this trade's real quote: what Radium pays above the engine's price is added to the costs
+            # (the stop levels come from the engine's entry), so the stop still lands near the max loss
+            if q_px and p.get("entry_price"):
+                real_rt = (p.get("rt_pct") or 3.0) + max(0.0, (q_px / p["entry_price"] - 1) * 100)
+                full2, _ = stake_for(real_rt, solpx)
+                if full2 < stake * 0.95:
+                    if full2 < S["min_stake"]:
+                        return skip(f"real quote costs {real_rt:.1f}% round trip: the stake that keeps the "
+                                    f"${S['max_loss']:.0f} max loss (${full2:.2f}) is under the ${S['min_stake']:.0f} minimum")
+                    stake = full2; lam = int(stake / solpx * LAMPORTS)
+                    q = quote(SOL, p["mint"], lam, S["buy_slip_bps"]); imp = impact(q)
+                    tm["resized"] = round(stake, 2)
+            if w_ts and time.time() - w_ts > S["max_wallet_age"]:
+                return skip(f"{time.time() - w_ts:.0f} s after the copied wallet's buy by the time it was quoted "
+                            f"(limit {S['max_wallet_age']:.0f} s): not chasing")
             tx, prio = build_swap(q)
             tm["built"] = time.time()
-            dec = decimals(p["mint"])
-            mid = prices([p["mint"]]).get(p["mint"])
             out = int(q["outAmount"])
             tm["ready"] = time.time()          # the moment a live bot sends (dry run: would send)
             tm["q_out"] = out; tm["q_in"] = lam; tm["prio"] = prio
@@ -1164,6 +1198,10 @@ class Bot:
                     note.append(f"live would skip: {low}")
                 elif stake < full:
                     note.append(f"smaller stake ${stake:.2f} to fit the wallet (full stake ${full:.2f})")
+            try:   # the mid price is for the record only: read after the send, so it never slows the buy
+                mid = prices([p["mint"]]).get(p["mint"])
+            except Exception:
+                mid = None
             usd_in = sol_in * solpx
             ui = out / 10 ** dec
             entry_px = usd_in / ui if ui else None
@@ -1365,12 +1403,14 @@ class Bot:
         if not opens:
             return
         now = time.time()
-        if now - self.last_px >= PRICE_EVERY_S:
+        if now - self.last_px >= EXIT_PX_EVERY_S:
+            # Nov 14: Radium watches its own open trades on its own fresh prices (Jupiter + DexScreener, freshest)
+            # every 2 s; it no longer waits on the engine's price ticks
             self.last_px = now
-            px = self.scanner_prices(sc, [t["mint"] for t in opens])
+            px = prices([t["mint"] for t in opens], {t["mint"]: t["pool"] for t in opens})
             miss = [t["mint"] for t in opens if t["mint"] not in px]
             if miss:
-                px.update(prices(miss, {t["mint"]: t["pool"] for t in opens}))
+                px.update(self.scanner_prices(sc, miss))
             for t in opens:
                 if t["mint"] in px:
                     pk = max(t["peak"] or 0, px[t["mint"]])
@@ -1403,16 +1443,9 @@ class Bot:
                 hit = "half"
             elif now - (t["paper_entry_ts"] or now) > C.TIME_STOP_S:
                 hit = "24 h time stop"
-            if hit and scanner_up:
-                # the main account normally does this itself; only step in if it hasn't after MIRROR_GRACE_S
-                if not t["below_since"]:
-                    self.con.execute("UPDATE trades SET below_since=? WHERE id=?", (now, t["id"])); self.con.commit()
-                    continue
-                if now - t["below_since"] < MIRROR_GRACE_S:
-                    continue
-                hit = hit if hit == "half" else hit + ", engine slow to act"
-            elif not hit and t["below_since"]:
-                self.con.execute("UPDATE trades SET below_since=NULL WHERE id=?", (t["id"],))
+            # Nov 14: the stop / breakeven / +$5 floor / trail and the 2x half sell happen the moment Radium's own price
+            # shows them; no more waiting up to 15 s for the engine to act first. The copied-wallet sell still comes
+            # from the engine (mirror_exits) and from the on-chain check below, whichever is first.
             if hit == "half":
                 self.sell(t, C.HALF_FRAC, "2x on live price (Radium's own guard)")
             elif hit:
@@ -1888,7 +1921,7 @@ class Bot:
               "control": {"pause": bool(ctl.get("pause")), "sell_all_and_stop": bool(ctl.get("sell_all_and_stop")), "stale": ctl.get("stale")},
               "blocked": self.blocked(ctl),
               "limits": {k: S[k] for k in ("max_loss", "max_stake", "min_stake", "stop_pct", "max_open", "daily_loss", "total_loss",
-                                           "buy_slip_bps", "sell_slip_bps", "max_impact", "max_lag", "priority_lamports", "reserve_sol")},
+                                           "buy_slip_bps", "sell_slip_bps", "max_impact", "max_lag", "max_chase_pct", "max_wallet_age", "priority_lamports", "reserve_sol")},
               "today": self.realised(lagos_day_start()), "stats": {"closed": allc[0], "pnl": allc[1], "paper_pnl": allc[2], "wins": allc[3] or 0, "skipped": nskip},
               "open": [tr(r) for r in rows if r["status"] in ("buying", "open", "closing")],
               "closed": [tr(r) for r in closed[:30]],
@@ -1971,7 +2004,7 @@ class Bot:
                 if now - getattr(self, "last_pub", 0) > 30:     # 30 s so the page's wallet balance stays fresh
                     self.last_pub = now
                     self.publish_page()
-            time.sleep(1)
+            time.sleep(0.25 if self.open_trades() else 0.5)
 
 
 def already_running():

@@ -31,6 +31,9 @@ import wscore   # wallet-score shadow test (Nov 7 evening): logged only, never b
 STREAM = None          # the live wallet feed (stream.WalletStream), started in main()
 SEEN_SIGS = deque(maxlen=20000); SEEN_SIG_SET = set()
 SEEN_BUYS = {}         # (wallet, mint) -> time a first buy was taken from the feed (stops the safety-net poll repeating it)
+PENDING_LOCK = threading.Lock()
+PF = ThreadPoolExecutor(max_workers=8, thread_name_prefix="engine-checks")   # Radium: checks run side by side
+RUG_PF = {}            # Radium: mint -> RugCheck answer being fetched since the buy was first seen
 PENDING = []           # feed buys of coins DexScreener hasn't listed yet, retried for up to DEX_RETRY_S
 CANDLES = {}           # (pool, mint) -> (fetched_at, since, candles): one GeckoTerminal call serves every account
 
@@ -78,7 +81,9 @@ class Limiter:
             return self.per_min - len(self.t)
 
 
-LIM = {"rpc": Limiter(200), "gecko": Limiter(25), "rug": Limiter(12), "dex": Limiter(200), "web": Limiter(5)}
+# "rpcf": Radium's own lane for the pre-buy reads (the buy transaction, the sold-early check), so the backup
+# re-read and the price ticks can never use up the budget a new buy needs (Helius allows 10 a second; 200+150 a minute fits)
+LIM = {"rpcf": Limiter(150), "rpc": Limiter(200), "gecko": Limiter(25), "rug": Limiter(12), "dex": Limiter(200), "web": Limiter(5)}
 STATS = {"rpc_bytes": 0}
 RPC_UA = "memecoin-paper-scanner/1.0 (read-only, python-urllib)"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
@@ -113,9 +118,11 @@ def http(url, data=None, kind="web", headers=None, timeout=30, tries=3, raw=Fals
             raise
 
 
-def rpc(method, params):
+def rpc(method, params, fast=False):
+    # fast (Radium pre-buy only): its own budget, a 4 s timeout and one retry, instead of 60 s and long back-offs
     j = http(C.RPC_URL, json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode(),
-             kind="rpc", headers={"Content-Type": "application/json"}, timeout=60)
+             kind="rpcf" if fast else "rpc", headers={"Content-Type": "application/json"},
+             timeout=4 if fast else 60, tries=2 if fast else 3)
     if j is None or "error" in j:
         raise RuntimeError(f"rpc {method} error: {j and j.get('error')}")
     return j["result"]
@@ -360,14 +367,15 @@ def paid_something(tx, owner):
     return False
 
 
-def ata_history(ata, since_ts, limit=25):
-    sigs = rpc("getSignaturesForAddress", [ata, {"limit": limit, "commitment": "confirmed"}])
+def ata_history(ata, since_ts, limit=25, fast=False):
+    sigs = rpc("getSignaturesForAddress", [ata, {"limit": limit, "commitment": "confirmed"}], fast=fast)
     return sorted([s for s in sigs if not s.get("err") and (s.get("blockTime") or 0) >= since_ts - 10],
                   key=lambda s: s["blockTime"])
 
 
-def get_tx(sig):
-    return rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1, "commitment": "confirmed"}])
+def get_tx(sig, fast=False):
+    return rpc("getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1, "commitment": "confirmed"}],
+               fast=fast)
 
 
 # ----------------------------------------------------------------------------- market data
@@ -471,6 +479,51 @@ def rugcheck(mint):
         return None
 
 
+def rugcheck_engine(mint):
+    """Radium: RugCheck with a tight timeout (no long retries: a late answer means a late buy)."""
+    try:
+        return http(C.RUGCHECK.format(mint), kind="rug", tries=1, timeout=C.ENGINE_RUG_TIMEOUT_S)
+    except Exception as e:
+        log.warning("rugcheck (fast) error %s %s", mint, e)
+        return None
+
+
+def engine_rug(mint, det):
+    """Radium: the RugCheck answer started when the buy was first seen; one quick retry only if time is left."""
+    t0, fut = RUG_PF.pop(mint, (now(), None))
+    r = None
+    if fut is not None:
+        try:
+            r = fut.result(timeout=max(0.5, C.ENGINE_RUG_TIMEOUT_S - (now() - t0)))
+        except Exception:
+            r = None
+    if r is None and C.ENGINE_CHECKS_MAX_S - (now() - det) > C.ENGINE_RUG_TIMEOUT_S / 2:
+        r = rugcheck_engine(mint)
+    return r
+
+
+def leader_fill_px(tx, wallet, tokens_ui):
+    """Radium: the price the copied wallet itself paid per token, from its own buy transaction (SOL, wSOL or USDC/USDT
+    spent, network fee left out). None when it can't be worked out."""
+    try:
+        m = tx["meta"]
+        keys = [k["pubkey"] if isinstance(k, dict) else k for k in tx["transaction"]["message"]["accountKeys"]]
+        sol = 0.0; usd = 0.0
+        if wallet in keys:
+            i = keys.index(wallet)
+            d = m["preBalances"][i] - m["postBalances"][i] - ((m.get("fee") or 0) if i == 0 else 0)
+            sol += max(0, d) / 1e9
+        pre, post, _ = token_delta(tx, wallet, "So11111111111111111111111111111111111111112")
+        sol += max(0.0, pre - post) / 1e9
+        for stable in ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"):
+            pre, post, _ = token_delta(tx, wallet, stable)
+            usd += max(0.0, pre - post) / 1e6
+        cost = sol * fills.sol_usd() + usd
+        return cost / tokens_ui if cost > 0 and tokens_ui > 0 else None
+    except Exception:
+        return None
+
+
 def analyse_rug(r, pool):
     """dev %, top-10 % (excluding pools/lockers/curve), insider %, graph insiders, authorities."""
     tok = r.get("token") or {}
@@ -526,16 +579,33 @@ def sell_proceeds(qty, px):
 
 
 # ----------------------------------------------------------------------------- Filter + Sniper
+PROC_LOCK = threading.RLock()
+
+
 def process_new_buys(con, cands):
     """cands: list of dicts(wallet, name, mint, ata, amt, prev_ts, det_ts[, src, tx])."""
     if not cands:
         return
+    if C.ENGINE:   # Radium: the feed thread and the backup re-read take turns, so one buy is never recorded twice
+        with PROC_LOCK:
+            return _process_new_buys(con, cands)
+    return _process_new_buys(con, cands)
+
+
+def _process_new_buys(con, cands):
+    if C.ENGINE:   # Radium: start RugCheck at once, while DexScreener is read (it doesn't need the pool)
+        for c in cands:
+            if c["mint"] not in RUG_PF and c["mint"] not in C.EXCLUDE_MINTS and (c.get("tx") or {}).get("paid", True):
+                RUG_PF[c["mint"]] = (now(), PF.submit(rugcheck_engine, c["mint"]))
+        for m in [m for m, (t0, _) in list(RUG_PF.items()) if now() - t0 > 600]:
+            RUG_PF.pop(m, None)
     pairs = dex_pairs({c["mint"] for c in cands})
     for c in cands:
         try:
             if handle_candidate(con, c, pairs.get(c["mint"]) or []) == "retry":
-                c["retry_at"] = now() + 20
-                PENDING.append(c)
+                c["retry_at"] = now() + (C.ENGINE_DEX_RETRY_S if C.ENGINE else 20)
+                with PENDING_LOCK:
+                    PENDING.append(c)
         except Exception as e:
             log.error("candidate error %s %s\n%s", c["mint"], e, traceback.format_exc())
         con.commit()
@@ -556,8 +626,12 @@ def handle_candidate(con, c, pairs):
         return
     if not tp:
         # a coin bought seconds ago may not be on DexScreener yet: retry for a couple of minutes first
-        if txi and txi["paid"] and now() - det < C.DEX_RETRY_S:
+        if txi and txi["paid"] and now() - det < (C.ENGINE_DEX_WAIT_S if C.ENGINE else C.DEX_RETRY_S):
             return "retry"
+        if C.ENGINE and txi and txi["paid"]:
+            RUG_PF.pop(mint, None)
+            insert_signal(con, **base, status="ignored", notes=f"not on DexScreener within {C.ENGINE_DEX_WAIT_S:.0f} s "
+                          "of the wallet's buy: skipped instead of buying late"); return
         insert_signal(con, **base, status="ignored", notes="no DEX market (airdrop/spam/unlisted)"); return
     price = float(tp.get("priceUsd") or 0)
     sym = tp["baseToken"].get("symbol"); nm = tp["baseToken"].get("name")
@@ -609,18 +683,21 @@ def handle_candidate(con, c, pairs):
     # Two entry times. Realistic (headline): the moment the scanner saw the buy. Old test: 5 s after the wallet.
     entry_real = det
     entry_5s = buy_ts + C.COPY_DELAY_S
+    if C.ENGINE:   # Radium: the cost quote and network fee run side by side with the checks below
+        c["_pf"] = (liq_dex, PF.submit(fills.prio_call, fills.entry_quote, mint, tp["pairAddress"], C.ENGINE_SIZE_USD, liq_dex),
+                    PF.submit(fills.prio_call, fills.tx_fee_usd, tp["pairAddress"]))
     # --- cheap filters
     # smart wallet sold before we could copy (only sells before our entry time count: no look-ahead)
-    sold_real = sold_5s = False
+    sold_real = sold_5s = False; sold_chk_fail = False
     try:
-        hist2 = ata_history(c["ata"], buy_ts)
+        hist2 = ata_history(c["ata"], buy_ts, fast=C.ENGINE)
         horizon = max(entry_real, entry_5s)
         for s in hist2:
             if s["blockTime"] > horizon:
                 break
             if s["signature"] == buy_sig:
                 continue
-            tx = get_tx(s["signature"])
+            tx = get_tx(s["signature"], fast=C.ENGINE)
             if not tx:
                 continue
             pre, post, _ = token_delta(tx, wallet, mint)
@@ -630,7 +707,9 @@ def handle_candidate(con, c, pairs):
                 break
     except Exception as e:
         note.append(f"sold-early check failed: {e}")
-    other = []
+        if C.ENGINE:   # Radium: a check that can't finish in time means skip, never buy without it
+            sold_chk_fail = True
+    other = ["sold_early_check_unavailable"] if (C.ENGINE and sold_chk_fail) else []
     if h1 is not None and h1 > C.PUMP_1H_MAX_PCT:
         other.append("up_100pct_1h")
     killed = (["smart_wallet_sold_early"] if sold_real else []) + other
@@ -642,9 +721,12 @@ def handle_candidate(con, c, pairs):
             killed.append("liquidity_under_25k")
         sig["killed_by"] = ",".join(killed)
         insert_signal(con, **sig, status="killed", notes="; ".join(note + ["holder checks not run"])); return
-    r = rugcheck(mint)
-    if r is None:
-        time.sleep(5); r = rugcheck(mint)
+    if C.ENGINE:
+        r = engine_rug(mint, det)
+    else:
+        r = rugcheck(mint)
+        if r is None:
+            time.sleep(5); r = rugcheck(mint)
     a = analyse_rug(r, tp["pairAddress"]) if r else None
     liq = liq_dex if liq_dex else (a["liq"] if a else None)
     sig["liq_usd"] = liq
@@ -765,9 +847,26 @@ def engine_enter(con, c, sig, note, killed, tp, price, liq):
     if killed:
         insert_signal(con, **sig, status="killed", notes="; ".join(note) or None); return
     mint, wallet, pool = c["mint"], c["wallet"], tp["pairAddress"]
-    q = fills.entry_quote(mint, pool, C.ENGINE_SIZE_USD, liq)
-    fee_in = fills.tx_fee_usd(pool)
-    fill = dict(fill_model="live", leader_px=None, seen_px=price, r_buy=q["r_buy"], r_sell_est=q["r_sell"],
+    q = fee_in = None
+    pf = c.get("_pf")
+    if pf:
+        try:
+            if pf[0] == liq:
+                q = pf[1].result(timeout=8)
+            fee_in = pf[2].result(timeout=8)
+        except Exception:
+            pass
+    if q is None:
+        q = fills.entry_quote(mint, pool, C.ENGINE_SIZE_USD, liq)
+    if fee_in is None:
+        fee_in = fills.tx_fee_usd(pool)
+    took = now() - c["det_ts"]
+    if took > C.ENGINE_CHECKS_MAX_S:
+        sig["killed_by"] = "checks_too_slow"
+        insert_signal(con, **sig, status="killed", notes="; ".join(note + [f"safety checks took {took:.1f} s (limit "
+                      f"{C.ENGINE_CHECKS_MAX_S:.0f} s): skipped instead of buying late"])); return
+    lpx = (c.get("tx") or {}).get("lpx")
+    fill = dict(fill_model="live", leader_px=lpx, seen_px=price, r_buy=q["r_buy"], r_sell_est=q["r_sell"],
                 rt_pct=q["rt_pct"], q_src_in=q["src"], route=q.get("route"), fee_in=fee_in, liq_in=liq,
                 sellable=1 if q["sellable"] else 0)
     sig["rt_pct"] = q["rt_pct"]
@@ -2000,8 +2099,9 @@ def parse_wallet_tx(con, tx, wallet, name, t_recv, sig, open_map):
             SEEN_BUYS[(wallet, mint)] = t_recv
             if paid is None:
                 paid = paid_something(tx, wallet)
+            lpx = leader_fill_px(tx, wallet, post / 10 ** (dec or 0)) if (C.ENGINE and paid) else None
             out.append(dict(wallet=wallet, name=name, mint=mint, ata=ata, amt=post, prev_ts=block_ts - 1, det_ts=t_recv,
-                            src="stream", tx=dict(block_ts=block_ts, sig=sig, post=post, dec=dec, paid=paid)))
+                            src="stream", tx=dict(block_ts=block_ts, sig=sig, post=post, dec=dec, paid=paid, lpx=lpx)))
         elif post < pre and (wallet, mint) in open_map:   # smart wallet selling a coin we hold (mirror-sell rule)
             ref = open_map[(wallet, mint)] or pre
             frac = 1 - post / ref if ref else 1
@@ -2021,7 +2121,7 @@ def read_feed_tx(sg):
     for k in range(6):   # a just-confirmed transaction can take a moment to be readable
         url = TX_URLS[k % len(TX_URLS)]
         try:
-            LIM["rpc"].wait()
+            LIM["rpcf" if C.ENGINE else "rpc"].wait()
             body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "getTransaction",
                                "params": [sg, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1,
                                                "commitment": "confirmed"}]}).encode()
@@ -2079,15 +2179,41 @@ def drain_stream(con, wait_s=0.0):
                 log.warning("feed tx parse failed %s %s", sg[:12], e)
         con.commit()
     if PENDING:
-        due = [c for c in PENDING if now() >= c["retry_at"]]
-        for c in due:
-            PENDING.remove(c)
+        with PENDING_LOCK:
+            due = [c for c in PENDING if now() >= c["retry_at"]]
+            for c in due:
+                PENDING.remove(c)
         cands += due
     if cands:
         process_new_buys(con, cands)
     for k in [k for k, t in SEEN_BUYS.items() if now() - t > 86400]:
         SEEN_BUYS.pop(k, None)
     return len(items)
+
+
+FEED_THREAD = [None]
+
+
+def feed_worker():
+    """Radium: the live feed and its filters on their own thread with their own database connection, so a slow step in
+    the main loop (backup re-read, exits, checkpoints) never holds a new buy back."""
+    con = db()
+    fills.PRIO.on = True   # this thread only buys: its Jupiter quotes take the pre-buy lane
+    while True:
+        try:
+            if STREAM is not None:
+                drain_stream(con, wait_s=0.25)
+            else:
+                time.sleep(0.25)
+                if PENDING:
+                    drain_stream(con)
+        except Exception as e:
+            log.error("feed thread error %s\n%s", e, traceback.format_exc())
+            try:
+                con.rollback()
+            except Exception:
+                pass
+            time.sleep(0.5)
 
 
 # ----------------------------------------------------------------------------- Scout: holdings re-read (safety net)
@@ -2098,7 +2224,9 @@ def poll_wallets(con):
     feed_up = STREAM is not None and STREAM.healthy()
     for w in ws:
         every = w["poll_s"] or 60
-        if feed_up:
+        if C.ENGINE:   # Radium: re-read every 60 s with the feed up, 30 s with it down (very busy wallets keep their slower pace)
+            every = (C.ENGINE_POLL_UP_S if feed_up else C.ENGINE_POLL_DOWN_S) if every <= 180 else every
+        elif feed_up:
             every = max(every, C.POLL_BACKUP_S)
         if t - (w["last_poll"] or 0) < every:
             continue
@@ -2197,10 +2325,16 @@ def main():
              "scanner start (PAPER MODE ONLY - no wallet, no keys, nothing signed)")
     if C.REMOVED_ERROR:
         log.warning("removed_wallets.json could not be read (%s): no wallets removed this run", C.REMOVED_ERROR)
-    STREAM = streammod.WalletStream(C.WS_URLS, noisy=(meta_get(con, "feed") or {}).get("noisy") or [])
+    STREAM = streammod.WalletStream(C.WS_URLS, noisy=(meta_get(con, "feed") or {}).get("noisy") or [], keepalive=C.ENGINE)
     STREAM.set_wallets([r[0] for r in con.execute("SELECT address FROM wallets WHERE active=1")])
     if not STREAM.start():
         STREAM = None
+    if C.ENGINE:
+        # Radium: the main loop's writes commit one by one, so they never hold the database while the feed thread
+        # records a new buy (a long-held write would make the buy wait)
+        con.commit(); con.isolation_level = None; con.execute("PRAGMA synchronous=NORMAL")
+        FEED_THREAD[0] = threading.Thread(target=feed_worker, name="engine-feed", daemon=True)
+        FEED_THREAD[0].start()
     last_eq = 0; kept0 = 0
     while True:
         loop_t = now()
@@ -2221,7 +2355,8 @@ def main():
             b0 = STATS["rpc_bytes"]; tm = {}
             def _t(name, fn, *a):
                 t1 = now(); r = fn(*a); tm[name] = now() - t1; return r
-            _t("feed", drain_stream, con)
+            if not C.ENGINE:
+                _t("feed", drain_stream, con)
             _t("live0", live_guard, con)
             cands, polled = _t("poll", poll_wallets, con)
             _t("filters", process_new_buys, con, cands)
@@ -2231,7 +2366,11 @@ def main():
                     _t("wscore", wscore.tick, con)
                 except Exception as e:
                     log.warning("wallet-score shadow test error %s", e); con.rollback()
-            _t("feed2", drain_stream, con)
+            if not C.ENGINE:
+                _t("feed2", drain_stream, con)
+            else:   # keep the SOL price fresh here, so a new buy never has to fetch it first
+                if now() - fills._state["sol"][0] > 45:
+                    fills._state["sol"] = (0.0, fills._state["sol"][1]); fills.sol_usd()
             _t("live", live_guard, con)
             _t("guard", guard_all, con)
             _t("live2", live_guard, con)
@@ -2266,9 +2405,12 @@ def main():
             except Exception:
                 pass
         # between full loops, keep reading the live feed so new buys are handled within seconds
-        while now() - loop_t < C.LOOP_S:
+        while now() - loop_t < (C.ENGINE_LOOP_S if C.ENGINE else C.LOOP_S):
             try:
-                drain_stream(con, wait_s=1.0) if STREAM is not None else time.sleep(1)
+                if C.ENGINE:
+                    time.sleep(1)   # the feed thread handles new buys
+                else:
+                    drain_stream(con, wait_s=1.0) if STREAM is not None else time.sleep(1)
                 live_guard(con)   # main-account exits on live prices, every second between full loops
             except Exception as e:
                 log.error("feed loop error %s\n%s", e, traceback.format_exc())

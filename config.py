@@ -48,6 +48,14 @@ except Exception as _e:   # a broken file must not stop the scanner; the error i
 ENGINE = os.environ.get("RADIUM_ENGINE", "") == "1"
 ENGINE_FOLLOW_FILE = os.environ.get("RADIUM_FOLLOW_FILE", "")
 ENGINE_SIZE_USD = 20.0
+# Radium engine speed (Nov 14): the paper bot is not affected by any of these.
+ENGINE_DEX_RETRY_S = 1.0     # a coin DexScreener hasn't listed yet is re-checked every second (paper: every 20 s)...
+ENGINE_DEX_WAIT_S = 12.0     # ...for 12 s; after that Radium skips it instead of buying late
+ENGINE_RUG_TIMEOUT_S = 6.0   # RugCheck must answer within 6 s (one quick retry if time is left), else the coin is skipped
+ENGINE_CHECKS_MAX_S = 10.0   # all safety checks must finish within 10 s of seeing the buy, else skipped (not bought late)
+ENGINE_POLL_UP_S = 60        # backup re-read of the wallets: every 60 s while the live feed is up (paper: 10 min)
+ENGINE_POLL_DOWN_S = 30      # ...and every 30 s while the live feed is down
+ENGINE_LOOP_S = 10
 BOARD_KEEP_DAYS = 3         # keep following a wallet for 3 days after it last appeared on the board
 BOARD_REFRESH_S = 6 * 3600  # re-read the leaderboard every 6 hours
 LOOP_S = 20

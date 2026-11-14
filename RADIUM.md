@@ -49,6 +49,23 @@ the `ragedele-glitch/rage-radium-bot` repo. The wallet address is never written 
 | RADIUM_SELL_SLIPPAGE_BPS | 1500 | 15%, widened on retries up to a 30% hard cap |
 | RADIUM_MAX_IMPACT_PCT | 5 | skip if Jupiter's price impact is higher |
 | RADIUM_MAX_LAG_S | 30 | skip if Radium sees the paper buy later than this |
+| RADIUM_MAX_CHASE_PCT | 15 | no chasing: skip if Jupiter's quote is more than this % above the copied wallet's own price |
+| RADIUM_MAX_WALLET_AGE_S | 10 | no chasing: skip if the buy would go out more than this many seconds after the wallet's buy |
+
+## Speed (Nov 14)
+- Cause of the 45 s "filters" on CALLCAT, plumber (46 s) and plunger (26 s): DexScreener hadn't listed the brand-new pump.fun
+  pool yet, and the engine only re-checked an unlisted coin every 20 s. Now: every 1 s for up to 12 s, then skip.
+- The engine reads the live feed and runs its checks on its own thread, so the backup re-read, exits and checkpoints in
+  the main loop never hold a buy back. RugCheck starts the moment the buy is seen, the Jupiter quote and fee run side by
+  side with the checks, Jupiter pre-buy calls skip the queue of background price checks, RPC pre-buy reads have their own
+  budget and a 4 s timeout. Any check that can't finish (RugCheck 6 s, all checks 10 s) means skip, never buy late.
+  No filter was loosened.
+- Exits: Radium checks its own open trades on fresh prices (Jupiter + DexScreener, freshest) every 2 s and sells at once on
+  the stop, breakeven, +$5 floor, trail and 2x half; it no longer waits 15 s for the engine. The copied-wallet sell stays.
+- Live feed: quiet connections are kept alive by websocket pings instead of being dropped after 3 minutes; a dead link is
+  noticed within 40 s; reconnects wait at most 10 s and move to the next endpoint after 2 quick failures. Backup re-read of
+  the wallets: every 60 s with the feed up, 30 s with it down.
+- The paper bot's trading is unchanged: all of this only runs with RADIUM_ENGINE=1.
 | RADIUM_PRIORITY_MAX_LAMPORTS | 1000000 | priority fee cap, 0.001 SOL |
 | RADIUM_FEE_RESERVE_SOL | 0.03 | SOL always kept for fees |
 

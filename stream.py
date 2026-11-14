@@ -25,12 +25,15 @@ class _Group:
     def __init__(self, wallets, main, url_i):
         self.wallets = wallets; self.main = main; self.url_i = url_i
         self.connected = False; self.subscribed = 0; self.url = None; self.err = None
-        self.up_since = None; self.last_msg = 0.0
+        self.up_since = None; self.last_msg = 0.0; self.last_note = 0.0
 
 
 class WalletStream:
-    def __init__(self, urls, user_agent="memecoin-paper-scanner/1.1 (read-only)", noisy=()):
+    def __init__(self, urls, user_agent="memecoin-paper-scanner/1.1 (read-only)", noisy=(), keepalive=False):
         self.urls = [u for u in urls if u]
+        # keepalive (Radium only): a quiet connection is proven alive with a websocket ping instead of being torn down
+        # after 3 quiet minutes and counted as 'down' after 90 s, so the backup re-read is needed far less
+        self.keepalive = keepalive
         self.ua = user_agent
         self.q = queue.Queue(maxsize=50000)
         self._want = ()
@@ -139,7 +142,7 @@ class WalletStream:
         g.up_since = None; g.connected = False; g.subscribed = 0
 
     async def _runner(self, g):
-        i = g.url_i; backoff = 1
+        i = g.url_i; backoff = 1; quick = 0
         try:
             while True:
                 url = self.urls[i % len(self.urls)]
@@ -155,11 +158,13 @@ class WalletStream:
                 self._down(g)
                 self.reconnects += 1
                 if time.time() - t0 > 60:
-                    backoff = 1            # it ran fine for a while: reconnect at once, same endpoint
+                    backoff = 1; quick = 0  # it ran fine for a while: reconnect at once, same endpoint
                 else:
-                    if not g.main:
-                        i += 1             # side connection failed quickly: try the next endpoint
-                    backoff = min(60, backoff * 2)
+                    quick += 1
+                    if not g.main or (self.keepalive and quick >= 2):
+                        i += 1             # failed quickly (Radium: main feed too, after 2 quick failures): next endpoint
+                    # Radium waits at most 10 s between tries, so the feed is back fast and the backup is rarely needed
+                    backoff = min(10 if self.keepalive else 60, backoff * 2)
                 await asyncio.sleep(backoff)
         finally:
             self._down(g)
@@ -167,7 +172,8 @@ class WalletStream:
     async def _session(self, g, url):
         import websockets
         want = g.wallets
-        kw = dict(max_size=2 ** 24, ping_interval=20, ping_timeout=60, open_timeout=20, close_timeout=5)
+        kw = dict(max_size=2 ** 24, ping_interval=20, ping_timeout=20 if self.keepalive else 60, open_timeout=20,
+                  close_timeout=5)
         try:
             conn = websockets.connect(url, user_agent_header=self.ua, **kw)
         except TypeError:
@@ -179,19 +185,26 @@ class WalletStream:
                 await ws.send(json.dumps({"jsonrpc": "2.0", "id": k + 1, "method": "logsSubscribe",
                                           "params": [{"mentions": [w]}, {"commitment": "confirmed"}]}))
             subs = {}
-            g.last_msg = time.time()
+            g.last_msg = time.time(); g.last_note = time.time()
             win = deque(); counts = {}       # per-wallet mentions in the last minute (main connection only)
             while True:
                 try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                    raw = await asyncio.wait_for(ws.recv(), timeout=20 if self.keepalive else 30)
                 except asyncio.TimeoutError:
+                    if self.keepalive:
+                        # the websocket library pings every 20 s and drops the link if no answer comes within 20 s,
+                        # so an open, quiet connection is a live one: it stays 'up' instead of being torn down
+                        g.last_msg = time.time()
+                        if time.time() - g.last_note > 1200:   # 20 quiet minutes even with pings: refresh the subscriptions
+                            raise RuntimeError("no wallet activity for 20 minutes: refreshing the subscriptions")
+                        continue
                     if time.time() - g.last_msg > 180:
                         raise RuntimeError("no messages for 3 minutes")
                     continue
                 t = time.time()
                 g.last_msg = t
                 if '"logsNotification"' in raw:
-                    self.n_all += 1
+                    self.n_all += 1; g.last_note = t
                     if '"err":null' not in raw and not g.main:
                         continue                 # failed transaction on a noisy connection: skip without parsing
                 m = json.loads(raw)

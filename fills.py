@@ -25,7 +25,18 @@ import config as C
 SOL = "So11111111111111111111111111111111111111112"
 UA = "memecoin-paper-scanner/1.0 (read-only quotes, python-urllib)"
 _lock = threading.Lock()
-_state = {"jup_last": 0.0, "sol": (0.0, 0.0), "dec": {}, "prio": {}, "exitq": {}}
+_state = {"jup_last": 0.0, "jup_prio_last": 0.0, "sol": (0.0, 0.0), "dec": {}, "prio": {}, "exitq": {}}
+# Radium pre-buy lane (Nov 14): quotes for a coin about to be bought go ahead of the background price checks instead of
+# queueing behind them 2.2 s apiece. Only Radium's engine turns this on (thread by thread); the paper bot never does.
+PRIO = threading.local()
+
+
+def prio_call(fn, *a, **k):
+    PRIO.on = True
+    try:
+        return fn(*a, **k)
+    finally:
+        PRIO.on = False
 
 
 def _get(url, body=None, timeout=20):
@@ -54,11 +65,19 @@ def _get(url, body=None, timeout=20):
 
 def _jup(path):
     # keyless Jupiter allows about one request every 2 seconds
-    with _lock:
-        wait = _state["jup_last"] + 2.2 - time.time()
-        if wait > 0:
-            time.sleep(wait)
-        _state["jup_last"] = time.time()
+    if getattr(PRIO, "on", False):
+        with _lock:   # pre-buy: 0.35 s apart from each other, never waiting behind background calls
+            wait = _state["jup_prio_last"] + 0.35 - time.time()
+            if wait > 0:
+                time.sleep(wait)
+            _state["jup_prio_last"] = _state["jup_last"] = time.time()
+        return _get("https://lite-api.jup.ag" + path, timeout=5)
+    while True:
+        with _lock:
+            wait = max(_state["jup_last"] + 2.2, _state["jup_prio_last"] + 1.0) - time.time()
+            if wait <= 0:
+                _state["jup_last"] = time.time(); break
+        time.sleep(min(wait, 0.3))   # re-check often, so a pre-buy quote can step in between
     return _get("https://lite-api.jup.ag" + path)
 
 
