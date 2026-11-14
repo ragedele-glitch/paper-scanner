@@ -1,7 +1,7 @@
 {
- "pause": true,
+ "pause": false,
  "sell_all_and_stop": false,
- "set": "pause",
+ "set": "resume",
  "by": "ragedele-glitch",
- "at": "2026-11-14 00:26:31 UTC"
+ "at": "2026-11-14 00:36:58 UTC"
 }
